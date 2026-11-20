@@ -145,6 +145,16 @@ def package(options):
         dmg_root.mkdir()
         test_home = temp / 'home'
         test_home.mkdir(mode=0o700)
+        if not options.clt_only:
+            # Xcode manages read-only Metal toolchain mounts in its user cache.
+            # Keep their lifecycle with Xcode. The disposable HOME used by the
+            # app tests must never recursively traverse a mounted toolchain.
+            relative = Path('Library/Developer/DVTDownloads/MetalToolchain')
+            system_cache = real_home / relative
+            system_cache.mkdir(parents=True, exist_ok=True)
+            link = test_home / relative
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(system_cache, target_is_directory=True)
         env = {k: v for k, v in os.environ.items() if not k.startswith('DSH_')}
         env.update(HOME=str(test_home), CFFIXED_USER_HOME=str(test_home),
                    SDKROOT=os.environ.get('SDKROOT') or output('xcrun', '--sdk', 'macosx', '--show-sdk-path'),

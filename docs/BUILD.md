@@ -11,6 +11,8 @@ python3 scripts/release.py
 
 构建在临时目录编译科研桥和 App，运行 Swift、WebKit、PDF、桥协议和 Zotero 测试，检查 App 签名及架构，实际只读挂载并核对安装盘，再生成 SHA-256。运行 AppKit/WebKit 测试需要可用的 macOS 图形登录会话。没有完整 Xcode 的维护机可用 `--clt-only` 构建社区测试包。该选项跳过 XCTest，记录测试结果时请注明。可用 `SDKROOT` 指定已安装且与编译器匹配的 SDK。这些步骤不向 `/Applications` 安装，不访问个人 DSH 配置或调用任何模型。
 
+完整 Xcode 构建沿用 Xcode 管理的 Metal 工具链缓存，使只读挂载独立于测试用的临时 HOME。科研助手的设置和合成会话仍在临时目录。
+
 `Resources/PublicManifest.txt` 逐项列举允许分发的资源。公开包只附这份清单中的资源、构建出来的原创图标、许可、入门说明和当前源码构建的科研桥。个人桌宠素材只用于本机维护。DMG 顶层另有可选的 Zotero 扩展。构建会拒绝重复清单项、意外文件、符号链接及带有构建者 HOME 路径的产物。
 
 已装 DSH Desktop 0.2.2-rc.5 的维护者还可在只读挂载 DMG 后使用同一发行包的组件运行端到端复验。将 `app` 设为实际挂载包的路径，若科研桥版本有变化，一并调整包名。此检查新建临时 HOME、profile 和工作区，运行真实 DSH 服务与合成会话，并检查重启恢复。不会复用本机订阅授权。
