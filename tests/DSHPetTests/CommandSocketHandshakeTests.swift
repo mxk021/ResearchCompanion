@@ -27,6 +27,8 @@ final class CommandSocketHandshakeTests: XCTestCase {
         for _ in 0..<100 where client.submissionStatus == .submitting {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
+        XCTAssertFalse(client.hasPendingSubmission)
+        XCTAssertTrue(client.draft.isEmpty)
         let original = try XCTUnwrap(client.sessionID)
         client.draft = "a follow-up using the first answer"
         client.submitDraft()
@@ -444,6 +446,8 @@ private final class CommandSocketServer: @unchecked Sendable {
                             "id": id, "ok": false,
                             "error": ["code": "test/rejected", "message": "rejected by test"],
                         ]
+                    } else if action == "prompt" {
+                        response = ["id": id, "ok": true, "accepted": true, "sessionId": request["sessionId"] ?? ""]
                     } else if action == "createSession" {
                         if let session = request["sessionId"] as? String {
                             lock.withLock { if !sessionIDs.contains(session) { sessionIDs.append(session) } }

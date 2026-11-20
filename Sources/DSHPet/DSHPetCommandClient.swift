@@ -227,29 +227,50 @@ final class DSHPetCommandClient: ObservableObject {
 
     @Published var selectedSkillPrefix: String? {
         didSet {
-            if let selectedSkillPrefix { defaults.set(selectedSkillPrefix, forKey: Keys.selectedSkillPrefix) }
-            else { defaults.removeObject(forKey: Keys.selectedSkillPrefix) }
+            guard selectedSkillPrefix != oldValue else { return }
+            // AppKit can publish the selected candidate before its text binding.
+            // Commit when both halves are available, in either callback order.
+            if selectedSkillPrefix.map({ draft.hasPrefix($0) }) ?? true { persistDraft() }
         }
     }
     @Published var draft: String {
         didSet {
             guard draft != oldValue else { return }
+            if let prefix = selectedSkillPrefix {
+                if !draft.hasPrefix(prefix) {
+                    selectedSkillPrefix = nil
+                    return
+                }
+                if !oldValue.hasPrefix(prefix) {
+                    persistDraft()
+                    return
+                }
+            }
             draftSaveTask?.cancel()
             draftSaveTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 250_000_000)
                 guard !Task.isCancelled else { return }
                 self?.flushDraftPersistence()
             }
-            if let selectedSkillPrefix, !draft.hasPrefix(selectedSkillPrefix) { self.selectedSkillPrefix = nil }
         }
     }
     private var draftSaveTask: Task<Void, Never>?
 
     func flushDraftPersistence() {
-        guard draftSaveTask != nil else { return }
+        if draftSaveTask != nil { persistDraft() }
+    }
+
+    private func persistDraft() {
         draftSaveTask?.cancel()
         draftSaveTask = nil
+        let prefix = selectedSkillPrefix.flatMap { draft.hasPrefix($0) ? $0 : nil }
+        if let prefix {
+            // Restore the skill and its exact draft from one UserDefaults value.
+            defaults.set(["prefix": prefix, "text": draft], forKey: Keys.selectedSkillPrefix)
+        }
         defaults.set(draft, forKey: Keys.draft)
+        // Publish a plain draft before retiring the previous skill snapshot.
+        if prefix == nil { defaults.removeObject(forKey: Keys.selectedSkillPrefix) }
     }
 
     var onAccepted: (() -> Void)?
@@ -342,9 +363,10 @@ final class DSHPetCommandClient: ObservableObject {
         persistedTargetBindingKey = defaults.string(forKey: Keys.targetBindingKey)
         selectedWorkspaceID = defaults.string(forKey: Keys.workspaceID)
         sessionID = defaults.string(forKey: Keys.sessionID)
-        let restoredDraft = defaults.string(forKey: Keys.draft) ?? ""
+        let skillDraft = defaults.dictionary(forKey: Keys.selectedSkillPrefix)
+        let restoredDraft = skillDraft?["text"] as? String ?? defaults.string(forKey: Keys.draft) ?? ""
         draft = restoredDraft
-        let savedSkillPrefix = defaults.string(forKey: Keys.selectedSkillPrefix)
+        let savedSkillPrefix = skillDraft?["prefix"] as? String ?? defaults.string(forKey: Keys.selectedSkillPrefix)
         selectedSkillPrefix = savedSkillPrefix.flatMap { restoredDraft.hasPrefix($0) ? $0 : nil }
         pendingRequestID = defaults.string(forKey: Keys.requestID)
         pendingRequestText = defaults.string(forKey: Keys.requestText)

@@ -68,9 +68,34 @@ final class DSHPetCommandClientTests: XCTestCase {
         client.selectedSkillPrefix = "/review "
         let restored = DSHPetCommandClient(defaults: defaults, socketPath: "/tmp/unused.sock")
         XCTAssertEqual(restored.selectedSkillPrefix, "/review ")
+        XCTAssertEqual(restored.draft, "/review 请检查")
         restored.draft = "请检查"
         XCTAssertNil(restored.selectedSkillPrefix)
-        XCTAssertNil(defaults.string(forKey: "dsh-pet.command.selectedSkillPrefix"))
+        XCTAssertNil(defaults.object(forKey: "dsh-pet.command.selectedSkillPrefix"))
+        let plain = DSHPetCommandClient(defaults: defaults, socketPath: "/tmp/unused.sock")
+        XCTAssertEqual(plain.draft, "请检查")
+        XCTAssertNil(plain.selectedSkillPrefix)
+    }
+
+    @MainActor
+    func testSkillFirstCallbackAndLegacyDraftFlush() {
+        let suite = "DSHPetCommandClientTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("/old legacy", forKey: "dsh-pet.command.draft")
+        defaults.set("/old ", forKey: "dsh-pet.command.selectedSkillPrefix")
+        func restore() -> DSHPetCommandClient { DSHPetCommandClient(defaults: defaults, socketPath: "/tmp/unused.sock") }
+        let client = restore()
+        XCTAssertEqual(client.selectedSkillPrefix, "/old ")
+        client.selectedSkillPrefix = "/review "
+        client.draft = "/review new"
+        XCTAssertEqual(restore().draft, "/review new")
+        XCTAssertEqual(restore().selectedSkillPrefix, "/review ")
+        client.draft += " question"
+        XCTAssertEqual(restore().draft, "/review new")
+        client.stop()
+        XCTAssertEqual(restore().draft, "/review new question")
+        XCTAssertEqual(restore().selectedSkillPrefix, "/review ")
     }
 
     @MainActor
