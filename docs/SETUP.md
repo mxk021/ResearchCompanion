@@ -1,6 +1,12 @@
 # 安装和首次使用
 
-需要 Apple 芯片 Mac、macOS 14 或更新版本。打开 DMG，把 Research Companion 拖进“应用程序”，从那里启动。以 Release 页面标明的签名和公证状态为准。若组织策略或 Gatekeeper 不允许该构建，请等待受信任的发行版。
+v0.2.9 Community Beta（构建 21）的安装包适用于 Apple Silicon Mac，部署目标为 macOS 14.0。当前只验证了 arm64 架构，macOS 14 的实机兼容性仍待验收。
+
+## 下载与首次打开
+
+1. 从发行页的 **Assets** 下载 `ResearchCompanion-0.2.9-arm64.dmg` 和 `ResearchCompanion-0.2.9-arm64.dmg.sha256`。在两者所在的目录运行 `shasum -a 256 -c ResearchCompanion-0.2.9-arm64.dmg.sha256`，确认输出为 `OK`。如果摘要不符，请丢弃该副本，从同一发行页重新下载。[v0.2.9 发行页](https://github.com/mxk021/ResearchCompanion/releases/tag/v0.2.9)
+2. 打开 DMG，把 **Research Companion** 拖进「应用程序」。首次从「应用程序」双击打开。此版本使用 ad hoc 签名，未经 Apple 公证，Gatekeeper 可能提示无法验证开发者或无法检查 App 是否包含恶意软件。
+3. 仅在你信任下载来源且摘要一致时，为这个 App 单独确认。尝试打开后进入苹果菜单 →「系统设置」→「隐私与安全性」，向下找到这次拦截记录，点「仍要打开」，按系统提示确认。如果系统提示 App 已损坏或会损坏电脑，请停止安装。受组织管理的 Mac 可能不提供允许选项，可联系管理员。[Apple 官方说明](https://support.apple.com/zh-cn/102445)
 
 ## 连接本机的 DSH
 
