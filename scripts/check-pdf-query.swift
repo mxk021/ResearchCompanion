@@ -93,7 +93,7 @@ struct ResearchPDFQueryCheck {
         try check(try chinese.prepare("从起点到研究内容").first?.text == "起点采用本文研究内容")
         try check(parts[0].pdfPages == "1–2")
         try check(parts[0].pdfPositions?.map(\.column) == [1, 1, 2, 1])
-        try check(parts[0].pdfPositions?.first?.sourceRange == NSRange(location: 23, length: 11))
+        try check(parts[0].pdfPositions?.first?.sourceRange == NSRange(location: 10 + "Do not send. ".utf16.count, length: "THE diffrac-".utf16.count))
         try check(parts[0].pdfPositions?.last?.blockRange?.length == "Original formula α² = β, then sentinel near the final grating".utf16.count)
     }
 
