@@ -20,12 +20,13 @@ import { basename, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { mkdir, readFile } from 'node:fs/promises'
 import { ResearchRetirement } from './ResearchRetirement.js'
-import { decodeResearchHistory } from './ResearchHistory.js'
+import { decodeResearchHistory, researchPromptMetadata } from './ResearchHistory.js'
 import { projectedSessionTitle, researchSessionIndexPage, type ResearchIndexSummary, type ResearchSessionQuery } from './ResearchSessionIndex.js'
 import {
   accountProviderAllowed, decodeResearchSelection, researchModelCatalog, sameResearchSelection, verifyResearchSelection,
   type ResearchModelRuntime, type ResearchSelection,
 } from './ResearchModels.js'
+import { researchDocumentPlan, type PlanningRuntime } from './ResearchDocumentPlan.js'
 import { ResearchStream, type AssistantFrame } from './ResearchStream.js'
 import { ZoteroContextProvider, researchPrompt, DEFAULT_PERSONA, noMemory } from './ResearchContext.js'
 import {
@@ -152,6 +153,9 @@ export function apply(ctx: Context): void {
   const unconfirmedSessions = new Set<string>()
   const sessionOperations = new Map<string, Promise<void>>()
   const pendingModelRuns = new Map<string, { requestId: string; selection: ResearchSelection; turn?: number }>()
+  // One non-durable fingerprint per recent session, observable only by exact
+  // request ID. This is the DSH adapter-entry request, not a server receipt.
+  const dispatchEvidence = new Map<string, {requestId: string; selection: ResearchSelection; sha256: string; utf16Length: number}>()
   const recentModelReceipts = new Map<string, { requestId: string; selection: ResearchSelection }>()
   const streams = new Map<string, { stream: ResearchStream; revision: number; publishTimer?: ReturnType<typeof setTimeout> }>()
   let streamRevision = 0
@@ -467,12 +471,35 @@ export function apply(ctx: Context): void {
     return next()
   })
 
+  ctx.on('llm/stream', (request, next) => {
+    const sessionId = request.sessionId
+    const pin = sessionId && pendingModelRuns.get(sessionId)
+    if (sessionId && pin && request.provider === pin.selection.provider && request.model === pin.selection.model) {
+      const message = request.messages.find(message => message.role === 'user' &&
+        message.source && 'rpcId' in message.source && message.source.rpcId === pin.requestId)
+      const selection = decodeResearchSelection(request)
+      if (message && selection) {
+        for (const block of message.content) {
+          if (block.type !== 'text') continue
+          const evidence = researchPromptMetadata(block.text)?.material
+          if (evidence) {
+            dispatchEvidence.set(sessionId, {requestId:pin.requestId, selection,
+              sha256:createHash('sha256').update(evidence.text).digest('hex'), utf16Length:evidence.text.length})
+            if (dispatchEvidence.size > 128) dispatchEvidence.delete(dispatchEvidence.keys().next().value!)
+            break
+          }
+        }
+      }
+    }
+    return next()
+  })
   ctx.on('session/created', () => { scheduleTaskRefresh() })
   ctx.on('session/disposed', session => {
     const sessionId = String(session.id)
     sessionStates.delete(sessionId)
     pendingModelRuns.delete(sessionId)
     recentModelReceipts.delete(sessionId)
+    dispatchEvidence.delete(sessionId)
     const active = streams.get(sessionId)
     if (active?.publishTimer) clearTimeout(active.publishTimer)
     streams.delete(sessionId)
@@ -574,6 +601,7 @@ export function apply(ctx: Context): void {
     const value = (ctx.workspaceRegistry as unknown as { archivedSessionIds?: readonly string[] }).archivedSessionIds
     return Array.isArray(value) ? value : undefined
   }
+  const planningRuntime = () => optionalService('llm') as (ResearchModelRuntime & PlanningRuntime) | undefined
   const llm = (): ResearchModelRuntime | undefined => optionalService('llm') as ResearchModelRuntime | undefined
   const platformDefault = (): ResearchSelection | undefined => decodeResearchSelection(
     (optionalService('agentDefaultModel') as { currentSelection?: () => unknown } | undefined)?.currentSelection?.(),
@@ -682,6 +710,7 @@ export function apply(ctx: Context): void {
       ...(retirement.available(optionalService) ? ['researchSafeDelete','research.retirement.offline.v1'] : []),
       ...(retirement.onlineAvailable(optionalService) ? ['research.retirement.online.v1'] : []),
       ...(resolveAvailable && llm() ? ['modelCatalog', 'researchSelectModel'] : []),
+      ...(resolveAvailable && typeof planningRuntime()?.stream === 'function' ? ['researchDocumentPlan'] : []),
     ]
   }
 
@@ -773,6 +802,22 @@ export function apply(ctx: Context): void {
       return admitResearchPrompt(request, content)
     }),
     modelCatalog: async () => ({ ...(await researchModelCatalog(llm())), defaultSelection: platformDefault() }),
+    researchDocumentPlan: request => serializeSession(request.sessionId, async () => {
+      requireWorkspaceSession(request.workspaceId, request.sessionId)
+      const runtime = planningRuntime()
+      if (!runtime?.stream) throw new Error('当前 DSH 未提供文档取证模型接口。')
+      const agent = await resolveAgent(request.sessionId) as ResearchAgent
+      const current = () => decodeResearchSelection(agent.model?.current?.())
+      if (!sameResearchSelection(request.selection, current())) throw new Error('会话模型已变化，请重新提交文件问题。')
+      const selection = await verifyResearchSelection(runtime, request.selection)
+      await requireIdle(request.sessionId)
+      request.signal.throwIfAborted()
+      if (!sameResearchSelection(request.selection, current())) throw new Error('会话模型已变化，已取消取证。')
+      const plan = await researchDocumentPlan(runtime, selection, request.document, request.text, request.signal)
+      request.signal.throwIfAborted()
+      if (!sameResearchSelection(request.selection, current())) throw new Error('会话模型已变化，已丢弃旧取证请求。')
+      return {plan, documentId:request.document.id, selection}
+    }),
     researchSelectModel: request => serializeSession(request.sessionId, async () => {
       requireWorkspaceSession(request.workspaceId, request.sessionId)
       const selection = await verifyResearchSelection(llm(), request.selection)
@@ -785,7 +830,7 @@ export function apply(ctx: Context): void {
       try { return { context: await contextProvider.current() } }
       catch (error) { return { context: { key: '', title: '', text: '', available: false, error: String(error instanceof Error ? error.message : error) } } }
     },
-    conversation: async ({ workspaceId, sessionId, knownHistory }) => {
+    conversation: async ({ workspaceId, sessionId, knownHistory, verifyRequestId }) => {
       requireWorkspaceSession(workspaceId, sessionId)
       const [result, state, projection] = await Promise.all([
         coldQueries.events({ address: { kind: 'session', sessionId }, maxMessages: 100 }, AbortSignal.timeout(15_000)),
@@ -799,6 +844,8 @@ export function apply(ctx: Context): void {
       const lastEnd = (result.records ?? []).slice().sort((a: any, b: any) => ((b.event ?? b).seq ?? -1) - ((a.event ?? a).seq ?? -1)).find((r: any) => (r.event ?? r).type === 'turn/end')
       const reason = (lastEnd?.event ?? lastEnd)?.data?.reason
       return { ...(knownHistory === historyRevision ? { historyUnchanged: true } : { messages }),
+        ...(verifyRequestId ? {dispatchEvidence: dispatchEvidence.get(sessionId)?.requestId === verifyRequestId
+          ? dispatchEvidence.get(sessionId) : null} : {}),
         historyRevision, hasMore: result.hasMore === true, cursor: result.cursor,
         running: state.running === true || (typeof state.running === 'object' && state.running?.active === true)
           || (state.queue?.length ?? 0) > 0,
@@ -911,6 +958,7 @@ export function apply(ctx: Context): void {
       streams.clear()
       pendingModelRuns.clear()
       recentModelReceipts.clear()
+      dispatchEvidence.clear()
       commandBridge?.stop()
       localBridge.stop()
       if (originRetryTimer !== undefined) clearTimeout(originRetryTimer)

@@ -95,6 +95,17 @@ struct LongPDFCheck {
         if client.modelSelectionAvailable {
             try await wait("catalog") { client.modelCatalog != nil && client.selectedResearchModel != nil }
         }
+        client.loadFixedMaterial(changing)
+        try await wait("fresh attached document") { !client.loadingResearchFile }
+        client.draft = "有什么要留意的？"
+        client.submitResearch()
+        try await wait("cold session provider default") {
+            (client.conversationMessages.last?.reply?.question == "有什么要留意的？" && !client.hasPendingSubmission) || client.lastError != nil
+        }
+        if let error = client.lastError { throw ResearchMaterialError.message(error) }
+        precondition(client.conversationSelection?.reasoningEffort == "low")
+        client.startNewSession()
+        precondition(client.sessionID == nil && !client.hasAssociatedFile)
         for question in ["不要结合 PDF，只解释这一句", "仅翻译选区", "what is the meaning of “paper”?"] {
             precondition(!ResearchMaterial.requestsFileBackground(question, filename: file.lastPathComponent))
         }
@@ -147,6 +158,30 @@ struct LongPDFCheck {
         let rangeQuery = "翻译从 OPENING THISTLE 到 PAGE_1_END 的内容。"
         let verifiedRange = try client.fixedMaterial!.pdfIndex!.prepare(rangeQuery)
         precondition(verifiedRange.count == 1)
+        for source in ["none", "failed", "opening"] {
+            client.removeResearchSelection()
+            if source != "none" {
+                let token = client.beginSelectionTranslation(previewOnly: true)!
+                if source == "failed" {
+                    client.finishSelectionTranslation(token, result: .failure(SelectionCaptureError.empty))
+                } else {
+                    let opening = try ResearchMaterial.selection("OPENING THISTLE", source: "Preview", title: "Start")
+                    client.finishSelectionTranslation(token, result: .success(opening))
+                }
+            }
+            let n = client.conversationMessages.count
+            client.draft = "所选文章的OPENING THISTLE到PAGE_1_END.这段内容翻译"
+            client.submitResearch()
+            try await wait("range with " + source) {
+                (client.conversationMessages.count > n && !client.hasPendingSubmission) || client.lastError != nil
+            }
+            if let error = client.lastError { throw ResearchMaterialError.message(error) }
+            let answer = client.conversationMessages.last!.reply!
+            precondition(answer.material?.text == verifiedRange[0].text)
+            precondition(store.read(session: client.sessionID!, reply: answer)?.file?.fingerprint == before.fingerprint)
+        }
+        let unrelatedAgain = client.beginSelectionTranslation(previewOnly: true)!
+        client.finishSelectionTranslation(unrelatedAgain, result: .success(captured))
         var packets: [String] = []
         for route in [subscription, alternative] {
             if route != client.selectedResearchModel {
@@ -170,6 +205,25 @@ struct LongPDFCheck {
         precondition(packets[0] == packets[1])
         client.selectResearchModel(subscription)
         try await wait("restore explicit subscription") { client.selectedResearchModel == subscription && !client.modelSwitching }
+        let beforeInferred = client.conversationMessages.count
+        client.draft = "开场是 OPENING THISTLE，收尾是 PAGE_1_END，两处之间都要译成中文。"
+        client.submitResearch()
+        try await wait("infer both verbatim boundaries") {
+            (client.conversationMessages.count > beforeInferred && !client.hasPendingSubmission) || client.lastError != nil
+        }
+        if let error = client.lastError { throw ResearchMaterialError.message(error) }
+        precondition(client.conversationMessages.last!.reply!.material!.text == verifiedRange[0].text)
+        let combinedQuestion = "结合论文解释这段"
+        let priorCombined = client.conversationMessages.count
+        client.draft = combinedQuestion
+        client.submitResearch()
+        try await wait("planned combined evidence") {
+            (client.conversationMessages.count > priorCombined && !client.hasPendingSubmission) || client.lastError != nil
+        }
+        if let error = client.lastError { throw ResearchMaterialError.message(error) }
+        let mixedReply = client.conversationMessages.last!.reply!
+        precondition(mixedReply.material!.text.contains(captured.text) && mixedReply.material!.text.contains("MIDPOINT LARCH"))
+        precondition(store.read(session: client.sessionID!, reply: mixedReply)?.backgroundFile?.fingerprint == before.fingerprint)
         client.removeResearchSelection()
         let all = try index.segments()
         precondition(all.count > 4 && all.allSatisfy { $0.text.utf16.count <= 7_200 })
@@ -194,6 +248,21 @@ struct LongPDFCheck {
             precondition(answer.reply!.material!.text.utf16.count <= 12_000)
             precondition(store.read(session: client.sessionID!, reply: answer.reply!)?.file?.fingerprint == before.fingerprint)
         }
+        let beforeSemantic = client.conversationMessages.count
+        client.draft = "为什么两次记录各用一种代号？"
+        client.submitResearch()
+        try await wait("follow-up evidence on the same session and model") {
+            (client.conversationMessages.count > beforeSemantic && !client.hasPendingSubmission) || client.lastError != nil
+        }
+        if let error = client.lastError { throw ResearchMaterialError.message(error) }
+        let semanticReply = client.conversationMessages.last!.reply!
+        precondition(semanticReply.material!.text.contains("OPENING THISTLE") && semanticReply.material!.text.contains("FINAL QUARTZ"))
+        precondition(store.read(session: client.sessionID!, reply: semanticReply)?.file?.fingerprint == before.fingerprint)
+        client.draft = "这行代号怎么理解？"
+        let beforeMissing = client.conversationMessages.count
+        client.submitResearch()
+        try await wait("bounded failed search") { !client.pdfRequestRunning && client.lastError != nil }
+        precondition(client.draft == "这行代号怎么理解？" && client.conversationMessages.count == beforeMissing)
         precondition(ResearchPDFIndex.wholeTask("不要翻译全文，只翻译第24页", mode: .ask) == nil)
         client.draft = ""
         let countBeforePreview = client.conversationMessages.count
@@ -226,13 +295,21 @@ struct LongPDFCheck {
         try await approve(true)
         try await wait("reject") { !client.pdfRequestRunning }
         precondition(client.pdfRequestStatus?.contains("已完成 1/") == true && client.conversationMessages.count == count + 1)
+        precondition(client.draft == "请分析全文。FAIL_SEGMENT")
+        let savedFirst = client.conversationMessages.last!.reply!.requestId
+        client.submitResearch()
+        try await approve(true)
+        try await wait("retry remaining chunks") { !client.pdfRequestRunning }
+        precondition(client.pdfRequestStatus?.contains("已完成 \(all.count)/\(all.count) 段") == true, client.pdfRequestStatus ?? "")
+        precondition(client.conversationMessages.count == count + all.count + 1)
+        precondition(client.conversationMessages.filter { $0.reply?.requestId == savedFirst }.count == 1)
         client.draft = "请翻译全文。CANCEL_SEGMENT"
         client.submitResearch()
         try await approve(true)
         try await wait("cancel one admitted part") { client.conversationRunning }
         client.stopPDFWork()
         try await wait("cancel") { !client.pdfRequestRunning }
-        precondition(client.pdfRequestStatus?.contains("已停止") == true)
+        precondition(client.pdfRequestStatus?.contains("已停止") == true && client.draft == "请翻译全文。CANCEL_SEGMENT")
         precondition(before.matches(file))
         let blank = folder.appendingPathComponent("blank.pdf")
         try makeFixture(blank, pages: 2, blankLast: true)
@@ -319,6 +396,7 @@ struct LongPDFCheck {
         let cleared = DSHPetCommandClient(defaults: prefs, provenanceStore: store)
         cleared.applyWorkspaces(client.workspaces)
         precondition(cleared.displayedResearchMaterial == nil && !cleared.hasAssociatedFile)
+        print("PASS empty/failed/short/unrelated selection, inferred ranges, two evidence reads on one model, strict selection, preserved draft and resumed chunks.")
         print("PASS chooser auto-link, draft migration, new-session isolation, stale chooser, return/relaunch, changed and missing files, detachment.")
         print("PASS 52-page native import, local Vision OCR on 37, front/middle/end and keyword question wire evidence, all ordered translation/analysis parts and final synthesis, reply provenance, reject/cancel/unreadable page and changed file.")
     }

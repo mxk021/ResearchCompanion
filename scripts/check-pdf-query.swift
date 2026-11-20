@@ -28,6 +28,7 @@ struct ResearchPDFQueryCheck {
         let check = Self()
         try check.testCrossColumnAndCrossPageReturnsExactVerbatimBoundsAndLocations()
         try check.testMissingReversedAmbiguousAndUnreliableNeverFallBackToRanking()
+        try check.testVerifiedRangePlanningAndScopedDuplicates()
         try check.testCrossPageWordCanBeSearchedWithEitherPrintedSpelling()
         try check.testColumnParagraphAndSectionReadExcludeAdjacentEvidence()
         try check.testPlanReassemblesExactlyAcrossOverBudgetBlock()
@@ -108,10 +109,47 @@ struct ResearchPDFQueryCheck {
         try rejects([valid], "请翻译从 START 到", "同时给出")
         let quoted = try index([page(1, [block("BEGIN contains an author's quoted phrase. NEXT")])])
         try check(try quoted.prepare("Translate from “BEGIN” to “author's quoted phrase”").first?.text == "BEGIN contains an author's quoted phrase")
-        try rejects([valid, page(2, [block("START occurs in a citation.", kind: .reference)])], "从 START 到 FINISH", "至少出现两次")
+        // A second START after the only FINISH cannot be the requested ordered range.
+        let ordered = try index([valid, page(2, [block("START occurs in a citation.", kind: .reference)])])
+        try check(try ordered.prepare("从 START 到 FINISH").first?.text == "START occurs before FINISH")
+        try rejects([page(1, [block("START one"), block("START two before FINISH")])], "从 START 到 FINISH", "至少出现两次")
         try rejects([valid, page(2, [], state: .needsOCR)], "从 START 到 FINISH", "第 2 页")
         try rejects([page(1, [block("START"), block("Uncertain OCR", reliable: false), block("FINISH")], state: .ocr)], "从 START 到 FINISH", "无法可靠")
         try rejects([page(1, [block("START here; FINISH there")], reliable: false)], "从 START 到 FINISH", "无法可靠")
+    }
+
+    func testVerifiedRangePlanningAndScopedDuplicates() throws {
+        let passage = "The path to zinc spans two pages.\n\nA meter's reading reaches the XYZ method without bias"
+        let doc = try index([page(1, [block("Keep out. The path to zinc spans two pages.", column: 2)]),
+                             page(2, [block("A meter's reading reaches the XYZ method without bias. Omit.", column: 1)])])
+        let variants = ["翻译从 The path to zinc 到 XYZ method without bias 的全部内容。",
+                        "所选文章的The path to zinc到XYZ method without bias.这段内容翻译",
+                        "请把以 The path to zinc 开头、到 XYZ method without bias 结束的原文翻译出来",
+                        "Translate from The path to zinc through XYZ method without bias"]
+        for q in variants { try check(try doc.prepare(q).map(\.text).joined() == passage) }
+        try rejects(try doc.readRange(start: "The path to zinc", end: "FDTD method without bias"), containing: "FDTD")
+        try check(try doc.readRange(start: "A meter’s reading", end: "XYZ method without bias", includeEnd: false).first?.text == "A meter's reading reaches the ")
+        try check(try doc.prepare("从 “A meter’s reading” 到 “XYZ method without bias”，不含起点").first?.text == " reaches the XYZ method without bias")
+        let quoted = try index([page(1, [block("Preface. The LMT model works. End marker. Omit.")])])
+        for (l, r) in [("“", "”"), ("「", "」"), ("\"", "\""), ("‘", "’"), ("『", "』"), ("'", "'")] {
+            let question = "Start with " + l + "LMT model works" + r + " and finish at " + l + "End marker" + r
+            let plan = ResearchDocumentPlan(action: .range, start: "model", end: "End marker")
+            try check(try plan.read(index: quoted, question: question, selection: nil, requireSelection: false).first?.text
+                      == "LMT model works. End marker")
+        }
+        let repeated = try index([page(1, [block("1. Introduction", kind: .heading), block("START alpha FINISH")]),
+                                  page(2, [block("2. Methods", kind: .heading), block("START beta FINISH")]),
+                                  page(3, [block("3. Results", kind: .heading), block("START gamma FINISH")])])
+        try rejects(try repeated.readRange(start: "START", end: "FINISH"), containing: "文件第 2 页")
+        try check(try repeated.readRange(start: "START", end: "FINISH", withinPages: 2...2).first?.text == "START beta FINISH")
+        try check(try repeated.readRange(start: "START", end: "FINISH", section: "methods").first?.text == "START beta FINISH")
+        try check(try repeated.prepare("第2页中从 START 到 FINISH").first?.text == "START beta FINISH")
+        try check(repeated.documentOutline.count == 3)
+        try check(try repeated.readPages(2...2).first?.text == "2. Methods\n\nSTART beta FINISH")
+        try check(try repeated.searchEvidence("gamma").text.contains("gamma"))
+        let gap = try index([page(1, [block("OPEN text")]), page(2, [], state: .needsOCR), page(3, [block("CLOSE tick")])])
+        try rejects(try gap.readRange(start: "OPEN", end: "CLOSE"), containing: "第 2 页")
+        try check(try gap.readRange(start: "CLOSE", end: "tick", withinPages: 3...3).first?.text == "CLOSE tick")
     }
 
     func testCrossPageWordCanBeSearchedWithEitherPrintedSpelling() throws {
@@ -141,7 +179,7 @@ struct ResearchPDFQueryCheck {
         let doc = try index([page(1, [block("omit. " + target + ". omit.")])])
         let parts = try doc.prepare("翻译从 START 到 FINISH 的全部内容。")
         try check(parts.count > 1)
-        try check(parts.allSatisfy { $0.text.utf16.count <= ResearchMaterial.maximumLength && $0.pdfPositions?.isEmpty == false })
+        try check(parts.allSatisfy { $0.text.utf16.count <= 7_200 && $0.pdfPositions?.isEmpty == false })
         try check(parts.map(\.text).joined() == target)
     }
 

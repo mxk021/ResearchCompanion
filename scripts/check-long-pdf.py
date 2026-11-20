@@ -15,9 +15,17 @@ def serve(listener, path, selection_check):
     reasoning = {"efforts": [{"id": "low", "name": "Low"}], "defaultEffort": "low"}
     subscription = dict(provider="chatgpt", model="gpt-6.2-sol", reasoningEffort="low")
     paid = dict(provider="deepseek-account", model="fixture-paid")
-    default = paid if selection_check else subscription
+    # A newly created session reports the requested tuple before the provider
+    # resolves its default effort. Planning and answering must use the same resolved tuple.
+    default = paid if selection_check else dict(provider=subscription["provider"], model=subscription["model"])
     range_packets = []
     cancel_polls = 0
+    rejected_part = False
+    first_part_requests = 0
+    plan_steps = {}
+    semantic = "为什么两次记录各用一种代号？"
+    cold_question = "有什么要留意的？"
+    inferred_range = "开场是 OPENING THISTLE，收尾是 PAGE_1_END，两处之间都要译成中文。"
     with listener.accept()[0] as conn, conn.makefile("rwb") as wire:
         for line in wire:
             request = json.loads(line)
@@ -25,7 +33,7 @@ def serve(listener, path, selection_check):
             result = {"ok": True, "id": request["id"]}
             if action == "capabilities":
                 result.update(protocolVersion=1, commandSocket=True,
-                              supports=["conversation", "researchContext", "researchPrompt", "researchMaterial", "modelCatalog", "researchSelectModel"],
+                              supports=["conversation", "researchContext", "researchPrompt", "researchMaterial", "modelCatalog", "researchSelectModel", "researchDocumentPlan"],
                               instance=dict(instanceId="pdf-check", commandSocketPath=str(path), statusSocketPath=str(path) + "-status"))
             elif action == "workspaces":
                 result["workspaces"] = [dict(id="pdf", title="PDF fixture", path=str(path.parent),
@@ -41,17 +49,53 @@ def serve(listener, path, selection_check):
                     dict(id="deepseek-account", name="Paid", models=[dict(id=paid["model"], name="Paid")])])
             elif action == "researchSelectModel":
                 assert request["workspaceId"] == "pdf" and request["sessionId"] in sessions
-                assert request["selection"] in (subscription, paid)
-                selected[request["sessionId"]] = result["selected"] = request["selection"]
+                assert request["selection"] in (subscription, paid, default)
+                resolved = subscription if not selection_check and request["selection"] == default else request["selection"]
+                selected[request["sessionId"]] = result["selected"] = resolved
+            elif action == "researchDocumentPlan":
+                # Unknown planning requests include strict-selection and exact-range paths:
+                # these must never expose even the file outline to the model.
+                q, doc = request["text"], request["document"]
+                route = request["selection"]
+                session = request["sessionId"]
+                assert request["workspaceId"] == "pdf" and session in sessions
+                assert route == selected[session] == subscription and doc["pages"] == (1 if q == cold_question else 52)
+                assert "originalPath" not in doc and "bookmark" not in doc and len(doc["id"]) == 64
+                stamp = (session, doc["id"], route["provider"], route["model"], route["reasoningEffort"])
+                previous = plan_steps.setdefault(q, [])
+                assert len(previous) < 2 and all(item == stamp for item in previous)
+                assert ("feedback" in doc) == bool(previous)
+                if previous:
+                    assert doc["feedback"].startswith("【已读取的证据】") == (q != "这行代号怎么理解？")
+                if q == cold_question:
+                    assert not previous
+                    plan = {"action": "pages", "pageStart": 1, "pageEnd": 1}
+                elif q == semantic:
+                    if previous:
+                        assert "OPENING THISTLE" in doc["feedback"]
+                    plan = {"action": "search", "query": "FINAL QUARTZ" if previous else "OPENING THISTLE"}
+                elif q == inferred_range:
+                    assert not previous
+                    plan = {"action": "range", "start": "OPENING THISTLE", "end": "PAGE_1_END"}
+                elif q == "HYPERION":
+                    plan = {"action": "useEvidence"} if previous else {"action": "search", "query": q}
+                elif q == "结合论文解释这段":
+                    assert doc["selection"] == "LARCH: fresh preview"
+                    plan = {"action": "useEvidence"} if previous else {"action": "combined", "query": "MIDPOINT LARCH"}
+                elif q == "这行代号怎么理解？":
+                    plan = {"action": "search", "query": "nonexistentfixturemark"}
+                else:
+                    raise AssertionError("Unexpected model planning request: " + q)
+                previous.append(stamp)
+                result.update(selection=route, documentId=doc["id"], plan=plan)
             elif action == "researchPrompt":
                 assert request["selection"] == selected[request["sessionId"]]
                 deliberate = selection_check and request["material"]["source"] == "Fixture explicit paid choice"
                 if not selection_check and request["text"] == "翻译从 OPENING THISTLE 到 PAGE_1_END 的内容。":
-                    deliberate = len(range_packets) == 1
+                    deliberate = request["selection"] == paid
                     packet = request["material"]
                     range_packets.append(packet)
-                    if deliberate:
-                        assert range_packets[0] == packet
+                    assert all(first == packet for first in range_packets)
                 assert request["selection"] == (paid if deliberate else subscription), "Unexpected paid translation or prompt"
                 history = replies[request["sessionId"]]
                 result["selection"] = request["selection"]
@@ -60,7 +104,16 @@ def serve(listener, path, selection_check):
                 assert len(material["text"].encode("utf-16-le")) // 2 <= 24_000
                 assert request["includeContext"] and request["sessionId"] in sessions
                 question = request["text"]
-                if "FAIL_SEGMENT" in question and "第 2/" in question:
+                if question in plan_steps:
+                    assert len(plan_steps[question]) == (1 if question in (inferred_range, cold_question) else 2)
+                    assert all(step[0] == request["sessionId"] and step[2:] ==
+                               (request["selection"]["provider"], request["selection"]["model"], request["selection"]["reasoningEffort"])
+                               for step in plan_steps[question])
+                if "FAIL_SEGMENT" in question and "第 1/" in question:
+                    first_part_requests += 1
+                    assert first_part_requests == 1, "Retry submitted a completed chunk twice"
+                if "FAIL_SEGMENT" in question and "第 2/" in question and not rejected_part:
+                    rejected_part = True
                     result.update(ok=False, error={"code": "fixture/rejected", "message": "synthetic rejection"})
                 else:
                     material.update(key="fixturekey")
@@ -98,7 +151,19 @@ if __name__ == "__main__":
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
             listener.bind(str(path))
             listener.listen()
-            worker = threading.Thread(target=serve, args=(listener, path, selection_check), daemon=True)
+            failures = []
+            def observe_socket():
+                try:
+                    serve(listener, path, selection_check)
+                except Exception as error:
+                    failures.append(error)
+            worker = threading.Thread(target=observe_socket, daemon=True)
             worker.start()
             # This existing diagnostic switch prevents writes to the installed app's launch log.
-            subprocess.run([verifier, root, "--check-bridge"], check=True)
+            result = subprocess.run([verifier, root, "--check-bridge"])
+            worker.join(timeout=3)
+            if failures:
+                raise failures[0]
+            result.check_returncode()
+            if worker.is_alive():
+                raise RuntimeError("The synthetic client did not close its socket")

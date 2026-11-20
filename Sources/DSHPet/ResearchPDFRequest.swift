@@ -21,11 +21,27 @@ enum ResearchPDFAddress {
     static let columns = #"左[侧边]?栏|右[侧边]?栏|\b(?:left|right)(?:[- ]hand)?\s+column\b"#
 
     static func parse(_ input: String) -> Self {
-        let q = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let q = endpointOptions(input).question.trimmingCharacters(in: .whitespacesAndNewlines)
         // Explicitly quoted endpoints keep punctuation inside the quotes.
         let quoted = #"(?:“([^”]*)”|「([^」]*)」|『([^』]*)』|‘([^’]*)’|"([^"]*)"|'([^']*)')"#
         if let m = captures(#"(?:从|自|\bfrom)\s*"# + quoted + #"\s*(?:至|到|直到|\bto\b|\bthrough\b)\s*"# + quoted, in: q) {
             return .anchors(m[1...6].first { !$0.isEmpty } ?? "", m[7...12].first { !$0.isEmpty } ?? "")
+        }
+        // Parse only explicitly marked boundaries here. Other colloquial descriptions
+        // go through the current model's document planner rather than guessing words.
+        // Two foreign-language excerpts separated by a Chinese range connector. At a
+        // script boundary the trailing imperative is outside the unquoted document text.
+        let foreign = #"([\p{Latin}\p{N}][\p{Latin}\p{M}\p{N}\s_\-–−'’(),./:;·]*?)"#
+        if let m = captures(#"(?:^|[\p{Han}：:，,])\s*"# + foreign + #"\s*(?:直到|至|到)\s*"# + foreign
+                            + #"\s*[。.,，；;：:\s]*这(?:一)?(?:段|部分|段落)(?:的)?(?:内容|原文|文字)?\s*(?:请|帮我)?(?:完整|全部)?(?:翻译|译成|译为|译出)"#, in: q) {
+            return .anchors(clean(m[1]), clean(m[2]))
+        }
+        let marked = [
+            #"(?:以|由)\s*(.+?)\s*(?:开头|起头|为起点|开始)[、，,；;\s]*(?:一直)?(?:直到|到|至|以)\s*(.+?)\s*(?:为终点|结束|为止|结尾)"#,
+            #"\b(?:beginning|starting) (?:with|at)\s+(.+?)\s*[,;]?\s*(?:and\s+)?ending (?:with|at)\s+(.+)$"#
+        ]
+        for pattern in marked {
+            if let m = captures(pattern, in: q) { return .anchors(clean(m[1]), clean(m[2], trailing: true)) }
         }
         let isPageToPage = captures(#"(?:从|自)\s*第?(?:"# + number + #")\s*页?\s*(?:至|到)\s*第?(?:"# + number + #")\s*页|\bfrom\s+page\s+\d+\s+to\s+page\s+\d+"#, in: q) != nil
         if !isPageToPage {
@@ -70,6 +86,18 @@ enum ResearchPDFAddress {
         }
     }
 
+    /// A boundary exclusion is an instruction only as a separate trailing clause.
+    /// Preserve punctuation and words *inside* the quoted endpoints.
+    static func endpointOptions(_ question: String) -> (question: String, includeStart: Bool, includeEnd: Bool) {
+        guard let parts = captures(#"^(.*?)(?:[，,；;（(]\s*)((?:不含|不包括|不包含|排除|excluding|exclude)\s*(?:起点(?:原文)?|终点(?:原文)?|两端(?:原文)?|(?:the )?(?:start|end|both endpoints?)))[）)。.!！]?\s*$"#, in: question) else {
+            return (question, true, true)
+        }
+        let clause = parts[2].lowercased()
+        let both = clause.contains("两端") || clause.contains("both")
+        return (parts[1], !(both || clause.contains("起点") || clause.contains("start")),
+                !(both || clause.contains("终点") || clause.contains("end")))
+    }
+
     private static func clean(_ text: String, trailing: Bool = false) -> String {
         var value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trailing {
@@ -78,9 +106,12 @@ enum ResearchPDFAddress {
             value = value.replacingOccurrences(of: #"(?:(?:[，,]?\s*(?:之间|为止|结束处)?\s*的\s*|\s+)(?:(?:全部|所有|整段|完整|这部分|这一段)\s*)?(?:内容|原文|文字|段落|部分))(?:[，,].*)?[。！？.!?]?\s*$"#, with: "", options: .regularExpression)
             value = value.trimmingCharacters(in: CharacterSet(charactersIn: "。！？!?"))
         }
-        return value.trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'“”‘’「」『』"))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let wrappers: [Character: Character] = ["“": "”", "‘": "’", "「": "」", "『": "』", "\"": "\"", "'": "'"]
+        if value.count >= 2, let start = value.first, let end = wrappers[start], value.last == end {
+            value = String(value.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return value
     }
 
     static func integer(_ text: String) -> Int? {

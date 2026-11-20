@@ -51,3 +51,11 @@ test('Zotero profile discovery respects the explicit default profile',async()=>{
   assert.equal(zoteroPairingPath(home),join(base,'Profiles/b/dsh-companion-bridge/pairing.json'))
  }finally{await rm(home,{recursive:true,force:true})}
 })
+
+test('translation and explanation preserve the actual typed range and restrictions', () => {
+  const material = decodeInlineMaterial({source:'PDF',title:'Example',text:'source',scope:'File page 2'})
+  const question = '从 A 到 FFT kernel 全译；保留两个端点。'
+  for (const mode of ['translate', 'explain']) {
+    assert.ok(researchPrompt(question, mode, material, DEFAULT_PERSONA).endsWith('\n'+question))
+  }
+})

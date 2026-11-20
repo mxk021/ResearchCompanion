@@ -128,6 +128,10 @@ struct ResearchPDFSearchText {
                 } else {
                     append("-", end: end)
                 }
+            } else if "‘’".contains(ch) {
+                append("'", end: end)
+            } else if "“”".contains(ch) {
+                append("\"", end: end)
             } else if let byte = ch.asciiValue {
                 append(String(UnicodeScalar(byte >= 65 && byte <= 90 ? byte + 32 : byte)), end: end)
             } else {
@@ -144,9 +148,9 @@ struct ResearchPDFSearchText {
 
     private static let hyphens: Set<Character> = ["-", "‐", "‑", "﹣", "－", "‒", "–"]
 
-    /// Return up to two distinct, boundary-aligned original intervals, enough to
-    /// distinguish unique from ambiguous. ICU matching uses the same UTF-16 offsets.
-    func occurrences(_ anchor: String) throws -> [NSRange] {
+    /// Match only inside the requested source interval. Limit results after applying that
+    /// constraint so a repeated header on an earlier page cannot hide a later exact match.
+    func occurrences(_ anchor: String, within source: NSRange? = nil, limit: Int = 2) throws -> [NSRange] {
         let query = try ResearchPDFSearchText(anchor.trimmingCharacters(in: .whitespacesAndNewlines)).folded
         guard !query.isEmpty, query.utf16.count <= 2_048 else {
             throw ResearchMaterialError.message("请给出非空、可核对的原文短句（每处最多 2048 个字符）。")
@@ -166,15 +170,27 @@ struct ResearchPDFSearchText {
         if query.last?.isASCII == true, query.last?.isLetter == true { pattern += "(?![a-zA-Z0-9" + marker + "])" }
         let regex = try NSRegularExpression(pattern: "(?=(" + pattern + "))")
         var hits: [NSRange] = []
-        regex.enumerateMatches(in: folded, range: NSRange(location: 0, length: starts.count)) { match, _, stop in
-            guard let span = match?.range(at: 1), span.length > 0 else { return }
+        func lowerBound(_ location: Int) -> Int {
+            var low = 0, high = starts.count
+            while low < high {
+                let mid = low + (high - low) / 2
+                if starts[mid] < location { low = mid + 1 } else { high = mid }
+            }
+            return low
+        }
+        let searchRange = source.map { span in
+            let lo = lowerBound(span.location)
+            return NSRange(location: lo, length: lowerBound(NSMaxRange(span)) - lo)
+        } ?? NSRange(location: 0, length: starts.count)
+        regex.enumerateMatches(in: folded, options: .withTransparentBounds, range: searchRange) { match, _, stop in
+            guard let span = match?.range(at: 1), span.length > 0, NSMaxRange(span) <= NSMaxRange(searchRange) else { return }
             let first = span.location, last = NSMaxRange(span) - 1
             // A ligature/case fold may expand into multiple units. Never return a
             // fraction of a source grapheme as a verified quotation.
             guard first == 0 || starts[first - 1] != starts[first],
                   last + 1 == starts.count || starts[last + 1] != starts[last] else { return }
             hits.append(NSRange(location: starts[first], length: ends[last] - starts[first]))
-            if hits.count == 2 { stop.pointee = true }
+            if hits.count >= limit { stop.pointee = true }
         }
         return hits
     }

@@ -5,6 +5,7 @@ import type { MoodBridgePayload } from './LocalStateBridge.js'
 import type { HarnessInstanceDescriptor } from './HarnessInstance.js'
 import { decodeResearchSelection, type ResearchSelection } from './ResearchModels.js'
 import { decodeInlineMaterial, type ResearchContext } from './ResearchContext.js'
+import { decodePlanningDocument, type PlanningDocument } from './ResearchDocumentPlan.js'
 import type { RetirementRequest } from './ResearchRetirement.js'
 import type { ResearchHistoryRequest } from './ResearchSessionIndex.js'
 
@@ -82,10 +83,11 @@ export interface CommandHandlers {
   openSession: (request: OpenSessionCommand) => Promise<{ accepted: true; sessionId: string }>
   prompt: (request: PromptCommand) => Promise<{ accepted: true; sessionId: string }>
   snapshotFor: (sessionId: string) => MoodBridgePayload | undefined | Promise<MoodBridgePayload | undefined>
-  conversation?: (request: OpenSessionCommand & { knownHistory?: string }) => Promise<unknown>
+  conversation?: (request: OpenSessionCommand & { knownHistory?: string; verifyRequestId?: string }) => Promise<unknown>
   modelCatalog?: () => Promise<unknown>
   researchSelectModel?: (request: OpenSessionCommand & { selection: ResearchSelection }) => Promise<unknown>
   researchContext?: () => Promise<unknown>
+  researchDocumentPlan?: (request: OpenSessionCommand & { text: string; document: PlanningDocument; selection: ResearchSelection; signal: AbortSignal }) => Promise<unknown>
   researchRetirement?: (request: RetirementRequest) => Promise<unknown>
   researchHistory?: (request: ResearchHistoryRequest) => Promise<unknown>
   researchPrompt?: (request: OpenSessionCommand & { requestId: string; text: string; mode: string; contextKey?: string; includeContext: boolean; expectedSelection?: ResearchSelection; material?: ResearchContext }) => Promise<unknown>
@@ -120,6 +122,7 @@ interface CommandRequest {
   contextKey?: unknown
   includeContext?: unknown
   material?: unknown
+  document?: unknown
   selection?: unknown
   knownHistory?: unknown
   historyTitle?: unknown
@@ -321,6 +324,22 @@ export class CommandBridge {
       if (action === 'modelCatalog' && this.handlers.modelCatalog) {
         this.respond(client.socket, id, { catalog: await this.handlers.modelCatalog() }); return
       }
+      if (action === 'researchDocumentPlan' && this.handlers.researchDocumentPlan) {
+        const selection = selectionField(request.selection)
+        if (!selection) throw new CommandError('invalid-request', '文档取证需要已绑定的模型。')
+        const document = decodePlanningDocument(request.document)
+        const abort = new AbortController()
+        const closed = () => abort.abort()
+        if (client.socket.destroyed) return
+        client.socket.once('close', closed)
+        try {
+          this.respond(client.socket, id, await this.handlers.researchDocumentPlan({
+            workspaceId: stringField(request.workspaceId, 'workspaceId'), sessionId: stringField(request.sessionId, 'sessionId'),
+            text: stringField(request.text, 'text'), document, selection, signal: AbortSignal.any([abort.signal, AbortSignal.timeout(85_000)]),
+          }))
+        } finally { client.socket.off('close', closed) }
+        return
+      }
       if (action === 'researchSelectModel' && this.handlers.researchSelectModel) {
         const selection = selectionField(request.selection)
         if (!selection) throw new CommandError('invalid-request', 'selection is required')
@@ -368,6 +387,7 @@ export class CommandBridge {
         this.respond(client.socket, id, await this.handlers.conversation({
           workspaceId: stringField(request.workspaceId, 'workspaceId'), sessionId: stringField(request.sessionId, 'sessionId'),
           ...(knownHistory ? { knownHistory } : {}),
+          ...(request.requestId === undefined ? {} : {verifyRequestId: stringField(request.requestId, 'requestId')}),
         })); return
       }
       if (action === 'researchPrompt' && this.handlers.researchPrompt) {

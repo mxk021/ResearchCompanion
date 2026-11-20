@@ -145,8 +145,9 @@ export class ZoteroContextProvider implements ContextProvider {
 export function researchPrompt(question: string, mode: string, context: ResearchContext | null, persona: string): string {
   if (!['ask', 'translate', 'explain'].includes(mode)) throw new Error('Invalid research mode')
   if (mode !== 'ask' && !context?.text) throw new Error('请先选择要翻译或解释的材料（Zotero、预览／浏览器选区或本机文件）。')
-  const instruction = mode === 'translate' ? '准确翻译所给原文为中文，保留术语与公式，不添加原文没有的信息。'
-    : mode === 'explain' ? '用中文解释所给原文的概念、论证和限制，区分原文与解释。' : question.trim()
+  const modeInstruction = mode === 'translate' ? '准确翻译所给原文为中文，保留术语与公式，不添加原文没有的信息。'
+    : mode === 'explain' ? '用中文解释所给原文的概念、论证和限制，区分原文与解释。' : ''
+  const instruction = [modeInstruction, question.trim()].filter(Boolean).join('\n')
   if (!instruction) throw new Error('请输入问题。')
   const evidence = context ? {
     key: context.key, title: context.title, source: context.source, page: context.pageLabel ?? null, pageIndex: context.pageIndex,

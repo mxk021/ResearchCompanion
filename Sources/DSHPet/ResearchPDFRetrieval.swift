@@ -54,26 +54,116 @@ extension ResearchPDFIndex {
         }
     }
 
-    private func exact(_ start: String, _ end: String?) throws -> [ResearchMaterial] {
-        // A missing physical page could hide a second occurrence of either anchor.
-        if !unavailable.isEmpty { throw missingPages(Array(unavailable), whole: true) }
-        func locate(_ text: String, _ name: String) throws -> NSRange {
-            let hits = try corpus.narrative.occurrences(text)
-            guard let hit = hits.first else { throw ResearchMaterialError.message("\(name)未在可核验的全文正文中找到：「\(text)」。请核对原文。") }
-            guard hits.count == 1 else {
-                let numbers = hits.flatMap { corpus.slices(intersecting: $0).map { corpus.entries[$0.entry].page } }
-                throw ResearchMaterialError.message("\(name)在文件第 \(Self.pageList(numbers)) 页至少出现两次：「\(text)」。请提供更长的唯一原文。")
+    /// Evidence from one contiguous range in the PDF reading order. Inputs from a model
+    /// are addresses only; the body and every location come from this version of the file.
+    func readRange(start: String, end: String, withinPages: ClosedRange<Int>? = nil, section: String? = nil,
+                   includeStart: Bool = true, includeEnd: Bool = true) throws -> [ResearchMaterial] {
+        try exact(start, end, withinPages: withinPages, section: section, includeStart: includeStart, includeEnd: includeEnd)
+    }
+
+    private func exact(_ start: String, _ end: String?, withinPages: ClosedRange<Int>? = nil,
+                       section: String? = nil, includeStart: Bool = true, includeEnd: Bool = true) throws -> [ResearchMaterial] {
+        if let withinPages { try validatePages(withinPages) }
+        let chapter = try section.map { try sectionEntries($0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) }
+        let ids = (chapter ?? corpus.entries.indices).filter { id in
+            let entry = corpus.entries[id]
+            return entry.narrativeRange != nil && (withinPages?.contains(entry.page) ?? true)
+        }
+        guard let firstID = ids.first, let lastID = ids.last,
+              let firstSpan = corpus.entries[firstID].narrativeRange,
+              let lastSpan = corpus.entries[lastID].narrativeRange else {
+            if let withinPages {
+                let missing = unavailable.filter(withinPages.contains)
+                if !missing.isEmpty { throw missingPages(Array(missing), whole: false) }
             }
-            return hit
+            throw ResearchMaterialError.message("指定位置没有可核对的连续正文。")
         }
-        let first = try locate(start, end == nil ? "引文" : "起点")
-        let last = try end.map { try locate($0, "终点") } ?? first
-        guard first.location <= last.location, NSMaxRange(first) <= NSMaxRange(last) else {
-            throw ResearchMaterialError.message("终点位于起点之前，无法按所给顺序提取。")
+        // A missing page inside the specified search scope can hide another endpoint.
+        var physical = withinPages ?? (1...pages.count)
+        if chapter != nil { physical = corpus.entries[firstID].page...corpus.entries[lastID].page }
+        let missing = unavailable.filter(physical.contains)
+        guard missing.isEmpty else { throw missingPages(Array(missing), whole: withinPages == nil && chapter == nil) }
+        let search = NSUnionRange(firstSpan, lastSpan)
+        func locate(_ text: String, name: String) throws -> [NSRange] {
+            let hits = try corpus.narrative.occurrences(text, within: search, limit: 9)
+            guard !hits.isEmpty else {
+                throw ResearchMaterialError.message("\(name)未在指定正文范围中找到：「\(text)」。请核对原文。")
+            }
+            return hits
         }
-        let slices = corpus.slices(intersecting: NSRange(location: first.location, length: NSMaxRange(last) - first.location))
+        func ambiguous(_ hits: [NSRange], name: String) -> ResearchMaterialError {
+            let candidates = hits.prefix(3).compactMap { hit -> String? in
+                guard let slice = corpus.slices(intersecting: hit).first else { return nil }
+                let entry = corpus.entries[slice.entry]
+                let block = pages[entry.page - 1].blocks[entry.block]
+                let column = block.column == 1 ? "左栏" : block.column == 2 ? "右栏" : ""
+                let ns = entry.text as NSString
+                let low = max(0, slice.range.location - 24)
+                let excerpt = ns.substring(with: ns.rangeOfComposedCharacterSequences(for:
+                    NSRange(location: low, length: min(70, ns.length - low)))).split(whereSeparator: \.isWhitespace).joined(separator: " ")
+                return "文件第 \(entry.page) 页\(column)第 \(entry.block + 1) 块「\(excerpt)」"
+            }
+            return .message("\(name)至少出现两次。候选位置：" + candidates.joined(separator: "；") + "。可指定文件页、章节或较长的原文。")
+        }
+        let starts = try locate(start, name: end == nil ? "引文" : "起点")
+        let first: NSRange, last: NSRange
+        if let end {
+            let ends = try locate(end, name: "终点")
+            // A non-exhaustive set must never be declared unique. Refine with an
+            // explicit page/section before enumerating repeated occurrences again.
+            if starts.count == 9 { throw ambiguous(starts, name: "起点") }
+            if ends.count == 9 { throw ambiguous(ends, name: "终点") }
+            func ordered(_ a: NSRange, _ b: NSRange) -> Bool {
+                a.location <= b.location && NSMaxRange(a) <= NSMaxRange(b)
+            }
+            let possibleStarts = starts.filter { a in ends.contains { ordered(a, $0) } }
+            guard let a = possibleStarts.first else {
+                throw ResearchMaterialError.message("终点位于起点之前，无法按所给顺序提取。")
+            }
+            guard possibleStarts.count == 1 else { throw ambiguous(possibleStarts, name: "起点") }
+            let possibleEnds = ends.filter { ordered(a, $0) }
+            guard possibleEnds.count == 1, let b = possibleEnds.first else { throw ambiguous(possibleEnds, name: "终点") }
+            (first, last) = (a, b)
+        } else {
+            guard starts.count == 1 else { throw ambiguous(starts, name: "引文") }
+            (first, last) = (starts[0], starts[0])
+        }
+        let lo = includeStart ? first.location : NSMaxRange(first)
+        let hi = includeEnd ? NSMaxRange(last) : last.location
+        guard hi > lo else { throw ResearchMaterialError.message("按指定边界排除端点后没有连续正文。") }
+        let slices = corpus.slices(intersecting: NSRange(location: lo, length: hi - lo))
         try verified(slices)
-        return try materials(slices, scope: "已核验原文范围（正文阅读顺序，含两端；页眉、页脚及独立脚注不计入）", limit: ResearchMaterial.maximumLength)
+        let ends = includeStart && includeEnd ? "含两端" : "按所指定的端点开闭取文"
+        return try materials(slices, scope: "已核验连续原文（\(ends)；页眉、页脚及独立脚注不计入）", limit: 7_200)
+    }
+
+    private func validatePages(_ range: ClosedRange<Int>) throws {
+        guard range.lowerBound >= 1, range.upperBound <= pages.count else {
+            throw ResearchMaterialError.message("所问页码超出 PDF 的文件页 1–\(pages.count)。")
+        }
+    }
+
+    func readPages(_ range: ClosedRange<Int>) throws -> [ResearchMaterial] {
+        try validatePages(range)
+        let missing = unavailable.filter(range.contains)
+        guard missing.isEmpty else { throw missingPages(Array(missing), whole: false) }
+        let slices = corpus.entries.indices.filter { range.contains(corpus.entries[$0].page) }.map(corpus.full)
+        try verified(slices)
+        return try materials(slices, scope: "按文件页序连续取出的原文", limit: 7_200)
+    }
+
+    func searchEvidence(_ query: String, selection: String? = nil) throws -> ResearchMaterial {
+        try ranked(query, background: selection)
+    }
+
+    var documentOutline: [String] {
+        var result: [String] = []
+        for id in corpus.entries.indices {
+            guard let title = heading(id), !title.isEmpty else { continue }
+            result.append("文件第 \(corpus.entries[id].page) 页 · " + String(title.prefix(96)))
+            if result.count == 24 { break }
+        }
+        return result
     }
 
     private func physicalPages(_ question: String) throws -> Set<Int>? {
@@ -182,7 +272,25 @@ extension ResearchPDFIndex {
         try address.requireAnchorText()
         switch address {
         case let .anchors(a, b):
-            let alternatives = try ResearchPDFAddress.englishEndpoints(question)
+            let options = ResearchPDFAddress.endpointOptions(question)
+            // Only structural context before the "from" phrase can constrain a range.
+            // A page or section mentioned inside a verbatim endpoint remains source text.
+            let prefix = options.question.range(of: #"(?:从|自|以|由|\bfrom\b|\b(?:beginning|starting) (?:with|at)\b)"#,
+                                                options: [.regularExpression, .caseInsensitive]).map { String(options.question[..<$0.lowerBound]) } ?? ""
+            let explicitPages = try physicalPages(prefix)
+            let pageRange: ClosedRange<Int>?
+            if let pages = explicitPages, let low = pages.min(), let high = pages.max() {
+                guard pages.count == high - low + 1 else {
+                    throw ResearchMaterialError.message("连续范围只能以相邻的文件页消歧，请指定单页或连续页段。")
+                }
+                pageRange = low...high
+            } else { pageRange = nil }
+            let section = ResearchPDFAddress.explicitSection(prefix)
+            func read(_ start: String, _ end: String) throws -> [ResearchMaterial] {
+                try readRange(start: start, end: end, withinPages: pageRange, section: section,
+                              includeStart: options.includeStart, includeEnd: options.includeEnd)
+            }
+            let alternatives = try ResearchPDFAddress.englishEndpoints(options.question)
             if !alternatives.isEmpty {
                 let valid = try alternatives.filter { pair in
                     guard !pair.0.isEmpty, !pair.1.isEmpty else { return false }
@@ -191,9 +299,9 @@ extension ResearchPDFIndex {
                 guard valid.count == 1, let pair = valid.first else {
                     throw ResearchMaterialError.message("无法唯一确定英文起止短句，请分别用引号标出两处原文。")
                 }
-                return try exact(pair.0, pair.1)
+                return try read(pair.0, pair.1)
             }
-            return try exact(a, b)
+            return try read(a, b)
         case let .quotation(quote): return try exact(quote, nil)
         case .location, .none: break
         }

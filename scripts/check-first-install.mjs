@@ -11,7 +11,7 @@ import { createInterface } from 'node:readline'
 import { promisify } from 'node:util'
 import { setTimeout as delay } from 'node:timers/promises'
 import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat } from 'node:fs/promises'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 
 assert.ok(process.versions.electron, 'Run with the DSH Desktop Electron runtime in Node mode.')
 assert.ok(process.argv[2], 'Supply a bridge .tgz, optionally followed by the packaged Research Companion executable.')
@@ -92,15 +92,23 @@ try {
     require(join(installation, 'dsh-official-bundles/lib/index.js')).PROFILE_TEMPLATES.web.bundles)
   const store = join(dsh, 'local-plugins/ResearchCompanion')
   await mkdir(store, { recursive: true, mode: 0o700 })
-  const localPackage = join(store, basename(tgz))
-  await copyFile(tgz, localPackage)
-  await execute(cli, ['plugin', '--profile', 'desktop', 'add', '--offline', '--ignore-scripts', 'file:' + localPackage], { env })
+  async function installPackage(source) {
+    const digest = createHash('sha256').update(await readFile(source)).digest('hex')
+    const directory = join(store,digest)
+    await mkdir(directory,{recursive:true,mode:0o700})
+    const localPackage = join(directory,basename(source))
+    await copyFile(source,localPackage)
+    await execute(cli, ['plugin','--profile','desktop','add','--offline','--ignore-scripts','file:' + localPackage], {env})
+  }
+  const previous = process.env.RC_TEST_UPGRADE_FROM
+  await installPackage(previous ?? tgz)
   const metadata = JSON.parse(await readFile(join(profile, 'package.json')))
   assert.ok(metadata.dsh.profile.bundles.includes('dsh-research-companion'))
   assert.deepEqual(Object.keys(metadata.dependencies), ['dsh-research-companion'])
   const { manifest, path } = await start()
   const [capabilities, state] = await Promise.all([request(manifest, 'capabilities'), request(manifest, 'workspaces')])
   assert.ok(capabilities.supports.includes('researchHistory'))
+  assert.equal(capabilities.supports.includes('researchDocumentPlan'), !previous)
   assert.ok(!capabilities.supports.some(feature => feature.startsWith('research.retirement.') || feature === 'researchSafeDelete'))
   assert.equal(state.workspaces.length, 1)
   assert.equal(state.workspaces[0].path, workspace)
@@ -118,7 +126,9 @@ try {
   const sessionId = randomUUID(), workspaceId = state.workspaces[0].id
   assert.equal((await request(manifest, 'createSession', { workspaceId, sessionId, title: 'Synthetic optics' })).sessionId, sessionId)
   await stop()
+  if (previous) await installPackage(tgz)
   const reopened = await start()
+  assert.ok((await request(reopened.manifest,'capabilities')).supports.includes('researchDocumentPlan'))
   const persisted = (await request(reopened.manifest, 'workspaces')).workspaces
   assert.equal(persisted[0].id, workspaceId)
   assert.deepEqual(persisted[0].sessionIds, [sessionId])
@@ -137,6 +147,7 @@ try {
   assert.equal(preserved.id, previousWorkspace.id)
   assert.equal(preserved.path, legacy)
   await stop()
+  if (previous) console.log('The stock offline CLI upgraded the previous public bridge in place and kept the original synthetic session.')
   console.log('The unconfigured ChatGPT provider offered no model. A pre-existing synthetic legacy workspace retained its registered identity after an upgrade.')
   console.log('Fresh HOME: stock CLI installed the release bridge offline; stock Host created one workspace, persisted a named synthetic session across restart, and withheld unsupported deletion.')
   if (nativeApp) console.log('The packaged native command client connected over the owner-local socket.')

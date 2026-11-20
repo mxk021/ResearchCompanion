@@ -83,6 +83,10 @@ struct ResearchMaterial: Equatable, Sendable {
         } else {
             background = try file.relevantText(question: question, selection: searchText)
         }
+        return try withBackgroundEvidence(background)
+    }
+
+    func withBackgroundEvidence(_ background: Self) throws -> Self {
         let location = [source, title, page.map { "页标签 " + $0 }].compactMap { $0 }.joined(separator: " · ")
         let range = background.pdfPages.map { " · PDF 文件页 " + $0 } ?? ""
         let body = "【本次选区 · " + location + "】\n" + text + "\n\n【会话文件摘录 · " + background.source + " · " + background.title + range + "】\n" + background.text

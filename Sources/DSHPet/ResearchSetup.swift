@@ -3,12 +3,12 @@ import CryptoKit
 import Foundation
 import SwiftUI
 
-/// An explicit first-install action. DSH owns profile locking, validation and bundle reconciliation.
+/// An explicit install or verified Community Beta upgrade. DSH owns profile locking, validation and bundle reconciliation.
 struct ResearchSetup {
     static let identifier = "com.deepseek.dsh"
     static let supportedVersion = "0.2.2-rc.5"
     static let bridgeName = "dsh-research-companion"
-    static let archiveName = bridgeName + "-0.2.3.tgz"
+    static let archiveName = bridgeName + "-0.2.4.tgz"
     static let download = URL(string: "https://www.deepseek.com/harness/")!
     let desktop: URL?
     let home: URL
@@ -28,7 +28,7 @@ struct ResearchSetup {
                     archive: Bundle.main.url(forResource: archiveName, withExtension: nil))
     }
 
-    enum BridgeState: Equatable { case uninitialized, absent, selected, disabled, invalid }
+    enum BridgeState: Equatable { case uninitialized, absent, selected, upgradeable, customPrevious, disabled, invalid }
     func bridgeState() -> BridgeState {
         let file = profile.appendingPathComponent("package.json")
         if !FileManager.default.fileExists(atPath: file.path) { return .uninitialized }
@@ -37,8 +37,40 @@ struct ResearchSetup {
               let dsh = root["dsh"] as? [String: Any], let metadata = dsh["profile"] as? [String: Any],
               let bundles = metadata["bundles"] as? [String] else { return .invalid }
         let dependency = (root["dependencies"] as? [String: String])?[Self.bridgeName]
-        if bundles.contains(Self.bridgeName) { return dependency == nil ? .invalid : .selected }
+        if bundles.contains(Self.bridgeName) {
+            guard let dependency else { return .invalid }
+            let package = profile.appendingPathComponent("node_modules/" + Self.bridgeName)
+            guard let manifest = try? Data(contentsOf: package.appendingPathComponent("package.json")),
+                  let installed = (try? JSONSerialization.jsonObject(with: manifest)) as? [String: Any],
+                  installed["name"] as? String == Self.bridgeName else { return .invalid }
+            if installed["version"] as? String == "0.2.3" {
+                return isOriginalCommunityBridge(dependency, installed: package) ? .upgradeable : .customPrevious
+            }
+            return .selected
+        }
         return dependency == nil ? .absent : .disabled
+    }
+
+    /// Limit in-place upgrades to the unmodified bridge installed by the previous public release.
+    private func isOriginalCommunityBridge(_ dependency: String, installed: URL) -> Bool {
+        let previousDigest = "fed8184516967505b5a747ca0c76a0580854dca8f467bc8c6c050d7812900f72"
+        guard dependency.hasPrefix("file:") else { return false }
+        let pathname = String(dependency.dropFirst("file:".count))
+        let resolved = (pathname as NSString).isAbsolutePath ? URL(fileURLWithPath: pathname) : profile.appendingPathComponent(pathname)
+        let original = home.appendingPathComponent(".dsh/local-plugins/ResearchCompanion/" + previousDigest)
+            .appendingPathComponent(Self.bridgeName + "-0.2.3.tgz")
+        guard resolved.standardizedFileURL == original.standardizedFileURL,
+              original.resolvingSymlinksInPath().standardizedFileURL == original.standardizedFileURL,
+              let bytes = try? Data(contentsOf: original), SHA256.hash(data: bytes).hexString == previousDigest else { return false }
+        // A replaced entry point, manifest, UI or cordis patch may belong to a
+        // private integration even when the old tarball is still in place.
+        var executable = SHA256()
+        for path in ["cordis.patch.yml", "lib/client.js", "lib/index.js", "lib/ResearchContext.js", "lib/ResearchSessionIndex.js", "package.json"] {
+            guard let data = try? Data(contentsOf: installed.appendingPathComponent(path)) else { return false }
+            executable.update(data: data)
+            executable.update(data: Data([0]))
+        }
+        return executable.finalize().hexString == "f984135ea2b42a75ba36750602483e2cc281007aa6ab4e425570ecd8f8ac0555"
     }
 
     enum Failure: LocalizedError {
@@ -53,7 +85,7 @@ struct ResearchSetup {
               FileManager.default.isExecutableFile(atPath: cli.path) else {
             throw Failure.detail("未找到匹配的 DSH 桌面版或随应用分发的科研桥。")
         }
-        guard bridgeState() == .absent else { throw Failure.detail("桌面配置已变化。请重新检查科研桥的安装状态。") }
+        guard [.absent, .upgradeable].contains(bridgeState()) else { throw Failure.detail("桌面配置已变化。请重新检查科研桥的安装状态。") }
         // Limit executable trust to the official signed desktop distribution validated for this release.
         let verify = Process()
         verify.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
@@ -81,6 +113,9 @@ struct ResearchSetup {
         } else {
             try bytes.write(to: destination, options: .withoutOverwriting)
         }
+        guard !NSRunningApplication.runningApplications(withBundleIdentifier: Self.identifier).contains(where: { !$0.isTerminated }) else {
+            throw Failure.detail("请先保存工作并从应用菜单正常退出 DSH，再更新科研桥。")
+        }
         let operation = Process()
         operation.executableURL = cli
         operation.arguments = ["plugin", "--profile", "desktop", "add", "--offline", "--ignore-scripts", "file:" + destination.path]
@@ -99,6 +134,10 @@ struct ResearchSetup {
     }
 }
 
+private extension SHA256.Digest {
+    var hexString: String { map { String(format: "%02x", $0) }.joined() }
+}
+
 struct ResearchSetupView: View {
     @State private var environment = ResearchSetup.current()
     @State private var bridge: ResearchSetup.BridgeState = .uninitialized
@@ -112,6 +151,8 @@ struct ResearchSetupView: View {
         switch bridge {
         case .uninitialized: return "请先打开 DSH，等待桌面初始化，然后从其应用菜单正常退出。"
         case .absent: return isRunning ? "请先保存工作并正常退出 DSH，待其退出后安装本地科研桥。" : "安装科研桥后，重新打开 DSH 即会创建本账号的科研工作区。"
+        case .upgradeable: return isRunning ? "请先保存工作并正常退出 DSH，再更新原公开版科研桥。" : "可将旧版科研桥更新到应用随附版本，保留原科研工作区和会话。"
+        case .customPrevious: return "现有科研桥由其他方式维护。请按原安装方式更新文档取证接口，保留原插件和本机定制。"
         case .selected: return isRunning ? "科研桥已登记。等待 DSH 就绪；如仍未连接，请在 DSH 插件页检查加载情况。" : "科研桥已登记。请打开 DSH，然后在会话模型菜单选择已授权模型。"
         case .disabled: return "科研桥已安装但未启用。请在 DSH 的桌面插件页启用原有科研桥。"
         case .invalid: return "桌面 profile 无法识别。请先在 DSH 中检查现有配置。"
@@ -125,8 +166,8 @@ struct ResearchSetupView: View {
             HStack {
                 if environment.version == nil || !compatible {
                     Link("DSH 官方下载", destination: ResearchSetup.download)
-                } else if bridge == .absent && !isRunning {
-                    Button(installing ? "正在安装…" : "安装科研桥") { install() }.disabled(installing)
+                } else if [.absent, .upgradeable].contains(bridge) && !isRunning {
+                    Button(installing ? "正在安装…" : bridge == .upgradeable ? "更新科研桥" : "安装科研桥") { install() }.disabled(installing)
                 } else if !isRunning, let desktop = environment.desktop {
                     Button("打开 DSH") { NSWorkspace.shared.openApplication(at: desktop, configuration: .init()) { _, _ in } }
                 }
@@ -150,7 +191,7 @@ struct ResearchSetupView: View {
 
     private func install() {
         refresh()
-        guard compatible, !isRunning, !installing, bridge == .absent else { return }
+        guard compatible, !isRunning, !installing, [.absent, .upgradeable].contains(bridge) else { return }
         let setup = environment
         installing = true
         issue = nil

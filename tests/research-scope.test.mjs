@@ -82,6 +82,11 @@ async function harness(run) {
       saveSelection: () => { throw new Error('must not write the global model') },
     },
     llm: {
+      stream: options => {
+        calls.push(['llm.stream', options])
+        if (!state.planner) throw new Error('test planner missing')
+        return state.planner(options)
+      },
       listProviders: () => Object.keys(models).map(id => ({ id, name: id })),
       listConfigurableProviders: () => [{ provider: 'chatgpt', settingsNs: 'chatgpt' }, { provider: 'openai', settingsNs: 'pi-ai' }],
       listModels: async provider => {
@@ -417,5 +422,112 @@ test('subscription and DeepSeek agent admission receive identical verified PDF e
       snapshots.push(prompt)
     }
     assert.equal(snapshots[0], snapshots[1])
+  })
+})
+
+test('only explicit native tools supply plans, exact route and source bounds survive socket transport', async () => {
+  await harness(async ({client, calls, state}) => {
+    const target = {workspaceId:'research-workspace', sessionId:'research-session'}
+    const document = {id:'revision-01', title:'Untrusted document', pages:3, outline:['Methods'], history:['User asked about optics.']}
+    const text = 'Translate every word from First anchor to FFT kernel with constant memory.'
+    function native(name, args) {
+      return async function* () {
+        yield {type:'block-end', index:0, block:{type:'tool-call', id:'abc', name, arguments:JSON.stringify(args)}}
+        yield {type:'finish', reason:{kind:'tool-calls'}}
+      }
+    }
+    const args = {start:'First anchor', end:'FFT kernel with constant memory'}
+    for (const selection of [{provider:'deepseek-account', model:'deepseek-flash'}, {provider:'chatgpt', model:'gpt-test', reasoningEffort:'medium'}]) {
+      await client.request('researchSelectModel', {...target, selection})
+      const request = (overrides = {}) => client.request('researchDocumentPlan', {...target,text,document,selection, ...overrides})
+      state.planner = native('document_range', args)
+      const result = await request()
+      assert.deepEqual(result.plan,{action:'range',...args})
+      assert.equal(result.documentId,document.id)
+      assert.deepEqual(result.selection,selection)
+      const options = calls.filter(([name])=>name==='llm.stream').at(-1)[1]
+      assert.equal(options.provider, selection.provider)
+      assert.equal(options.model,selection.model)
+      assert.equal(options.reasoningEffort,selection.reasoningEffort)
+      assert.equal(options.tools.some(tool=>tool.name==='document_selection'),false)
+      assert.equal(options.tools.some(tool=>tool.name==='document_useEvidence'),false)
+      assert.equal(JSON.parse(options.messages[0].content[0].text).history[0],document.history[0])
+      state.planner = native('document_range',{...args,end:'an invented endpoint'})
+      await assert.rejects(request(),/端点/)
+      state.planner = native('document_range', {start:'First anchor',end:'kernel with constant memory'})
+      await assert.rejects(request({text:'从 First anchor 到 FFT kernel with constant memory 的全部内容'}),/缩短/)
+      state.planner = native('document_pages',{pageStart:2,pageEnd:8})
+      await assert.rejects(request(),/页序/)
+      state.planner = native('document_useEvidence',{})
+      const following = await request({document:{...document,feedback:'【已读取的证据】\nEarlier read returned relevant source text.'}})
+      assert.equal(following.plan.action,'useEvidence')
+      await assert.rejects(request({document:{...document,feedback:'read failed'}}),/工具调用/)
+      state.planner=native('document_range',{start:'First anchor',end:'ending at a verified paragraph.'})
+      assert.equal((await request({document:{...document,feedback:'【已读取的证据】\nending at a verified paragraph.'}})).plan.action,'range')
+      await assert.rejects(request({document:{...document,feedback:'No match for ending at a verified paragraph.'}}),/端点/)
+      await assert.rejects(request({workspaceId:'original-workspace'}),/not attached/)
+      const before = calls.filter(([name])=>name==='llm.stream').length
+      await assert.rejects(request({document:{...document,file:'/private/original'}}),/字段/)
+      await assert.rejects(request({selection:{provider:'openai',model:'prohibited'}}),/模型已变化/)
+      assert.equal(calls.filter(([name])=>name==='llm.stream').length,before)
+      state.planner = async function* () {
+        yield {type:'block-end', block:{type:'text',text:'{"action":"whole"}'}}
+        yield {type:'finish',reason:{kind:'stop'}}
+      }
+      await assert.rejects(request(),/未知字段|未匹配|结构化/)
+      assert.equal(calls.filter(([name])=>name==='llm.stream').length,before+2)
+    }
+    assert.equal(calls.some(([name])=>name==='prompt'),false)
+  })
+})
+
+test('an explicit unsupported-tools failure permits a single isolated schema-only retry', async () => {
+  await harness(async ({client,calls,state}) => {
+    const selection = {provider:'chatgpt',model:'gpt-test',reasoningEffort:'low'}
+    const target = {workspaceId:'research-workspace',sessionId:'research-session'}
+    await client.request('researchSelectModel',{...target,selection})
+    let bad = false
+    state.planner = async function* (options) {
+      if (options.tools) {
+        yield {type:'finish',reason:{kind:'error',failure:{code:'UNSUPPORTED_TOOLS'}}}
+      } else {
+        const nonce = options.system.match(/nonce must equal ([0-9a-f-]{36})/u)[1]
+        const envelope = {nonce:bad?'stale':nonce,plan:{action:'combined',query:'optical filter bandwidth'}}
+        yield {type:'block-end',block:{type:'text',text:JSON.stringify(envelope)}}
+        yield {type:'finish',reason:{kind:'stop'}}
+      }
+    }
+    const request=()=>client.request('researchDocumentPlan',{...target,selection,text:'纸中这段为什么这样做？',
+      document:{id:'version-7',title:'Example',pages:8,selection:'the filter bandwidth'}})
+    assert.equal((await request()).plan.action,'combined')
+    bad = true
+    await assert.rejects(request(),/未匹配/)
+    const options=calls.filter(([name])=>name==='llm.stream').map(([,value])=>value)
+    assert.equal(options.length,4)
+    assert.ok(options.every(o=>o.provider===selection.provider && o.model===selection.model && o.reasoningEffort===selection.reasoningEffort))
+  })
+})
+
+
+test('dispatch verification fingerprints only evidence actually present at the adapter boundary', async () => {
+  await harness(async ({client,calls,eventHandlers}) => {
+    const {createHash} = await import('node:crypto')
+    const target = {workspaceId:'research-workspace',sessionId:'research-session'}
+    const selection = {provider:'chatgpt',model:'gpt-test',reasoningEffort:'medium'}
+    const material = {source:'PDF',title:'Synthetic',scope:'file page 2',text:'α and β in synthetic data.'}
+    const requestId = 'adapter-audit-1'
+    await client.request('researchSelectModel',{...target,selection})
+    await client.request('researchPrompt',{...target,selection,material,requestId,text:'translate',mode:'ask',includeContext:true})
+    const get = async () => (await client.request('conversation',{...target,requestId})).dispatchEvidence
+    assert.equal(await get(),null)
+    const stream = eventHandlers.get('llm/stream')[0]
+    const prompt = calls.filter(([name])=>name==='prompt').at(-1)[1].content[0].text
+    const input = prompt.replace(material.text,'SYNTHETIC changed by fixture after admission')
+    const messages = [{role:'user',source:{kind:'user',rpcId:requestId},content:[{type:'text',text:input}]}]
+    stream({...selection,sessionId:target.sessionId,messages},()=>[])
+    const quote = 'SYNTHETIC changed by fixture after admission'
+    assert.deepEqual(await get(),{requestId,selection,sha256:createHash('sha256').update(quote).digest('hex'),utf16Length:quote.length})
+    assert.equal((await client.request('conversation',{...target,requestId:'different'})).dispatchEvidence,null)
+    assert.equal('dispatchEvidence' in (await client.request('conversation',target)),false)
   })
 })
