@@ -1,0 +1,9 @@
+{
+  "name": "research-companion-zotero-context-bridge",
+  "version": "0.1.4",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test tests/bridge.test.cjs"
+  }
+}

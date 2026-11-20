@@ -1,0 +1,94 @@
+import Foundation
+import CoreGraphics
+
+/// 保留 Codex 原图的帧序与尺寸，只映射 DSH 的状态语义。
+struct CodexSpriteAtlas {
+    enum BuiltIn: String, CaseIterable {
+        case xinzhizhu = "Xinzhizhu"
+        case jingyuniang = "Jingyuniang"
+        case jingyuniangQ = "JingyuniangQ"
+    }
+
+    // Q 版有三帧连续闭眼；在 6.6 秒循环内快速播放，避免长时间闭眼。
+    static let jingyuniangQIdleFrameDurations: [TimeInterval] = [6.12, 0.10, 0.08, 0.08, 0.08, 0.14]
+    private let cells: [[CGImage]]
+    private let idleFrameCount: Int
+    private let idleFrameDurations: [TimeInterval]?
+    private var importedFrameCounts: [Int]?
+
+    init(builtIn: BuiltIn = .xinzhizhu, bundle: Bundle = .main) throws {
+        let name = builtIn.rawValue
+        let fileExtension = builtIn == .jingyuniang ? "png" : "webp"
+        guard let url = bundle.url(forResource: name + "Sprites", withExtension: fileExtension, subdirectory: "Pet/\(name)") else {
+            throw XiaoyuSpriteAtlasError.missingResource
+        }
+        try self.init(resourceURL: url, idleFrameCount: builtIn == .xinzhizhu ? 7 : 6,
+                      idleFrameDurations: builtIn == .jingyuniangQ ? Self.jingyuniangQIdleFrameDurations : nil)
+    }
+
+    init(resourceURL: URL, idleFrameCount: Int = 7, idleFrameDurations: [TimeInterval]? = nil) throws {
+        precondition((1...8).contains(idleFrameCount))
+        self.idleFrameCount = idleFrameCount
+        self.idleFrameDurations = idleFrameDurations
+        cells = try XiaoyuSpriteAtlas.decodeCells(resourceURL: resourceURL, rows: 11)
+    }
+
+    init(importedImage: CGImage) throws {
+        // Decode compressed atlases once before cropping; each frame then shares bitmap storage.
+        guard let context = CGContext(data: nil, width: importedImage.width, height: importedImage.height,
+            bitsPerComponent: 8, bytesPerRow: importedImage.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            throw XiaoyuSpriteAtlasError.unreadableImage
+        }
+        context.draw(importedImage, in: CGRect(x: 0, y: 0, width: importedImage.width, height: importedImage.height))
+        guard let decodedImage = context.makeImage() else { throw XiaoyuSpriteAtlasError.unreadableImage }
+        cells = try XiaoyuSpriteAtlas.decodeCells(image: decodedImage, rows: 11)
+        idleFrameCount = 6
+        idleFrameDurations = nil
+        var counts: [Int] = []
+        for row in cells {
+            let occupied = row.map(Self.hasVisiblePixels)
+            guard let last = occupied.lastIndex(of: true), occupied.prefix(last + 1).allSatisfy({ $0 }) else {
+                throw CustomPetImportError.invalid("图集中有缺失或不连续的动作帧。")
+            }
+            counts.append(last + 1)
+        }
+        guard counts[1] == 8, counts[2] == 8 else {
+            throw CustomPetImportError.invalid("左右移动动作必须各包含 8 帧。")
+        }
+        importedFrameCounts = counts
+    }
+
+    static func hasVisiblePixels(_ image: CGImage) -> Bool {
+        var pixels = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        guard let context = CGContext(data: &pixels, width: image.width, height: image.height,
+            bitsPerComponent: 8, bytesPerRow: image.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return stride(from: 3, to: pixels.count, by: 4).contains { pixels[$0] > 0 }
+    }
+
+    static func row(for animation: XiaoyuAnimation) -> Int {
+        switch animation {
+        case .disconnected, .idle: return 0
+        case .waiting: return 7
+        case .authorizing, .questioning: return 6
+        case .done: return 4
+        case .failed: return 5
+        case .wave: return 3
+        }
+    }
+
+    func frame(for animation: XiaoyuAnimation, elapsed: TimeInterval) -> CGImage? {
+        let row = Self.row(for: animation)
+        let count = animation == .disconnected ? 1
+            : importedFrameCounts?[row] ?? (animation == .idle ? idleFrameCount : animation.frameDurations.count)
+        return cells[row][animation.frameIndex(
+            elapsed: elapsed, frameCount: count, durations: animation == .idle ? idleFrameDurations : nil
+        )]
+    }
+
+    func dragFrame(for direction: XiaoyuDragDirection, elapsed: TimeInterval) -> CGImage? {
+        cells[direction == .right ? 1 : 2][direction.frameIndex(elapsed: elapsed)]
+    }
+}

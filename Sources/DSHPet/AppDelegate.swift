@@ -1,0 +1,1607 @@
+import AppKit
+import SwiftUI
+import Combine
+import QuartzCore
+import os
+
+private let appLog = Logger(subsystem: "com.local.research-companion", category: "app")
+
+/// 置顶悬浮窗：透明、无边框、不抢焦点、点击穿透。
+/// 鼠标移入球体范围时恢复响应（可拖拽），移出后再次穿透。
+/// 拖拽由 SwiftUI 手势驱动（见 DSHPetView），位置持久化到 UserDefaults。
+final class DSHPetPanel: NSPanel {
+    /// 供 SwiftUI 拖拽手势引用当前悬浮窗
+    static weak var current: DSHPetPanel?
+
+    /// 拖拽进行中（悬停检测据此保持响应，避免拖到一半变成点击穿透）
+    var isDragging = false
+    var onRightClick: ((NSPoint) -> Void)?
+
+    private enum PositionKeys {
+        static let x = "dsh-pet.ballPositionX"
+        static let y = "dsh-pet.ballPositionY"
+    }
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+    override var acceptsFirstResponder: Bool { true }
+
+    override func rightMouseDown(with event: NSEvent) {
+        onRightClick?(NSEvent.mouseLocation)
+    }
+
+    /// 尝试恢复上次拖拽保存的位置；仅当设置允许且窗口中心仍在某个屏幕可视区内才生效
+    @discardableResult
+    func restoreSavedPosition() -> Bool {
+        guard PetSettings.shared.rememberPosition else { return false }
+        let defaults = UserDefaults.standard
+        let x = (defaults.object(forKey: PositionKeys.x) as? NSNumber)?.doubleValue
+        let y = (defaults.object(forKey: PositionKeys.y) as? NSNumber)?.doubleValue
+        guard let x, let y else { return false }
+        // 用「窗口中心」判断而非整窗相交：避免显示器变化后只留一截在屏边、球心在屏外
+        let center = NSPoint(x: x + self.frame.width / 2, y: y + self.frame.height / 2)
+        let visibleFrames = NSScreen.screens.map(\.visibleFrame)
+        guard visibleFrames.contains(where: { $0.contains(center) }) else { return false }
+        setFrameOrigin(NSPoint(x: x, y: y))
+        return true
+    }
+
+    /// 拖拽结束时保存当前位置（受「记住位置」设置控制）
+    func persistPosition() {
+        guard PetSettings.shared.rememberPosition else { return }
+        UserDefaults.standard.set(Double(frame.origin.x), forKey: PositionKeys.x)
+        UserDefaults.standard.set(Double(frame.origin.y), forKey: PositionKeys.y)
+        appLog.info("persistPosition -> \(Int(self.frame.origin.x)),\(Int(self.frame.origin.y))")
+    }
+}
+
+/// Separate control surface below the pet. Keeping it in its own panel means
+/// expanding the composer never changes the pet window's drag anchor or size.
+final class DSHPetComposerPanel: NSPanel {
+    var onExplicitClose: (() -> Void)?
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+    override var acceptsFirstResponder: Bool { true }
+    override func cancelOperation(_ sender: Any?) { onExplicitClose?() }
+}
+
+final class DSHPetTaskPanel: NSPanel {
+    var onCancel: (() -> Void)?
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+    override var acceptsFirstResponder: Bool { true }
+
+    override func cancelOperation(_ sender: Any?) {
+        onCancel?()
+    }
+}
+
+private final class PetContextPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+private struct PetContextView: View {
+    let hidePet: () -> Void
+
+    var body: some View {
+        Button(action: hidePet) {
+            Text("隐藏宠物")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white)
+                .frame(width: 88, height: 32)
+                .background(Color(nsColor: NSColor(calibratedWhite: 0.42, alpha: 0.76)),
+                            in: RoundedRectangle(cornerRadius: 12))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(.white.opacity(0.35), lineWidth: 0.7)
+                }
+                .shadow(color: .black.opacity(0.2), radius: 7, y: 3)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("隐藏宠物")
+        .frame(width: 104, height: 48)
+    }
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+    private let model = DSHPetModel.shared
+    private var panel: DSHPetPanel?
+    private var composerPanel: DSHPetComposerPanel?
+    private var researchWindow: ResearchWindowController?
+    private var taskPanel: DSHPetTaskPanel?
+    private var petContextPanel: PetContextPanel?
+    private var petContextMonitors: [Any] = []
+    private var settingsPanel: NSPanel?
+    private var hoverMonitors: [Any] = []
+    private var visibilitySink: AnyCancellable?
+    private var settingsSink: AnyCancellable?
+    private var bubbleSink: AnyCancellable?
+    private var composerSink: AnyCancellable?
+    private var researchVisibilitySink: AnyCancellable?
+    private var taskPanelSink: AnyCancellable?
+    private var connectionSink: AnyCancellable?
+    private var hotKeySink: AnyCancellable?
+    private var translationHotKeySink: AnyCancellable?
+    private var statusItem: NSStatusItem?
+    private var statusSink: AnyCancellable?
+    private var statusHeaderItem: NSMenuItem?
+    private var togglePetMenuItem: NSMenuItem?
+    private var shortcutMenuItems: [DSHPetShortcutAction: [NSMenuItem]] = [:]
+    private var readingMenuItems: [ResearchReadingAction: NSMenuItem] = [:]
+    private var lastIconColor: Color?
+    private let globalHotKeyManager = GlobalHotKeyManager()
+    private let translationHotKeyManager = GlobalHotKeyManager(id: 2)
+    private var captureFrontPID: pid_t?
+    private var taskPanelEventMonitors: [Any] = []
+    private var isTaskPanelClosing = false
+    private var lastExternalApplication: NSRunningApplication?
+    private var panelSelectionOrigin: (app: NSRunningApplication, target: ResearchSelectionCapture.Target)?
+    private var servicePreviousApplication: NSRunningApplication?
+    private var serviceActivationSource: (app: NSRunningApplication, expiresAt: TimeInterval)?
+    private var selectionActivationTask: Task<Void, Never>?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        ResearchLaunchLog.write("delegate-launched")
+        // Launch Services normally directs another open to the running app.
+        // Forward a forced second launch before creating panels or connections.
+        if let existing = Self.existingInstance() {
+            ResearchLaunchLog.write("duplicate-instance-exit")
+            if let url = existing.bundleURL {
+                NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
+            }
+            NSApp.terminate(nil)
+            return
+        }
+
+        NSApp.setActivationPolicy(.regular)
+
+        // 菜单栏彩色图标（NSStatusItem 非模板渲染）+ 标准主菜单
+        setupStatusItem()
+        setupMainMenu()
+        recordServiceForeground(NSWorkspace.shared.frontmostApplication)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(serviceForegroundChanged(_:)),
+            name: NSWorkspace.didActivateApplicationNotification, object: nil
+        )
+        NSApp.servicesProvider = self
+        NSUpdateDynamicServices()
+        ResearchLaunchLog.write(ResearchSelectionCapture.accessibilityAvailable
+            ? "selection-accessibility-allowed" : "selection-accessibility-denied")
+
+        setupPanel()
+        setupPetContextPanel()
+        setupComposerPanel()
+        setupTaskPanel()
+        setupGlobalHotKey()
+        model.start()
+        startHoverMonitor()
+        observeVisibility()
+        observeSettings()
+        observeBubble()
+        observeComposer()
+        ResearchLaunchLog.write("panels-created")
+        showComposerFromGlobalHotKey()
+        ResearchLaunchLog.write("first-panel-presented")
+        // 显示器增删/分辨率变化时，把球收回可视区（避免被 macOS 甩到屏幕外）
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screenParametersChanged),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+        // 设置面板「重置位置」请求
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(resetPositionRequested),
+            name: .dshPetResetPosition,
+            object: nil
+        )
+        appLog.info("didFinishLaunching done")
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        ResearchLaunchLog.write("app-terminating")
+        NSWorkspace.shared.notificationCenter.removeObserver(
+            self, name: NSWorkspace.didActivateApplicationNotification, object: nil
+        )
+        selectionActivationTask?.cancel()
+        researchWindow?.persistFrame()
+        model.commandClient.flushDraftPersistence()
+        model.stop()
+        for monitor in hoverMonitors {
+            NSEvent.removeMonitor(monitor)
+        }
+        hoverMonitors = []
+        bubbleSink?.cancel()
+        bubbleSink = nil
+        statusSink?.cancel()
+        statusSink = nil
+        composerSink?.cancel()
+        composerSink = nil
+        researchVisibilitySink?.cancel()
+        researchVisibilitySink = nil
+        taskPanelSink?.cancel()
+        taskPanelSink = nil
+        connectionSink?.cancel()
+        connectionSink = nil
+        hotKeySink?.cancel()
+        hotKeySink = nil
+        removeTaskPanelEventMonitors()
+        dismissPetContext()
+        model.closeTaskPanel()
+    }
+
+    func applicationWillHide(_ notification: Notification) {
+        ResearchLaunchLog.write("app-hidden")
+        cancelSelectionCapture()
+        researchWindow?.persistFrame()
+        model.closeTaskPanel()
+        model.commandClient.setResearchWindowForeground(false)
+    }
+
+    func applicationDidUnhide(_ notification: Notification) {
+        updateResearchForeground()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        updateResearchForeground()
+    }
+
+    func applicationDidResignActive(_ notification: Notification) {
+        model.commandClient.setResearchWindowForeground(false)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showComposerFromGlobalHotKey()
+        return false
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    // MARK: - 悬浮窗
+
+    private func setupPanel() {
+        let bubble = showStatusBubble ? model.bubblePresentation : nil
+        let width = DSHPetView.panelWidth(
+            for: PetSettings.shared.skin,
+            size: PetSettings.shared.ballSize,
+            glowEnabled: PetSettings.shared.glowEnabled,
+            bubble: bubble
+        )
+        let height = DSHPetView.panelHeight(
+            for: PetSettings.shared.skin,
+            size: PetSettings.shared.ballSize,
+            glowEnabled: PetSettings.shared.glowEnabled,
+            bubble: bubble
+        )
+        let panel = DSHPetPanel(
+            contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.title = "科研伙伴 · 角色"
+        panel.setAccessibilityLabel("科研伙伴角色")
+        panel.setAccessibilityIdentifier("research-companion.character")
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.level = .floating                       // 置顶
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        panel.ignoresMouseEvents = true               // 默认点击穿透（悬停时由 updateHover 恢复响应）
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.animationBehavior = .none
+        panel.isExcludedFromWindowsMenu = true
+        panel.onRightClick = { [weak self] point in
+            self?.showPetContext(at: point)
+        }
+
+        let hosting = NSHostingView(rootView: DSHPetView(
+            model: model,
+            settings: PetSettings.shared,
+            onOpenHarness: { [weak self] in self?.model.openHarness() }
+        ))
+        hosting.wantsLayer = true
+        hosting.layer?.backgroundColor = NSColor.clear.cgColor
+        panel.contentView = hosting
+
+        // 优先恢复上次拖拽位置，否则放屏幕右下角
+        if !panel.restoreSavedPosition() {
+            positionAtBottomRight(panel)
+        }
+        DSHPetPanel.current = panel
+        if PetSettings.shared.isPetVisible {
+            panel.orderFrontRegardless()
+        }
+        self.panel = panel
+    }
+
+    private func setupPetContextPanel() {
+        let context = PetContextPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 104, height: 48),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        context.isOpaque = false
+        context.backgroundColor = .clear
+        context.hasShadow = false
+        context.level = .floating
+        context.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        context.isReleasedWhenClosed = false
+        context.hidesOnDeactivate = false
+        context.isExcludedFromWindowsMenu = true
+        context.contentView = NSHostingView(rootView: PetContextView { [weak self] in
+            self?.dismissPetContext()
+            PetSettings.shared.isPetVisible = false
+        })
+        petContextPanel = context
+    }
+
+    private func showPetContext(at point: NSPoint) {
+        guard let context = petContextPanel else { return }
+        let visible = NSScreen.screens.first(where: { $0.frame.contains(point) })?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let size = context.frame.size
+        let origin = NSPoint(
+            x: min(max(point.x + 8, visible.minX), visible.maxX - size.width),
+            y: min(max(point.y - size.height - 8, visible.minY), visible.maxY - size.height)
+        )
+        context.setFrameOrigin(origin)
+        context.orderFrontRegardless()
+        installPetContextMonitors()
+    }
+
+    private func dismissPetContext() {
+        petContextPanel?.orderOut(nil)
+        for monitor in petContextMonitors { NSEvent.removeMonitor(monitor) }
+        petContextMonitors.removeAll()
+    }
+
+    private func installPetContextMonitors() {
+        guard petContextMonitors.isEmpty else { return }
+        let mouseEvents: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        if let local = NSEvent.addLocalMonitorForEvents(matching: mouseEvents.union(.keyDown), handler: { [weak self] event in
+            guard let self else { return event }
+            if event.type == .keyDown, event.keyCode == 53 {
+                self.dismissPetContext()
+                return nil
+            }
+            if event.type != .keyDown, event.window !== self.petContextPanel {
+                self.dismissPetContext()
+            }
+            return event
+        }) {
+            petContextMonitors.append(local)
+        }
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: mouseEvents, handler: { [weak self] _ in
+            Task { @MainActor [weak self] in self?.dismissPetContext() }
+        }) {
+            petContextMonitors.append(global)
+        }
+    }
+
+    private func setupComposerPanel() {
+        let p = DSHPetComposerPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 72, height: 18),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        p.isOpaque = false
+        p.title = "科研伙伴 · 操作栏"
+        p.setAccessibilityIdentifier("research-companion.pet-toolbar")
+        p.onExplicitClose = { [weak self] in self?.model.collapseComposer(reason: .panelCancel) }
+        p.backgroundColor = .clear
+        p.hasShadow = false
+        p.level = .floating
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        p.ignoresMouseEvents = true
+        p.isReleasedWhenClosed = false
+        p.hidesOnDeactivate = false
+        p.animationBehavior = .none
+        p.isExcludedFromWindowsMenu = true
+        let hosting = NSHostingView(rootView: DSHPetComposerView(model: model, command: model.commandClient))
+        hosting.wantsLayer = true
+        hosting.layer?.backgroundColor = NSColor.clear.cgColor
+        p.contentView = hosting
+        self.composerPanel = p
+        researchWindow = ResearchWindowController(model: model, command: model.commandClient)
+        researchWindow?.visibilityDidChange = { [weak self] in self?.updateResearchForeground() }
+        updateComposerPanel()
+    }
+
+    private func setupTaskPanel() {
+        let p = DSHPetTaskPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 340, height: 340),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = false
+        p.level = .floating
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        p.ignoresMouseEvents = false
+        p.isReleasedWhenClosed = false
+        p.hidesOnDeactivate = false
+        p.animationBehavior = .none
+        p.isExcludedFromWindowsMenu = true
+        let hosting = NSHostingView(rootView: DSHPetTaskPanelView(model: model, command: model.commandClient))
+        hosting.wantsLayer = true
+        p.contentView = hosting
+        p.onCancel = { [weak self] in self?.model.closeTaskPanel() }
+        self.taskPanel = p
+    }
+
+    private func positionAtBottomRight(_ panel: NSPanel) {
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })
+                ?? NSScreen.main
+                ?? NSScreen.screens.first else { return }
+        let inset: CGFloat = 16
+        let origin = NSPoint(
+            x: screen.visibleFrame.maxX - panel.frame.width - inset,
+            y: screen.visibleFrame.minY + inset
+        )
+        panel.setFrameOrigin(origin)
+        appLog.info("positionAtBottomRight -> \(Int(origin.x)),\(Int(origin.y)) on visibleFrame \(Int(screen.visibleFrame.minX)),\(Int(screen.visibleFrame.minY)) \(Int(screen.visibleFrame.width))x\(Int(screen.visibleFrame.height))")
+    }
+
+    @objc private func screenParametersChanged() {
+        researchWindow?.recoverVisibleFrame()
+        guard let panel, panel.isVisible else { return }
+        // 显示器增删/分辨率变化后，若窗口中心不在任何屏幕的可视区内
+        // （可能只留一截在屏边、球心已甩到无屏幕区域，导致拖不到），
+        // 就把球收回鼠标所在屏的右下角。
+        let center = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
+        let visibleFrames = NSScreen.screens.map(\.visibleFrame)
+        let centerOnScreen = visibleFrames.contains { $0.contains(center) }
+        if !centerOnScreen {
+            positionAtBottomRight(panel)
+            appLog.info("screen changed: ball center off-screen, repositioned to bottom-right")
+        }
+        updateComposerPanel()
+        updateTaskPanel()
+    }
+
+    @objc private func resetPositionRequested() {
+        guard let panel else { return }
+        positionAtBottomRight(panel)
+    }
+
+    // MARK: - 设置联动
+
+    private func observeSettings() {
+        // 皮肤、尺寸或光晕变化时更新窗口；底部锚点保持不动。
+        settingsSink = Publishers.CombineLatest3(
+            PetSettings.shared.$ballSize,
+            PetSettings.shared.$skin,
+            PetSettings.shared.$glowEnabled
+        )
+            .receive(on: RunLoop.main)
+            .sink { [weak self] newSize, skin, glowEnabled in
+                guard let self, let panel = self.panel else { return }
+                let bubble = self.showStatusBubble ? self.model.bubblePresentation : nil
+                panel.setFrame(self.panelFrame(
+                    ballSize: newSize, skin: skin, glowEnabled: glowEnabled, bubble: bubble
+                ), display: true)
+                self.updateComposerPanel()
+                self.updateHover()
+            }
+    }
+
+    // MARK: - 状态气泡（面板增高联动）
+
+    /// 当前是否显示状态气泡（有可显示的卡组页且设置开关打开）
+    private var showStatusBubble: Bool {
+        model.bubblePresentation != nil && PetSettings.shared.showStatusBubble
+    }
+
+    /// 按可见内容计算面板大小，保留宠物的水平中心和底部位置。
+    private func panelFrame(
+        ballSize d: CGFloat, skin: FloatingPetSkin, glowEnabled: Bool, bubble: DSHPetBubblePresentation?
+    ) -> NSRect {
+        let w = DSHPetView.panelWidth(for: skin, size: d, glowEnabled: glowEnabled, bubble: bubble)
+        let h = DSHPetView.panelHeight(for: skin, size: d, glowEnabled: glowEnabled, bubble: bubble)
+        let old = panel?.frame ?? NSRect(x: 0, y: 0, width: w, height: h)
+        let ballCenterX = old.midX
+        return NSRect(x: ballCenterX - w / 2, y: old.minY, width: w, height: h)
+    }
+
+    private func observeBubble() {
+        // 气泡内容/页数/设置变化 → 增高/缩回面板顶部
+        let bubbleChanges: AnyPublisher<Void, Never> = model.$bubblePresentation
+            .map { _ in () as Void }
+            .eraseToAnyPublisher()
+        let bubbleSetting: AnyPublisher<Void, Never> = PetSettings.shared.$showStatusBubble
+            .map { _ in () as Void }
+            .eraseToAnyPublisher()
+        bubbleSink = Publishers.MergeMany(bubbleChanges, bubbleSetting)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self, let panel = self.panel else { return }
+                let bubble = self.showStatusBubble ? self.model.bubblePresentation : nil
+                let frame = self.panelFrame(
+                    ballSize: PetSettings.shared.ballSize,
+                    skin: PetSettings.shared.skin,
+                    glowEnabled: PetSettings.shared.glowEnabled,
+                    bubble: bubble
+                )
+                if !frame.equalTo(panel.frame) {
+                    panel.setFrame(frame, display: true)
+                    appLog.info("panel frame -> \(Int(frame.width))x\(Int(frame.height)) bubble=\(bubble != nil)")
+                    self.updateHover()
+                }
+            }
+    }
+
+    // MARK: - 悬停检测（穿透 ↔ 可拖拽）
+
+    private func startHoverMonitor() {
+        // 事件驱动：鼠标移动/拖拽时才检测，鼠标不动时零唤醒（取代固定频率轮询定时器）。
+        // 本地监视器：本 app 活跃时（拖拽中、设置面板开着）触发；
+        // 全局监视器：其它 app 前台时触发（球默认点击穿透，鼠标事件不派发给本 app，
+        //   只有全局监视器能看到光标移动）。
+        // 全局监视器回调在后台线程，统一跳回主线程再更新。
+        let events: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        let local = NSEvent.addLocalMonitorForEvents(matching: events) { [weak self] event in
+            Task { @MainActor [weak self] in
+                self?.updateHover()
+            }
+            return event
+        }
+        let global = NSEvent.addGlobalMonitorForEvents(matching: events) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.updateHover()
+            }
+        }
+        hoverMonitors = [local, global].compactMap { $0 }
+    }
+
+    private func updateHover() {
+        let settings = PetSettings.shared
+        guard panel?.isVisible == true else { return }
+        let mouse = NSEvent.mouseLocation
+        let d = settings.ballSize
+        let petFrame: NSRect?
+        if let panel, panel.isVisible {
+            if settings.skin.isSprite {
+                // Codex 宠物保留完整单格的交互宽度，小雨沿用原来的贴合区域。
+                let petWidth = d * (settings.skin == .xiaoyu ? 0.75 : 192.0 / 208.0)
+                petFrame = NSRect(
+                    x: panel.frame.midX - petWidth / 2,
+                    y: panel.frame.minY,
+                    width: petWidth,
+                    height: d * 1.10
+                )
+            } else {
+                petFrame = NSRect(x: panel.frame.midX - d, y: panel.frame.minY + d / 2, width: d * 2, height: d)
+            }
+        } else {
+            petFrame = nil
+        }
+        let insidePet: Bool
+        if settings.skin.isSprite {
+            insidePet = petFrame?.insetBy(dx: -8, dy: -4).contains(mouse) == true
+        } else if let panel, panel.isVisible {
+            let ballCenter = NSPoint(x: panel.frame.midX, y: panel.frame.minY + d)
+            insidePet = hypot(mouse.x - ballCenter.x, mouse.y - ballCenter.y) <= d
+        } else {
+            insidePet = false
+        }
+
+        var insideBubble = false
+        if let panel,
+           settings.showStatusBubble,
+           let bubble = model.bubblePresentation {
+            let bubbleCanReceiveInput = bubble.interactive || bubble.taskID != nil
+            if bubbleCanReceiveInput {
+                let bubbleHeight = DSHPetView.bubbleSpaceHeight(for: bubble)
+                    + (settings.skin.isSprite ? DSHPetView.tailGap : 0)
+                let bubbleWidth = bubble.isMulti ? DSHPetView.multiBubblePanelWidth : panel.frame.width
+                let rect = NSRect(
+                    x: panel.frame.midX - bubbleWidth / 2,
+                    y: panel.frame.maxY - bubbleHeight,
+                    width: bubbleWidth,
+                    height: bubbleHeight
+                )
+                insideBubble = rect.insetBy(dx: 2, dy: 2).contains(mouse)
+            }
+        }
+
+        if settings.clickThroughMode != .always,
+            model.barPhase != .composer {
+            let controlFrame = composerPanel?.frame.insetBy(dx: -14, dy: -18)
+            let insideTaskPanel = taskPanel?.isVisible == true && taskPanel?.frame.contains(mouse) == true
+            model.setComposerHovering(
+                insidePet
+                    || insideBubble
+                    || controlFrame?.contains(mouse) == true
+                    || insideTaskPanel
+            )
+        }
+        updateComposerPanel()
+
+        guard let panel, panel.isVisible else { return }
+        switch settings.clickThroughMode {
+        case .always:
+            // 永远穿透：常驻忽略鼠标事件（不可拖拽）
+            if !panel.ignoresMouseEvents { panel.ignoresMouseEvents = true }
+        case .never:
+            // 永不穿透：常驻响应（无穿透）
+            if panel.ignoresMouseEvents { panel.ignoresMouseEvents = false }
+        case .hover:
+            // 气泡和透明光晕不参与宠物拖拽命中；多任务气泡可点击。
+            let shouldIgnore = !panel.isDragging && !insidePet && !insideBubble
+            if panel.ignoresMouseEvents != shouldIgnore {
+                panel.ignoresMouseEvents = shouldIgnore
+                appLog.info("hover -> ignoresMouseEvents=\(shouldIgnore)")
+            }
+        }
+    }
+
+    // MARK: - 输入控件面板
+
+    private func observeComposer() {
+        composerSink = model.$barPhase.removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateComposerPanel() }
+        researchVisibilitySink = model.$isResearchPanelOpen.removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] open in
+                guard let self, open == self.model.isResearchPanelOpen else { return }
+                if !open {
+                    self.cancelSelectionCapture()
+                    self.model.commandClient.flushDraftPersistence()
+                    self.researchWindow?.hide()
+                    self.updateResearchForeground()
+                } else if let window = self.researchWindow?.window, !window.isVisible, !window.isMiniaturized {
+                    self.focusResearchPanel()
+                }
+                self.updateComposerPanel()
+            }
+        taskPanelSink = model.$taskPanelMode
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateComposerPanel()
+                self?.updateTaskPanel()
+                self?.updateHover()
+            }
+        connectionSink = model.commandClient.$connection.removeDuplicates()
+            .sink { connection in
+                switch connection {
+                case .connected: ResearchLaunchLog.write("bridge-connected")
+                case .connecting: ResearchLaunchLog.write("bridge-connecting")
+                case .disconnected: ResearchLaunchLog.write("bridge-disconnected")
+                }
+            }
+    }
+
+    private func updateComposerPanel() {
+        guard let composerPanel else { return }
+        let settings = PetSettings.shared
+        guard settings.isPetVisible, !model.isResearchPanelOpen else {
+            if composerPanel.isVisible { composerPanel.orderOut(nil) }
+            return
+        }
+        let phase = model.barPhase
+        let size = Self.composerPanelSize(
+            for: phase,
+            expandedComposerSize: expandedComposerSize
+        )
+        let frame = composerFrame(size: size)
+        if !frame.equalTo(composerPanel.frame) { composerPanel.setFrame(frame, display: true) }
+        if phase == .composer {
+            composerPanel.ignoresMouseEvents = false
+        } else {
+            composerPanel.ignoresMouseEvents = settings.clickThroughMode != .never
+                && phase != .hovering
+        }
+        if !composerPanel.isVisible { composerPanel.orderFrontRegardless() }
+    }
+
+    private func focusResearchPanel() {
+        guard model.isResearchPanelOpen else { return }
+        cancelSelectionCapture()
+        if NSApp.isHidden { NSApp.unhide(nil) }
+        if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+        researchWindow?.present()
+    }
+
+    private func updateResearchForeground() {
+        let window = researchWindow?.window
+        let foreground = model.isResearchPanelOpen && NSApp.isActive && !NSApp.isHidden
+            && window?.isVisible == true && window?.isMiniaturized == false
+        model.commandClient.setResearchWindowForeground(foreground)
+    }
+
+    private var expandedComposerSize: NSSize {
+        NSSize(
+            width: min(520, (NSScreen.main?.visibleFrame.width ?? 540) - 24),
+            height: min(700, (NSScreen.main?.visibleFrame.height ?? 724) - 24)
+        )
+    }
+
+    static func composerPanelSize(
+        for phase: DSHPetBarPhase,
+        expandedComposerSize: NSSize
+    ) -> NSSize {
+        if phase == .composer { return expandedComposerSize }
+        if phase == .hovering {
+            return NSSize(
+                width: DSHPetComposerView.expandedBarPanelWidth,
+                height: DSHPetComposerView.expandedBarPanelHeight
+            )
+        }
+        return NSSize(
+            width: DSHPetComposerView.restingPanelWidth,
+            height: DSHPetComposerView.restingPanelHeight
+        )
+    }
+
+    private func updateTaskPanel() {
+        guard let taskPanel else { return }
+        let shouldShow = PetSettings.shared.isPetVisible
+            && model.taskPanelMode != .closed
+        guard shouldShow else {
+            removeTaskPanelEventMonitors()
+            taskPanel.ignoresMouseEvents = true
+            guard taskPanel.isVisible else {
+                taskPanel.alphaValue = 1
+                isTaskPanelClosing = false
+                return
+            }
+            guard !isTaskPanelClosing,
+                  !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+                if !isTaskPanelClosing {
+                    taskPanel.orderOut(nil)
+                    taskPanel.alphaValue = 1
+                }
+                return
+            }
+            isTaskPanelClosing = true
+            if let layer = taskPanel.contentView?.layer {
+                let scale = CABasicAnimation(keyPath: "transform.scale")
+                scale.fromValue = 1.0
+                scale.toValue = 0.96
+                scale.duration = 0.15
+                scale.timingFunction = CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1)
+                layer.add(scale, forKey: "dsh-pet.taskPanel.closeScale")
+            }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.15
+                context.timingFunction = CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1)
+                taskPanel.animator().alphaValue = 0
+            } completionHandler: { [weak self, weak taskPanel] in
+                Task { @MainActor in
+                    guard let self, let taskPanel else { return }
+                    self.isTaskPanelClosing = false
+                    if self.model.taskPanelMode == .closed || !PetSettings.shared.isPetVisible {
+                        taskPanel.orderOut(nil)
+                    }
+                    taskPanel.alphaValue = 1
+                }
+            }
+            return
+        }
+
+        isTaskPanelClosing = false
+        let wasVisible = taskPanel.isVisible
+        let shouldAnimateOpening = !wasVisible && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let size = NSSize(width: 340, height: 340)
+        taskPanel.setFrame(taskPanelFrame(size: size), display: true)
+        taskPanel.ignoresMouseEvents = false
+        taskPanel.alphaValue = shouldAnimateOpening ? 0 : 1
+        taskPanel.orderFrontRegardless()
+        installTaskPanelEventMonitors()
+
+        guard shouldAnimateOpening else { return }
+        if let layer = taskPanel.contentView?.layer {
+            let scale = CABasicAnimation(keyPath: "transform.scale")
+            scale.fromValue = 0.96
+            scale.toValue = 1.0
+            scale.duration = 0.2
+            scale.timingFunction = CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1)
+            layer.add(scale, forKey: "dsh-pet.taskPanel.scale")
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.2
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1)
+            taskPanel.animator().alphaValue = 1
+        }
+    }
+
+    private func taskPanelFrame(size: NSSize) -> NSRect {
+        guard let anchor = composerPanel?.frame else { return NSRect(origin: .zero, size: size) }
+        let anchorCenter = NSPoint(x: anchor.midX, y: anchor.midY)
+        let screen = NSScreen.screens.first(where: { $0.visibleFrame.contains(anchorCenter) })
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let gap: CGFloat = 6
+        let x = min(max(anchor.midX - size.width / 2, visible.minX + 4), visible.maxX - size.width - 4)
+        let belowY = anchor.minY - size.height - gap
+        let aboveY = anchor.maxY + gap
+        let y = belowY >= visible.minY + 4
+            ? belowY
+            : min(aboveY, visible.maxY - size.height - 4)
+        return NSRect(x: x, y: max(visible.minY + 4, y), width: size.width, height: size.height)
+    }
+
+    private func installTaskPanelEventMonitors() {
+        guard taskPanelEventMonitors.isEmpty else { return }
+        let mouseEvents: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        if let local = NSEvent.addLocalMonitorForEvents(matching: mouseEvents.union(.keyDown), handler: { [weak self] event in
+            guard let self else { return event }
+            if event.type == .keyDown, event.keyCode == 53 {
+                Task { @MainActor in self.model.closeTaskPanel() }
+                return nil
+            }
+            if event.type == .leftMouseDown || event.type == .rightMouseDown || event.type == .otherMouseDown {
+                Task { @MainActor in self.closeTaskPanelIfClickIsOutside() }
+            }
+            return event
+        }) {
+            taskPanelEventMonitors.append(local)
+        }
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: mouseEvents, handler: { [weak self] _ in
+            Task { @MainActor [weak self] in self?.closeTaskPanelIfClickIsOutside() }
+        }) {
+            taskPanelEventMonitors.append(global)
+        }
+    }
+
+    private func removeTaskPanelEventMonitors() {
+        for monitor in taskPanelEventMonitors {
+            NSEvent.removeMonitor(monitor)
+        }
+        taskPanelEventMonitors.removeAll()
+    }
+
+    private func closeTaskPanelIfClickIsOutside() {
+        guard model.taskPanelMode != .closed else { return }
+        let point = NSEvent.mouseLocation
+        let visibleFrames = [panel, composerPanel, taskPanel]
+            .compactMap { candidate -> NSRect? in
+                guard let candidate, candidate.isVisible else { return nil }
+                return candidate.frame
+            }
+        if !visibleFrames.contains(where: { $0.contains(point) }) {
+            model.closeTaskPanel()
+        }
+    }
+
+    private func composerFrame(size: NSSize) -> NSRect {
+        guard let panel else { return NSRect(origin: .zero, size: size) }
+        let centerX = panel.frame.midX
+        let screen = NSScreen.screens.first(where: { $0.visibleFrame.contains(NSPoint(x: centerX, y: panel.frame.midY)) })
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        // The idle capsule visually belongs to the pet's feet. Expanded
+        // surfaces retain a small breathing gap, while idle sits flush below.
+        let petControlGap: CGFloat = !model.isResearchPanelOpen && model.barPhase == .resting ? 0 : 4
+        let x = min(max(centerX - size.width / 2, visible.minX + petControlGap), visible.maxX - size.width - petControlGap)
+        let belowY = panel.frame.minY - size.height - petControlGap
+        let y: CGFloat
+        if belowY >= visible.minY + petControlGap {
+            y = belowY
+        } else {
+            // When there is no room below, sit above the visible pet (whose
+            // sprite is bottom-anchored), not above the transparent hit area.
+            y = min(
+                panel.frame.minY + PetSettings.shared.ballSize + petControlGap,
+                visible.maxY - size.height - petControlGap
+            )
+        }
+        return clampedComposerFrame(NSRect(x: x, y: y, width: size.width, height: size.height))
+    }
+
+    private func clampedComposerFrame(_ frame: NSRect) -> NSRect {
+        let center = NSPoint(x: frame.midX, y: frame.midY)
+        let screen = NSScreen.screens.first(where: { $0.visibleFrame.contains(center) })
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        guard let visible = screen?.visibleFrame else { return frame }
+        let inset: CGFloat = 4
+        let x = min(max(frame.minX, visible.minX + inset), max(visible.minX + inset, visible.maxX - frame.width - inset))
+        let y = min(max(frame.minY, visible.minY + inset), max(visible.minY + inset, visible.maxY - frame.height - inset))
+        return NSRect(x: x, y: y, width: frame.width, height: frame.height)
+    }
+
+    // MARK: - 宠物显示状态
+
+    private func observeVisibility() {
+        visibilitySink = PetSettings.shared.$isPetVisible
+            .receive(on: RunLoop.main)
+            .sink { [weak self] visible in
+                guard let self else { return }
+                if !visible { self.model.closeTaskPanel() }
+                if visible {
+                    if let panel = self.panel, !panel.isVisible {
+                        panel.orderFrontRegardless()
+                    }
+                } else {
+                    self.dismissPetContext()
+                    self.panel?.orderOut(nil)
+                }
+                self.updateComposerPanel()
+                self.updateTaskPanel()
+                self.updateHover()
+                appLog.info("display surfaces: visible=\(visible, privacy: .public)")
+            }
+    }
+
+    // MARK: - 菜单栏图标
+
+    /// 创建菜单栏常驻图标。
+    private func setupStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem = item
+        item.button?.image = Self.makeStatusIcon()
+        item.button?.imagePosition = .imageOnly
+
+        // 菜单内容：状态行 + 显示/隐藏 + 设置… + 退出
+        let menu = NSMenu()
+
+        statusHeaderItem = NSMenuItem(title: model.statusText, action: nil, keyEquivalent: "")
+        statusHeaderItem?.isEnabled = false
+        menu.addItem(statusHeaderItem!)
+
+        menu.addItem(.separator())
+
+        menu.addItem(makeShortcutMenuItem(
+            action: .inputMessage,
+            title: "打开科研对话",
+            selector: #selector(inputMessageFromMenu)
+        ))
+
+        togglePetMenuItem = makeShortcutMenuItem(
+            action: .togglePetVisibility,
+            title: PetSettings.shared.isPetVisible ? "隐藏宠物" : "显示宠物",
+            selector: #selector(togglePetVisibility)
+        )
+        menu.addItem(togglePetMenuItem!)
+
+        menu.addItem(makeShortcutMenuItem(
+            action: .openSettings,
+            title: "设置…",
+            selector: #selector(toggleSettingsPanel)
+        ))
+
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quitItem.target = NSApp
+        menu.addItem(quitItem)
+
+        item.menu = menu
+
+        // mood 颜色 / 球显隐 / 状态文案变化 → 刷新图标与菜单
+        statusSink = Publishers.Merge(model.objectWillChange, PetSettings.shared.objectWillChange)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                // objectWillChange 在属性写入前发出，推迟到下一轮再读，保证拿到新值
+                Task { @MainActor [weak self] in
+                    self?.refreshStatusItem()
+                }
+            }
+        refreshStatusItem() // 初始绘制
+    }
+
+    /// 用最新状态刷新菜单栏图标与菜单文案。
+    private func refreshStatusItem() {
+        guard let item = statusItem else { return }
+        let color = model.color
+
+        // The template glyph stays fixed; only the menu's state dot changes color.
+        if lastIconColor != color {
+            lastIconColor = color
+            statusHeaderItem?.image = Self.makeColoredDot(color: color, size: 10)
+        }
+
+        item.button?.toolTip = model.statusText
+        item.button?.setAccessibilityLabel(model.statusText)
+        statusHeaderItem?.title = model.statusText
+        togglePetMenuItem?.title = PetSettings.shared.isPetVisible ? "隐藏宠物" : "显示宠物"
+        applyMenuShortcuts()
+    }
+
+    private func makeShortcutMenuItem(
+        action: DSHPetShortcutAction,
+        title: String,
+        selector: Selector
+    ) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+        item.target = self
+        shortcutMenuItems[action, default: []].append(item)
+        return item
+    }
+
+    private func applyMenuShortcuts() {
+        let settings = PetSettings.shared
+        for action in DSHPetShortcutAction.allCases {
+            let configuration = settings.shortcutConfiguration(for: action)
+            let keyEquivalent = configuration.isEnabled && settings.shortcutConflict(for: action) == nil
+                ? configuration.menuKeyEquivalent
+                : nil
+            let modifierMask = configuration.modifiers.intersection([.command, .option, .control, .shift])
+            for item in shortcutMenuItems[action, default: []] {
+                item.keyEquivalent = keyEquivalent ?? ""
+                item.keyEquivalentModifierMask = keyEquivalent == nil ? [] : modifierMask
+            }
+        }
+        updateReadingMenuShortcuts()
+    }
+
+    private func updateReadingMenuShortcuts() {
+        let settings = PetSettings.shared
+        let configured = [settings.globalHotKeyConfiguration, settings.translationHotKey] + DSHPetShortcutAction.allCases.map {
+            settings.shortcutConfiguration(for: $0)
+        }
+        for (action, item) in readingMenuItems {
+            let shortcut = action.shortcut
+            let conflict = configured.contains {
+                $0.isEnabled && $0.keyCode == shortcut.keyCode && $0.modifiers == shortcut.modifiers
+            }
+            item.keyEquivalent = conflict ? "" : (shortcut.menuKeyEquivalent ?? "")
+            item.keyEquivalentModifierMask = conflict ? [] : shortcut.modifiers
+        }
+    }
+
+    @objc func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(readingActionFromMenu(_:)) {
+            return researchWindow?.readingMenuAvailable == true
+        }
+        return true
+    }
+
+    @objc private func readingActionFromMenu(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? String, let action = ResearchReadingAction(rawValue: value) else { return }
+        researchWindow?.performReadingAction(action)
+    }
+
+    @objc private func togglePetVisibility() {
+        PetSettings.shared.isPetVisible.toggle()
+    }
+
+    // MARK: - 全局快捷键
+
+    private func setupGlobalHotKey() {
+        globalHotKeyManager.onTrigger = { [weak self] in self?.showComposerFromGlobalHotKey() }
+        translationHotKeyManager.onTrigger = { [weak self] in self?.translateFrontSelection() }
+        translationHotKeySink = PetSettings.shared.$translationHotKey.combineLatest(PetSettings.shared.$shortcuts)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _, _ in self?.applyTranslationHotKey() }
+        hotKeySink = Publishers.CombineLatest3(
+            PetSettings.shared.$globalHotKeyEnabled,
+            PetSettings.shared.$globalHotKeyKeyCode,
+            PetSettings.shared.$globalHotKeyModifiers
+        )
+        .receive(on: RunLoop.main)
+        .sink { [weak self] _, _, _ in
+            self?.applyGlobalHotKeyConfiguration()
+        }
+        applyGlobalHotKeyConfiguration()
+    }
+
+    private func applyTranslationHotKey() {
+        let settings = PetSettings.shared
+        let desired = settings.translationHotKey
+        let fallback = translationHotKeyManager.registeredConfiguration.map { " · 当前有效 " + $0.displayName } ?? " · 当前未注册"
+        let protected = [settings.globalHotKeyConfiguration] + DSHPetShortcutAction.allCases.map { settings.shortcutConfiguration(for: $0) }
+            + ResearchReadingAction.allCases.map(\.shortcut)
+        if desired.isEnabled, protected.contains(where: { $0.isEnabled && $0.keyCode == desired.keyCode && $0.modifiers == desired.modifiers }) {
+            settings.translationHotKeyStatus = "与现有快捷键重复，请换一个组合键。" + fallback
+            return
+        }
+        switch translationHotKeyManager.update(desired) {
+        case .success: settings.translationHotKeyStatus = nil
+        case .failure(let error): settings.translationHotKeyStatus = error.localizedDescription + fallback
+        }
+        updateReadingMenuShortcuts()
+    }
+
+    private func applyGlobalHotKeyConfiguration() {
+        defer { applyTranslationHotKey() }
+        updateReadingMenuShortcuts()
+        let settings = PetSettings.shared
+        let result = globalHotKeyManager.update(settings.globalHotKeyConfiguration)
+        switch result {
+        case .success:
+            if globalHotKeyManager.isRegistered {
+                ResearchLaunchLog.write("hotkey-ready")
+                ResearchLaunchLog.write(settings.globalHotKeyConfiguration == .default
+                    ? "hotkey-default-option-space" : "hotkey-custom-registered")
+            } else { ResearchLaunchLog.write("hotkey-disabled") }
+            settings.setGlobalHotKeyStatus(nil)
+        case .failure(let error):
+            ResearchLaunchLog.write("hotkey-unavailable")
+            settings.setGlobalHotKeyStatus(error.localizedDescription + "；已保留上一次有效快捷键")
+        }
+    }
+
+    private func cancelSelectionCapture() {
+        selectionActivationTask?.cancel()
+        selectionActivationTask = nil
+        captureFrontPID = nil
+    }
+
+    private func showComposerFromGlobalHotKey() {
+        cancelSelectionCapture()
+        activateResearchComposer()
+    }
+
+    @objc func selectResearchTextFromPanel(_ sender: Any?) {
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            translateFrontSelection(previewOnly: true)
+            return
+        }
+        // AppKit can deliver the first button action before NSWorkspace posts
+        // our activation notification. Bind the immediately preceding external
+        // app's current window here; only identity, never old text, is reused.
+        let source = panelSelectionOrigin ?? lastExternalApplication.flatMap { app in
+            ResearchSelectionCapture.target(app).map { (app: app, target: $0) }
+        }
+        guard let origin = source, !origin.app.isTerminated,
+              let windowID = origin.target.windowID,
+              ResearchSelectionCapture.target(origin.app)?.windowID == windowID else {
+            cancelSelectionCapture()
+            model.commandClient.rejectResearchSelection("无法确认之前的来源窗口。请在原窗口选中文字，并按翻译选区快捷键。")
+            return
+        }
+        translateSelection(in: origin.app, target: origin.target, restoringFocus: true, previewOnly: true)
+    }
+
+    private func translateFrontSelection(previewOnly: Bool = false) {
+        guard let app = NSWorkspace.shared.frontmostApplication, let target = ResearchSelectionCapture.target(app),
+              target.isFrontmost() else {
+            cancelSelectionCapture()
+            model.commandClient.rejectResearchSelection(SelectionCaptureError.unsupported.localizedDescription)
+            activateResearchComposer()
+            return
+        }
+        translateSelection(in: app, target: target, restoringFocus: false, previewOnly: previewOnly)
+    }
+
+    private func translateSelection(in app: NSRunningApplication, target: ResearchSelectionCapture.Target, restoringFocus: Bool, previewOnly: Bool) {
+        cancelSelectionCapture()
+        let command = model.commandClient
+        guard let request = command.beginSelectionTranslation(previewOnly: previewOnly) else { activateResearchComposer(); return }
+        selectionActivationTask = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled else { return }
+            if restoringFocus {
+                // The button temporarily returns focus to the exact previous window. No selection
+                // text is read while the panel is shown or retained between triggers.
+                if #available(macOS 14.0, *) { NSApp.yieldActivation(to: app) }
+                _ = app.activate(options: [])
+                let deadline = ProcessInfo.processInfo.systemUptime + 1.0
+                while !target.isFrontmost(), !Task.isCancelled,
+                      ProcessInfo.processInfo.systemUptime < deadline {
+                    // App activation can precede its focused AX window/document.
+                    // Wait for that same bound window, including the interval
+                    // after its PID is foreground. Cancel if anyone else wins focus.
+                    let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                    guard pid == getpid() || pid == target.pid else { break }
+                    try? await Task.sleep(for: .milliseconds(20))
+                }
+            }
+            guard !Task.isCancelled else { return }
+            guard target.isFrontmost() else {
+                command.finishSelectionTranslation(request, result: .failure(SelectionCaptureError.sourceChanged))
+                self.selectionActivationTask = nil
+                return
+            }
+            self.captureFrontPID = target.pid
+            let worker = Task.detached(priority: .userInitiated) {
+                try Task.checkCancellation()
+                guard target.isFrontmost() else { throw SelectionCaptureError.sourceChanged }
+                let material = try await ResearchSelectionCapture.current(target, requestID: request.id)
+                try Task.checkCancellation()
+                let serviceReturned = await MainActor.run { ResearchSafariService.returned(request.id, target: target) }
+                guard target.isFrontmost() || serviceReturned else { throw SelectionCaptureError.sourceChanged }
+                return material
+            }
+            let result = await withTaskCancellationHandler { await worker.result } onCancel: { worker.cancel() }
+            guard !Task.isCancelled else { return }
+            self.selectionActivationTask = nil
+            self.captureFrontPID = nil
+            guard target.isFrontmost() || ResearchSafariService.returned(request.id, target: target) else {
+                command.finishSelectionTranslation(request, result: .failure(SelectionCaptureError.sourceChanged))
+                return
+            }
+            command.finishSelectionTranslation(request, result: result)
+            self.activateResearchComposer()
+        }
+    }
+
+    private func activateResearchComposer() {
+        model.openComposer(focus: true)
+        focusResearchPanel()
+    }
+
+    @objc private func serviceForegroundChanged(_ notification: Notification) {
+        let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+        recordServiceForeground(app)
+        if let expected = captureFrontPID, app?.processIdentifier != expected {
+            if app?.processIdentifier == getpid(), ResearchSafariService.allowsActivation(from: expected) { return }
+            cancelSelectionCapture()
+            model.commandClient.rejectResearchSelection(SelectionCaptureError.sourceChanged.localizedDescription)
+        }
+    }
+
+    private func recordServiceForeground(_ application: NSRunningApplication?) {
+        if application?.processIdentifier == ProcessInfo.processInfo.processIdentifier {
+            if let app = lastExternalApplication, let target = ResearchSelectionCapture.target(app) {
+                panelSelectionOrigin = (app, target)
+            } else { panelSelectionOrigin = nil }
+        } else {
+            lastExternalApplication = application?.activationPolicy == .regular ? application : nil
+            panelSelectionOrigin = nil
+        }
+        serviceActivationSource = nil
+        if application?.processIdentifier == ProcessInfo.processInfo.processIdentifier {
+            if let preceding = servicePreviousApplication {
+                serviceActivationSource = (preceding, ProcessInfo.processInfo.systemUptime + 2)
+            }
+            servicePreviousApplication = nil
+        } else if let application, let bundleID = application.bundleIdentifier,
+                  ResearchSelectionCapture.appIDs.contains(bundleID) {
+            servicePreviousApplication = application
+        } else {
+            servicePreviousApplication = nil
+        }
+    }
+
+    private func consumeResearchServiceOrigin() -> NSRunningApplication? {
+        let activation = serviceActivationSource
+        serviceActivationSource = nil
+        servicePreviousApplication = nil
+        guard let front = NSWorkspace.shared.frontmostApplication else { return nil }
+        if let bundleID = front.bundleIdentifier, ResearchSelectionCapture.appIDs.contains(bundleID) {
+            return front
+        }
+        // AppKit may activate our service before delivery. Only accept the
+        // immediately preceding foreground app for that single transition.
+        if front.processIdentifier == ProcessInfo.processInfo.processIdentifier,
+           let activation, !activation.app.isTerminated,
+           ProcessInfo.processInfo.systemUptime <= activation.expiresAt {
+            return activation.app
+        }
+        return nil
+    }
+
+    /// Services forwards the payload chosen in the origin app, including when it launches us.
+    @objc func translateResearchSelection(
+        _ pasteboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>
+    ) {
+        consumeSelectionService(pasteboard, previewOnly: false, error: error)
+    }
+
+    @objc func previewResearchSelection(
+        _ pasteboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>
+    ) {
+        if ResearchSafariService.consume(pasteboard) { return }
+        consumeSelectionService(pasteboard, previewOnly: true, error: error)
+    }
+
+    private func consumeSelectionService(
+        _ pasteboard: NSPasteboard, previewOnly: Bool, error: AutoreleasingUnsafeMutablePointer<NSString?>
+    ) {
+        let origin = consumeResearchServiceOrigin()
+        cancelSelectionCapture()
+        let command = model.commandClient
+        guard let request = command.beginSelectionTranslation(previewOnly: previewOnly) else { activateResearchComposer(); return }
+        let result = Result {
+            let legacy = NSPasteboard.PasteboardType(rawValue: "NSStringPboardType")
+            guard pasteboard.name != .general,
+                  let text = pasteboard.string(forType: .string) ?? pasteboard.string(forType: legacy) else { throw SelectionCaptureError.empty }
+            let source = origin.map(ResearchSelectionCapture.sourceName) ?? "系统服务"
+            return try ResearchSelectionCapture.exactSelection(text, source: source, title: source + "选区")
+        }
+        command.finishSelectionTranslation(request, result: result)
+        if case .failure(let issue) = result { error.pointee = issue.localizedDescription as NSString }
+        activateResearchComposer()
+    }
+
+    /// AppKit hands us the user-selected text on a service-specific pasteboard.
+    @objc func captureResearchSelection(
+        _ pasteboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>
+    ) {
+        ResearchLaunchLog.write("selection-service-invoked")
+        guard let scope = userData, scope == "preview" || scope == "browser" else {
+            ResearchLaunchLog.write("selection-service-origin-rejected")
+            let message = "未能确认选区来自预览或支持的浏览器。"
+            model.commandClient.rejectResearchSelection(message)
+            error.pointee = message as NSString
+            return
+        }
+        // The two system menu entries are individually constrained by bundle ID.
+        // Window activation order is only used to enrich that scope with an app name.
+        let origin = consumeResearchServiceOrigin().flatMap { app -> NSRunningApplication? in
+            (app.bundleIdentifier == "com.apple.Preview") == (scope == "preview") ? app : nil
+        }
+        let legacy = NSPasteboard.PasteboardType(rawValue: "NSStringPboardType")
+        guard let text = pasteboard.string(forType: .string) ?? pasteboard.string(forType: legacy) else {
+            ResearchLaunchLog.write("selection-service-empty")
+            let message = "原应用没有传入选中文字。"
+            model.commandClient.rejectResearchSelection(message)
+            error.pointee = message as NSString
+            return
+        }
+        do {
+            let source = origin.map(ResearchSelectionCapture.sourceName) ?? (scope == "preview" ? "预览" : "浏览器")
+            let material = try ResearchMaterial.selection(text, source: source, title: "\(source)选区")
+            model.commandClient.acceptResearchServiceSelection(material, from: origin)
+            ResearchLaunchLog.write("selection-service-accepted")
+            showComposerFromGlobalHotKey()
+        } catch let failure {
+            ResearchLaunchLog.write("selection-service-invalid")
+            model.commandClient.rejectResearchSelection(failure.localizedDescription)
+            error.pointee = failure.localizedDescription as NSString
+        }
+    }
+
+    /// Official DeepSeek Harness FishLogo geometry (MIT); see ThirdPartyNotices.txt.
+    /// Source blob: 8621f17273c0d192feb14a988816c8052360b908
+    static func makeStatusIcon() -> NSImage {
+        let image = NSImage(size: NSSize(width: 22, height: 22), flipped: false) { rect in
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: 22.9168, y: 1.43018))
+            path.curve(to: NSPoint(x: 22.4223, y: 1.65519), controlPoint1: NSPoint(x: 22.6713, y: 1.31018), controlPoint2: NSPoint(x: 22.5658, y: 1.53918))
+            path.curve(to: NSPoint(x: 22.2903, y: 1.78669), controlPoint1: NSPoint(x: 22.3733, y: 1.69269), controlPoint2: NSPoint(x: 22.3318, y: 1.74169))
+            path.curve(to: NSPoint(x: 20.9657, y: 2.39121), controlPoint1: NSPoint(x: 21.9317, y: 2.1697), controlPoint2: NSPoint(x: 21.5127, y: 2.42121))
+            path.curve(to: NSPoint(x: 18.8787, y: 3.20973), controlPoint1: NSPoint(x: 20.1657, y: 2.34621), controlPoint2: NSPoint(x: 19.4827, y: 2.59771))
+            path.curve(to: NSPoint(x: 17.6746, y: 1.71569), controlPoint1: NSPoint(x: 18.7502, y: 2.45521), controlPoint2: NSPoint(x: 18.3236, y: 2.0047))
+            path.curve(to: NSPoint(x: 16.7536, y: 1.08867), controlPoint1: NSPoint(x: 17.3351, y: 1.56568), controlPoint2: NSPoint(x: 16.9916, y: 1.41518))
+            path.curve(to: NSPoint(x: 16.4591, y: 0.341647), controlPoint1: NSPoint(x: 16.5876, y: 0.856163), controlPoint2: NSPoint(x: 16.5421, y: 0.597155))
+            path.curve(to: NSPoint(x: 16.1761, y: 0.00363739), controlPoint1: NSPoint(x: 16.4061, y: 0.187643), controlPoint2: NSPoint(x: 16.3536, y: 0.0301382))
+            path.curve(to: NSPoint(x: 15.8326, y: 0.270145), controlPoint1: NSPoint(x: 15.9836, y: -0.0263635), controlPoint2: NSPoint(x: 15.9081, y: 0.135141))
+            path.curve(to: NSPoint(x: 15.4251, y: 2.0462), controlPoint1: NSPoint(x: 15.5306, y: 0.822162), controlPoint2: NSPoint(x: 15.4136, y: 1.43018))
+            path.curve(to: NSPoint(x: 17.1991, y: 5.3203), controlPoint1: NSPoint(x: 15.4516, y: 3.43174), controlPoint2: NSPoint(x: 16.0366, y: 4.53527))
+            path.curve(to: NSPoint(x: 17.3236, y: 5.63181), controlPoint1: NSPoint(x: 17.3311, y: 5.4103), controlPoint2: NSPoint(x: 17.3651, y: 5.5003))
+            path.curve(to: NSPoint(x: 17.0671, y: 6.43533), controlPoint1: NSPoint(x: 17.2441, y: 5.90231), controlPoint2: NSPoint(x: 17.1501, y: 6.16482))
+            path.curve(to: NSPoint(x: 16.7501, y: 6.57033), controlPoint1: NSPoint(x: 17.0141, y: 6.60784), controlPoint2: NSPoint(x: 16.9351, y: 6.64584))
+            path.curve(to: NSPoint(x: 15.074, y: 5.4328), controlPoint1: NSPoint(x: 16.1121, y: 6.30383), controlPoint2: NSPoint(x: 15.5611, y: 5.90931))
+            path.curve(to: NSPoint(x: 12.568, y: 3.05973), controlPoint1: NSPoint(x: 14.2475, y: 4.63328), controlPoint2: NSPoint(x: 13.5, y: 3.75075))
+            path.curve(to: NSPoint(x: 11.9034, y: 2.60522), controlPoint1: NSPoint(x: 12.349, y: 2.89822), controlPoint2: NSPoint(x: 12.13, y: 2.74822))
+            path.curve(to: NSPoint(x: 12.277, y: 0.833162), controlPoint1: NSPoint(x: 10.9524, y: 1.68169), controlPoint2: NSPoint(x: 12.028, y: 0.923165))
+            path.curve(to: NSPoint(x: 11.5259, y: 0.42015), controlPoint1: NSPoint(x: 12.5375, y: 0.739159), controlPoint2: NSPoint(x: 12.3675, y: 0.41615))
+            path.curve(to: NSPoint(x: 8.93286, y: 1.08117), controlPoint1: NSPoint(x: 10.6844, y: 0.42365), controlPoint2: NSPoint(x: 9.91439, y: 0.705658))
+            path.curve(to: NSPoint(x: 8.48384, y: 1.21267), controlPoint1: NSPoint(x: 8.78935, y: 1.13767), controlPoint2: NSPoint(x: 8.63835, y: 1.17867))
+            path.curve(to: NSPoint(x: 5.70226, y: 1.11517), controlPoint1: NSPoint(x: 7.59332, y: 1.04367), controlPoint2: NSPoint(x: 6.66829, y: 1.00617))
+            path.curve(to: NSPoint(x: 1.36213, y: 3.64575), controlPoint1: NSPoint(x: 3.88321, y: 1.31768), controlPoint2: NSPoint(x: 2.43016, y: 2.1777))
+            path.curve(to: NSPoint(x: 0.146595, y: 9.50642), controlPoint1: NSPoint(x: 0.0790928, y: 5.4103), controlPoint2: NSPoint(x: -0.222916, y: 7.41536))
+            path.curve(to: NSPoint(x: 3.38869, y: 14.9616), controlPoint1: NSPoint(x: 0.535106, y: 11.7105), controlPoint2: NSPoint(x: 1.66014, y: 13.535))
+            path.curve(to: NSPoint(x: 9.60138, y: 17.0266), controlPoint1: NSPoint(x: 5.18125, y: 16.4406), controlPoint2: NSPoint(x: 7.24581, y: 17.1657))
+            path.curve(to: NSPoint(x: 14.421, y: 15.2321), controlPoint1: NSPoint(x: 11.0319, y: 16.9441), controlPoint2: NSPoint(x: 12.6245, y: 16.7526))
+            path.curve(to: NSPoint(x: 16.1381, y: 15.6151), controlPoint1: NSPoint(x: 14.874, y: 15.4576), controlPoint2: NSPoint(x: 15.3496, y: 15.5476))
+            path.curve(to: NSPoint(x: 17.7836, y: 15.4911), controlPoint1: NSPoint(x: 16.7456, y: 15.6716), controlPoint2: NSPoint(x: 17.3306, y: 15.5851))
+            path.curve(to: NSPoint(x: 18.1876, y: 14.5636), controlPoint1: NSPoint(x: 18.4931, y: 15.3411), controlPoint2: NSPoint(x: 18.4441, y: 14.6841))
+            path.curve(to: NSPoint(x: 16.1496, y: 13.67), controlPoint1: NSPoint(x: 16.1081, y: 13.595), controlPoint2: NSPoint(x: 16.5646, y: 13.9891))
+            path.curve(to: NSPoint(x: 19.3182, y: 7.17235), controlPoint1: NSPoint(x: 17.2061, y: 12.42), controlPoint2: NSPoint(x: 18.8202, y: 10.1979))
+            path.curve(to: NSPoint(x: 19.4222, y: 6.09732), controlPoint1: NSPoint(x: 19.3672, y: 6.83834), controlPoint2: NSPoint(x: 19.4297, y: 6.36783))
+            path.curve(to: NSPoint(x: 19.6447, y: 5.84931), controlPoint1: NSPoint(x: 19.4182, y: 5.93231), controlPoint2: NSPoint(x: 19.4562, y: 5.86831))
+            path.curve(to: NSPoint(x: 21.1357, y: 5.3913), controlPoint1: NSPoint(x: 20.1657, y: 5.78931), controlPoint2: NSPoint(x: 20.6712, y: 5.64681))
+            path.curve(to: NSPoint(x: 23.1548, y: 1.9972), controlPoint1: NSPoint(x: 22.4833, y: 4.65528), controlPoint2: NSPoint(x: 23.0268, y: 3.44624))
+            path.curve(to: NSPoint(x: 22.9168, y: 1.43018), controlPoint1: NSPoint(x: 23.1738, y: 1.77569), controlPoint2: NSPoint(x: 23.1508, y: 1.54668))
+            path.close()
+            path.move(to: NSPoint(x: 11.1749, y: 14.4736))
+            path.curve(to: NSPoint(x: 7.77832, y: 12.39), controlPoint1: NSPoint(x: 9.15936, y: 12.889), controlPoint2: NSPoint(x: 8.18184, y: 12.3675))
+            path.curve(to: NSPoint(x: 7.55182, y: 13.126), controlPoint1: NSPoint(x: 7.40081, y: 12.4125), controlPoint2: NSPoint(x: 7.46881, y: 12.8445))
+            path.curve(to: NSPoint(x: 7.91033, y: 13.8396), controlPoint1: NSPoint(x: 7.63882, y: 13.404), controlPoint2: NSPoint(x: 7.75182, y: 13.5955))
+            path.curve(to: NSPoint(x: 7.80083, y: 14.4216), controlPoint1: NSPoint(x: 8.01983, y: 14.0011), controlPoint2: NSPoint(x: 8.09533, y: 14.2411))
+            path.curve(to: NSPoint(x: 5.97027, y: 14.2601), controlPoint1: NSPoint(x: 7.15181, y: 14.8231), controlPoint2: NSPoint(x: 6.02327, y: 14.2866))
+            path.curve(to: NSPoint(x: 2.78467, y: 11.069), controlPoint1: NSPoint(x: 4.65673, y: 13.4865), controlPoint2: NSPoint(x: 3.5587, y: 12.4655))
+            path.curve(to: NSPoint(x: 1.53164, y: 6.74384), controlPoint1: NSPoint(x: 2.03715, y: 9.72493), controlPoint2: NSPoint(x: 1.60314, y: 8.28289))
+            path.curve(to: NSPoint(x: 1.99215, y: 6.17332), controlPoint1: NSPoint(x: 1.51264, y: 6.37233), controlPoint2: NSPoint(x: 1.62214, y: 6.24082))
+            path.curve(to: NSPoint(x: 3.46769, y: 6.13582), controlPoint1: NSPoint(x: 2.47916, y: 6.08332), controlPoint2: NSPoint(x: 2.98118, y: 6.06432))
+            path.curve(to: NSPoint(x: 8.74385, y: 8.8129), controlPoint1: NSPoint(x: 5.52476, y: 6.43633), controlPoint2: NSPoint(x: 7.27581, y: 7.35586))
+            path.curve(to: NSPoint(x: 10.8689, y: 11.6025), controlPoint1: NSPoint(x: 9.58188, y: 9.64243), controlPoint2: NSPoint(x: 10.2159, y: 10.634))
+            path.curve(to: NSPoint(x: 13.262, y: 14.4146), controlPoint1: NSPoint(x: 11.5634, y: 12.631), controlPoint2: NSPoint(x: 12.3105, y: 13.611))
+            path.curve(to: NSPoint(x: 14.1225, y: 15.0681), controlPoint1: NSPoint(x: 13.598, y: 14.6961), controlPoint2: NSPoint(x: 13.866, y: 14.9101))
+            path.curve(to: NSPoint(x: 11.1749, y: 14.4746), controlPoint1: NSPoint(x: 13.349, y: 15.1546), controlPoint2: NSPoint(x: 12.058, y: 15.1731))
+            path.line(to: NSPoint(x: 11.1749, y: 14.4736))
+            path.close()
+            path.move(to: NSPoint(x: 12.141, y: 8.25988))
+            path.curve(to: NSPoint(x: 12.439, y: 7.96338), controlPoint1: NSPoint(x: 12.141, y: 8.09488), controlPoint2: NSPoint(x: 12.273, y: 7.96338))
+            path.curve(to: NSPoint(x: 12.541, y: 7.98188), controlPoint1: NSPoint(x: 12.4765, y: 7.96338), controlPoint2: NSPoint(x: 12.5105, y: 7.97088))
+            path.curve(to: NSPoint(x: 12.6505, y: 8.05338), controlPoint1: NSPoint(x: 12.5825, y: 7.99688), controlPoint2: NSPoint(x: 12.6205, y: 8.01938))
+            path.curve(to: NSPoint(x: 12.7335, y: 8.25988), controlPoint1: NSPoint(x: 12.7035, y: 8.10588), controlPoint2: NSPoint(x: 12.7335, y: 8.18088))
+            path.curve(to: NSPoint(x: 12.4355, y: 8.55639), controlPoint1: NSPoint(x: 12.7335, y: 8.42489), controlPoint2: NSPoint(x: 12.6015, y: 8.55639))
+            path.curve(to: NSPoint(x: 12.141, y: 8.25988), controlPoint1: NSPoint(x: 12.2695, y: 8.55639), controlPoint2: NSPoint(x: 12.141, y: 8.42489))
+            path.close()
+            path.move(to: NSPoint(x: 15.1415, y: 9.79893))
+            path.curve(to: NSPoint(x: 14.5715, y: 9.95294), controlPoint1: NSPoint(x: 14.949, y: 9.87793), controlPoint2: NSPoint(x: 14.7565, y: 9.94544))
+            path.curve(to: NSPoint(x: 13.8015, y: 9.70893), controlPoint1: NSPoint(x: 14.2845, y: 9.96794), controlPoint2: NSPoint(x: 13.9715, y: 9.85143))
+            path.curve(to: NSPoint(x: 13.2695, y: 8.97691), controlPoint1: NSPoint(x: 13.5375, y: 9.48742), controlPoint2: NSPoint(x: 13.3485, y: 9.36342))
+            path.curve(to: NSPoint(x: 13.2845, y: 8.40989), controlPoint1: NSPoint(x: 13.2355, y: 8.8119), controlPoint2: NSPoint(x: 13.2545, y: 8.55639))
+            path.curve(to: NSPoint(x: 13.0545, y: 7.70787), controlPoint1: NSPoint(x: 13.3525, y: 8.09438), controlPoint2: NSPoint(x: 13.277, y: 7.89187))
+            path.curve(to: NSPoint(x: 12.39, y: 7.51636), controlPoint1: NSPoint(x: 12.8735, y: 7.55786), controlPoint2: NSPoint(x: 12.643, y: 7.51636))
+            path.curve(to: NSPoint(x: 12.1445, y: 7.44136), controlPoint1: NSPoint(x: 12.2955, y: 7.51636), controlPoint2: NSPoint(x: 12.209, y: 7.47486))
+            path.curve(to: NSPoint(x: 12.035, y: 7.09585), controlPoint1: NSPoint(x: 12.039, y: 7.38886), controlPoint2: NSPoint(x: 11.9519, y: 7.25735))
+            path.curve(to: NSPoint(x: 12.22, y: 6.89334), controlPoint1: NSPoint(x: 12.0615, y: 7.04335), controlPoint2: NSPoint(x: 12.19, y: 6.91584))
+            path.curve(to: NSPoint(x: 13.326, y: 6.90834), controlPoint1: NSPoint(x: 12.5635, y: 6.69784), controlPoint2: NSPoint(x: 12.9595, y: 6.76184))
+            path.curve(to: NSPoint(x: 14.292, y: 7.66287), controlPoint1: NSPoint(x: 13.6655, y: 7.04735), controlPoint2: NSPoint(x: 13.9225, y: 7.30236))
+            path.curve(to: NSPoint(x: 14.9525, y: 8.54539), controlPoint1: NSPoint(x: 14.6695, y: 8.09838), controlPoint2: NSPoint(x: 14.7375, y: 8.21838))
+            path.curve(to: NSPoint(x: 15.3831, y: 9.36392), controlPoint1: NSPoint(x: 15.1225, y: 8.8009), controlPoint2: NSPoint(x: 15.277, y: 9.06341))
+            path.curve(to: NSPoint(x: 15.1415, y: 9.79893), controlPoint1: NSPoint(x: 15.4471, y: 9.55142), controlPoint2: NSPoint(x: 15.3641, y: 9.70493))
+            path.close()
+            let scale = (rect.width - 2) / 23.16
+            var transform = AffineTransform()
+            transform.translate(x: rect.midX - 23.16 * scale / 2, y: rect.midY + 17.04 * scale / 2)
+            transform.scale(x: scale, y: -scale)
+            path.transform(using: transform)
+            path.windingRule = .nonZero
+            NSColor.black.setFill()
+            path.fill()
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+
+    /// 菜单头部的状态色点：纯色实心圆，颜色跟随 mood。
+    private static func makeColoredDot(color: Color, size: CGFloat = 10) -> NSImage {
+        NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+            NSColor(color).setFill()
+            NSBezierPath(ovalIn: rect.insetBy(dx: size * 0.12, dy: size * 0.12)).fill()
+            return true
+        }
+    }
+
+    // MARK: - 主菜单（手动补齐，替代 SwiftUI 自动生成的菜单）
+
+    /// 无 SwiftUI App 场景后手动建立标准主菜单：
+    /// 保证「设置…（⌘,）」与文本输入框的剪切/复制/粘贴等快捷键可用。
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "关于科研助手", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(makeShortcutMenuItem(
+            action: .inputMessage,
+            title: "输入消息",
+            selector: #selector(inputMessageFromMenu)
+        ))
+        appMenu.addItem(makeShortcutMenuItem(
+            action: .newSession,
+            title: "新建会话",
+            selector: #selector(newSessionFromMenu)
+        ))
+        appMenu.addItem(makeShortcutMenuItem(
+            action: .selectWorkspace,
+            title: "选择工作区",
+            selector: #selector(selectWorkspaceFromMenu)
+        ))
+        appMenu.addItem(makeShortcutMenuItem(
+            action: .openHarness,
+            title: "打开 Harness",
+            selector: #selector(openHarnessFromMenu)
+        ))
+        appMenu.addItem(.separator())
+        appMenu.addItem(makeShortcutMenuItem(
+            action: .openSettings,
+            title: "设置…",
+            selector: #selector(toggleSettingsPanel)
+        ))
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "隐藏科研助手", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        let hideOthers = appMenu.addItem(withTitle: "隐藏其他应用", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        appMenu.addItem(withTitle: "全部显示", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "退出科研助手", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "编辑")
+        editMenu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
+        let readingMenuItem = NSMenuItem()
+        let readingMenu = NSMenu(title: "科研")
+        for action in ResearchReadingAction.allCases {
+            let item = NSMenuItem(title: action.title, action: #selector(readingActionFromMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = action.rawValue
+            readingMenuItems[action] = item
+            readingMenu.addItem(item)
+        }
+        readingMenuItem.submenu = readingMenu
+        mainMenu.addItem(readingMenuItem)
+
+        let windowMenuItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "窗口")
+        windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenu.addItem(withTitle: "缩放", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        windowMenuItem.submenu = windowMenu
+        mainMenu.addItem(windowMenuItem)
+
+        NSApp.mainMenu = mainMenu
+        NSApp.windowsMenu = windowMenu
+        applyMenuShortcuts()
+    }
+
+    // MARK: - Harness 输入入口
+
+    @objc private func inputMessageFromMenu() {
+        showComposerFromGlobalHotKey()
+    }
+
+    @objc private func newSessionFromMenu() {
+        model.startNewSession()
+        focusResearchPanel()
+    }
+
+    @objc private func selectWorkspaceFromMenu() {
+        model.openComposer()
+        focusResearchPanel()
+    }
+
+    @objc private func openHarnessFromMenu() {
+        model.openHarness()
+    }
+
+    // MARK: - 设置面板
+
+    /// 打开/关闭设置面板（菜单栏「设置…」）
+    @objc func toggleSettingsPanel() {
+        if let settingsPanel, settingsPanel.isVisible {
+            settingsPanel.orderOut(nil)
+            return
+        }
+        openSettingsPanel()
+    }
+
+    private func openSettingsPanel() {
+        let panel: NSPanel
+        if let existing = settingsPanel {
+            panel = existing
+        } else {
+            let p = NSPanel(
+                contentRect: NSRect(x: 0, y: 0, width: 1060, height: 530),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                backing: .buffered,
+                defer: false
+            )
+            p.title = "科研助手设置"
+            p.isReleasedWhenClosed = false
+            p.hidesOnDeactivate = false
+            p.contentMinSize = NSSize(width: 980, height: 520)
+            p.setFrameAutosaveName("DSHPetSettingsSidebar")
+            p.contentView = NSHostingView(rootView: SettingsPanelView(model: model))
+            p.center()
+            settingsPanel = p
+            panel = p
+        }
+        // 设置面板需要能输入（TextField 等），临时激活本 app
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        appLog.info("settings panel opened")
+    }
+
+    private static func existingInstance() -> NSRunningApplication? {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return nil }
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        return NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .first { $0.processIdentifier != ownPID && !$0.isTerminated }
+    }
+}

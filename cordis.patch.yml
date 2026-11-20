@@ -1,0 +1,4 @@
+# Dedicated research companion bridge; no model provider registration.
+- insert:
+    - id: dsh-research-companion
+      name: dsh-research-companion

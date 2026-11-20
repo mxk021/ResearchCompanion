@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' file:; style-src 'self' file: 'unsafe-inline'; font-src 'self' file:; img-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>科研对话</title>
+  <link rel="stylesheet" href="vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="transcript.css">
+  <script defer src="vendor/katex/katex.min.js"></script>
+  <script defer src="vendor/markdown-it/browser/markdown-it.umd.min.js"></script>
+  <script defer src="markdown.js"></script>
+  <script defer src="transcript.js"></script>
+</head>
+<body>
+  <main id="transcript" aria-label="科研对话">
+    <p id="empty">选中材料后翻译、解释，或直接输入问题。</p>
+    <section id="messages" aria-label="消息"></section>
+    <p id="busy" aria-live="polite" hidden></p>
+  </main>
+  <p id="reading-feedback" role="status" aria-live="polite" hidden></p>
+  <section id="note-feedback" aria-label="笔记保存反馈" hidden>
+    <span id="note-feedback-text" role="status"></span>
+    <button id="reveal-note" type="button" hidden>在 Finder 中显示</button>
+    <button id="dismiss-note-feedback" type="button" aria-label="关闭笔记反馈">×</button>
+  </section>
+  <button id="latest" type="button" hidden>回到最新</button>
+  <div id="formula-actions" role="group" aria-label="公式操作" hidden>
+    <button id="copy-formula" type="button">复制 LaTeX</button>
+    <button id="save-formula" type="button">保存这条公式</button>
+    <button id="save-formula-options" type="button">公式保存选项…</button>
+  </div>
+</body>
+</html>

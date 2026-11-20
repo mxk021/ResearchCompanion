@@ -1,0 +1,214 @@
+:root {
+  color-scheme: light dark;
+  --text: #24262c;
+  --hint: #535868;
+  --background: #fcfcfd;
+  --incoming: #f0f1f4;
+  --outgoing: #eaf1ff;
+  --line: #d4d8e1;
+  --link: #214eb3;
+  --answer-focus: #6789cb;
+  font: 13px/1.56 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #eeeef2;
+    --hint: #babdca;
+    --background: #232427;
+    --incoming: #2d2f35;
+    --outgoing: #283551;
+    --line: #4a4e5b;
+    --link: #a6c3ff;
+    --answer-focus: #7d9acb;
+  }
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { background: var(--background); color: var(--text); }
+body { margin: 0; overflow-x: hidden; }
+button { font: inherit; }
+#transcript { padding: 2px 3px 16px; }
+#empty, #busy { color: var(--hint); margin: 10px; }
+#messages { container-type: inline-size; }
+.message {
+  margin: 0 0 10px;
+  padding: 9px 12px 11px;
+  border-radius: 10px;
+  background: var(--incoming);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.message.user { background: var(--outgoing); }
+.settled-answer:focus { outline: none; }
+.settled-answer.answer-target { box-shadow: inset 2px 0 var(--answer-focus); }
+.settled-answer.answer-target:focus-visible { outline: 1px solid var(--answer-focus); outline-offset: -1px; }
+.message-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: .8em;
+  color: var(--hint);
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+.message-header span { font-weight: 600; }
+.message-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: end;
+  align-items: baseline;
+  column-gap: 8px;
+}
+.message-header button {
+  border: 0;
+  background: none;
+  color: var(--link);
+  min-height: 22px;
+  padding: 1px 2px;
+  cursor: pointer;
+}
+.message-header button:focus-visible, .answer-more summary:focus-visible {
+  outline: 1px solid var(--answer-focus);
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+.message-body > :first-child { margin-top: 0; }
+.message-body > :last-child { margin-bottom: 0; }
+.message-body p { margin: .4em 0 .65em; }
+.message-body h1, .message-body h2, .message-body h3 {
+  line-height: 1.3;
+  margin-bottom: .38em;
+}
+.message-body h1 { font-size: 1.38em; }
+.message-body h2 { font-size: 1.22em; }
+.message-body h3 { font-size: 1.12em; }
+ol, ul { padding-inline-start: 1.65em; }
+li > p { margin: .2em 0; }
+a { color: var(--link); }
+blockquote { margin: .6em 0; padding-left: .9em; border-left: 2px solid var(--line); }
+pre, code, .math-fallback { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+pre, .math-display, .math-inline {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+pre, .math-fallback { white-space: pre-wrap; }
+pre { white-space: pre; background: var(--background); border: 1px solid var(--line); padding: 8px; border-radius: 5px; }
+.math-inline { display: inline-block; vertical-align: -.22em; overflow-wrap: normal; }
+.math-display { display: block; padding: 4px 0; }
+.math-display > .katex-display {
+  /* Preserve the left edge of a formula wider than the viewport. */
+  width: max-content;
+  min-width: 100%;
+  margin: .16em 0;
+}
+.math-fallback { overflow-wrap: anywhere; }
+table { display: block; overflow-x: auto; border-collapse: collapse; margin: .5em 0; }
+td, th { padding: 3px 7px; border: 1px solid var(--line); }
+details { margin-top: .45em; color: var(--hint); font-size: 11px; }
+details > pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+#latest, #formula-actions {
+  position: fixed;
+  z-index: 1;
+  color: var(--link);
+  background: var(--background);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 4px 11px;
+  cursor: pointer;
+  box-shadow: 0 1px 4px #0002;
+  white-space: nowrap;
+}
+#latest { bottom: 8px; right: 10px; }
+#formula-actions button {
+  border: 0;
+  padding: 0 5px;
+  background: transparent;
+  color: var(--link);
+  cursor: pointer;
+}
+
+/* Only one instance of each operation. Compact rows move Copy into More. */
+.action-menu { position: relative; margin: 0; }
+.action-menu summary {
+  display: block; list-style: none; padding: 2px 4px; min-height: 22px;
+  color: var(--link); cursor: pointer; white-space: nowrap; user-select: none;
+}
+.action-menu summary::-webkit-details-marker { display: none; }
+.action-menu summary:focus-visible { outline: 1px solid var(--answer-focus); border-radius: 3px; }
+.action-menu-items {
+  position: absolute; right: 0; top: 100%; z-index: 3; min-width: max-content;
+  padding: 4px; background: var(--background); border: 1px solid var(--line);
+  border-radius: 7px; box-shadow: 0 2px 8px #0003;
+}
+.action-menu-items button { display: block; width: 100%; padding: 4px 9px; text-align: start; }
+.action-menu-items button:is(:hover, :focus-visible) { background: var(--incoming); }
+.note-split, .source-group { display: inline-flex; align-items: baseline; min-width: 0; }
+.note-split {
+  flex: none; border: 1px solid var(--line); border-radius: 5px;
+  background: var(--background); white-space: nowrap;
+}
+.note-split > .answer-note { padding: 0 5px; min-height: 21px; }
+.note-split summary { border-inline-start: 1px solid var(--line); padding: 0 5px; min-height: 21px; }
+#note-feedback {
+  position: fixed;
+  z-index: 1;
+  bottom: 8px;
+  left: 9px;
+  max-width: calc(100% - 105px);
+  margin: 0;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--background);
+  box-shadow: 0 1px 4px #0002;
+  display: flex;
+  align-items: baseline;
+  gap: .6em;
+  overflow-wrap: anywhere;
+  font-size: 11px;
+}
+#note-feedback button {
+  border: 0;
+  background: none;
+  color: var(--link);
+  padding: 1px 2px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.message-header > span { flex: none; }
+.message-actions { min-width: 0; align-items: center; gap: 3px 7px; }
+.source-group { gap: 4px; flex: 0 1 auto; max-width: 100%; align-items: center; }
+.message-header .answer-direct-source {
+  display: inline-flex; align-items: baseline; min-width: 0; max-width: 100%;
+  background: var(--background); border: 1px solid var(--line); border-radius: 5px; padding: 0 5px;
+}
+.message-header .answer-material-label, .message-header .answer-source {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 28ch; font-weight: 400;
+}
+.message-header .source-page { flex: 0 1 auto; max-width: 18ch; overflow: hidden; text-overflow: ellipsis; white-space: pre; font-weight: 400; }
+@container (max-width: 475px) {
+  .message-header { flex-wrap: wrap; gap: 0 6px; }
+  .message-actions { flex: 1 1 auto; }
+  .message-header .answer-material-label, .message-header .answer-source { max-width: 30cqw; }
+  .source-group { flex-shrink: 1; }
+}
+#reading-feedback {
+  position: fixed;
+  z-index: 2;
+  top: 6px;
+  right: 10px;
+  max-width: calc(100% - 20px);
+  margin: 0;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--background);
+  box-shadow: 0 1px 4px #0002;
+  pointer-events: none;
+}

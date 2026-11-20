@@ -1,0 +1,36 @@
+DeepSeek Harness — FishLogo artwork
+Source: https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/client/ui-primitives/src/FishLogo.tsx
+Source blob: 8621f17273c0d192feb14a988816c8052360b908
+Geometry transcribed without redesign for the DSH Pet monochrome menu-bar template.
+
+MIT License
+
+Copyright (c) 2026 DeepSeek
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+本地科研对话排版资源 / Offline research transcript
+KaTeX 0.19.1 (MIT): https://github.com/KaTeX/KaTeX
+markdown-it 15.0.3 (MIT): https://github.com/markdown-it/markdown-it
+各资源的许可证位于 Transcript/vendor/。npm 发布归档完整性锁定在 scripts/vendor-transcript.py 中。
+
+
+Public distributions include the dsh-mac-pet MIT notice and attribution to SelectedTextKit in LicenseNotices/.
+The KaTeX JavaScript/CSS and markdown-it are MIT-licensed; KaTeX fonts retain the SIL Open Font License 1.1
+and their Reserved Font Names. See LicenseNotices/KaTeX-fonts-OFL.txt and
+LicenseNotices/markdown-it-dependencies.txt for the font and browser bundle notices.
