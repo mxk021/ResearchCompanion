@@ -71,13 +71,21 @@ def native_checks(temp, env, clt_only):
         run('swift', 'test', *swift, env=env)
     common = ['swiftc', '-sdk', env['SDKROOT'], '-parse-as-library', '-module-cache-path', temp / 'modules']
     for check, source in [('check-note-export', 'ResearchNoteStorage'), ('check-composer', 'ComposerTextView'),
-                          ('check-transcript', 'ResearchWindowGeometry')]:
+                          ('check-transcript', 'ResearchWindowGeometry'), ('check-pdf-layout', 'ResearchPDFLayout')]:
         binary = temp / check
         run(*common, ROOT / f'Sources/DSHPet/{source}.swift', ROOT / f'scripts/{check}.swift', '-o', binary, env=env)
         args = [ROOT / 'Resources/Transcript'] if check == 'check-transcript' else []
         run(binary, *args, env=env)
     for flags in ([], ['--selection']):
         run(PYTHON, 'scripts/check-long-pdf.py', *flags, env=env)
+    app_sources = sorted(p for p in (ROOT / 'Sources/DSHPet').glob('*.swift') if p.name != 'DSHPetMain.swift')
+    target = f'{platform.machine()}-apple-macos14.0'
+    for name in ['check-pdf-query', 'check-pdf-card']:
+        executable = temp / name
+        run(*common, '-target', target, '-whole-module-optimization', *app_sources,
+            ROOT / f'scripts/{name}.swift', '-o', executable, env=env)
+        arguments = [temp, '--render', '--check-bridge'] if name == 'check-pdf-card' else []
+        run(executable, *arguments, env=env)
     run('swift', 'build', *swift, '-c', 'release', env=env)
     path = Path(output('swift', 'build', *swift, '-c', 'release', '--show-bin-path', env=env))
     return path / 'DSHPet'

@@ -1,14 +1,17 @@
 import AppKit
+import PDFKit
 
 struct ResearchAnswerSource {
     let session: String
     let answer: ResearchChatMessage
     let local: ResearchProvenanceStore.LocalReference?
+    private let store: ResearchProvenanceStore
 
-    init(session: String, answer: ResearchChatMessage, store: ResearchProvenanceStore = .live) {
+    init(session: String, answer: ResearchChatMessage, store: ResearchProvenanceStore = .live, includePositions: Bool = true) {
         self.session = session
         self.answer = answer
-        local = answer.reply.flatMap { store.read(session: session, reply: $0) }
+        self.store = store
+        local = answer.reply.flatMap { store.read(session: session, reply: $0, includePositions: includePositions) }
     }
 
     var material: ResearchSourceMaterial? { answer.reply?.material }
@@ -23,8 +26,21 @@ struct ResearchAnswerSource {
         guard answer.role == "assistant", let reply = answer.reply, reply.requestId != nil else { return nil }
         if let zoteroURL { return .zotero(zoteroURL) }
         if let webURL { return .webpage(webURL) }
-        if let file = local?.file { return .file(file) }
-        return nil
+        if let file = local?.file { return .locatedFile(file, positions: local?.pdfPositions, pages: local?.pdfPages) }
+        return backgroundTarget
+    }
+
+    var backgroundTarget: ResearchDirectSource? {
+        guard let file = local?.backgroundFile else { return nil }
+        return .locatedFile(file, positions: local?.backgroundPositions, pages: local?.backgroundPages)
+    }
+
+    func positions(for file: ResearchFileReference, background: Bool) -> [ResearchPDFSourcePosition] {
+        guard let reply = answer.reply, let detail = store.read(session: session, reply: reply) else { return [] }
+        if background || detail.file == nil {
+            return file == detail.backgroundFile ? detail.backgroundPositions ?? [] : []
+        }
+        return file == detail.file ? detail.pdfPositions ?? [] : []
     }
 
     var sourcePresentation: ResearchSourcePresentation? {
@@ -36,7 +52,9 @@ struct ResearchAnswerSource {
         case .webpage(let url):
             name = title.isEmpty || ["浏览器选区", "Safari选区", "Safari 选区"].contains(title)
                 ? (url.host ?? "网页") : title
-        case .file(let file):
+        case .pdf(let file, _, _) where local?.file == nil:
+            name = URL(fileURLWithPath: file.originalPath).lastPathComponent
+        case .file(let file), .pdf(let file, _, _):
             name = title.isEmpty ? URL(fileURLWithPath: file.originalPath).lastPathComponent : title
         default:
             name = title.isEmpty ? "材料" : title
@@ -50,7 +68,10 @@ struct ResearchAnswerSource {
         } else {
             pdfPage = nil
         }
-        let page = pdfPage.map { "PDF 文件第 \($0) 页" } ?? local?.pdfPages.map { "摘录页 \($0)" }
+        let page: String?
+        if let pdfPage { page = "PDF 文件第 \(pdfPage) 页" }
+        else if case .pdf = target, local?.file == nil { page = local?.backgroundPages.map { "背景 PDF 摘录页 " + $0 } }
+        else { page = local?.pdfPages.map { "摘录页 " + $0 } }
         let label = pdfPage == nil ? nil : material.pageLabel?.split(whereSeparator: \.isWhitespace).joined(separator: " ")
         let readerLabel = label.flatMap { value in
             value.isEmpty ? nil : "阅读器页标签 \(value)"
@@ -69,6 +90,7 @@ struct ResearchAnswerSource {
             material.scope,
             material.pageIndex.map { "PDF 第 \($0 + 1) 页（文件位置）" },
             material.pageLabel.map { "页面标签 \($0)" },
+            local?.pdfPages.map { "PDF 文件摘录页 " + $0 },
             local?.backgroundFile.map { "会话背景文件 " + $0.originalPath },
             local?.backgroundPages.map { "背景文件摘录页 " + $0 },
         ].compactMap { $0 }
@@ -111,6 +133,15 @@ enum ResearchDirectSource: Sendable {
     case zotero(URL)
     case webpage(URL)
     case file(ResearchFileReference)
+    case pdf(ResearchFileReference, positions: [ResearchPDFSourcePosition], firstPage: Int)
+
+    static func locatedFile(_ file: ResearchFileReference, positions: [ResearchPDFSourcePosition]?, pages: String?) -> Self {
+        guard URL(fileURLWithPath: file.originalPath).pathExtension.lowercased() == "pdf" else { return .file(file) }
+        // Older snapshots carry only one-based page lists (e.g. 2–4、7).
+        let first = positions?.first?.page ?? pages.flatMap { Int($0.prefix(while: \.isNumber)) }
+        guard let first, first > 0 else { return .file(file) }
+        return .pdf(file, positions: positions ?? [], firstPage: first)
+    }
 
     var help: String {
         switch self {
@@ -118,6 +149,8 @@ enum ResearchDirectSource: Sendable {
             url.query == nil ? "打开当时的 Zotero 附件" : "定位到当时的 Zotero PDF 页"
         case .webpage:
             "打开保存的网址。网站不可达时由浏览器提示。"
+        case .pdf(_, let positions, _):
+            positions.isEmpty ? "定位到当时的 PDF 原文" : "查看 PDF 中标记的原文位置"
         case .file:
             "打开当时的本机文件"
         }
@@ -127,14 +160,14 @@ enum ResearchDirectSource: Sendable {
         switch self {
         case .zotero: "无法打开该 Zotero 附件。请检查 Zotero 是否可用，或打开「来源」核对摘录。"
         case .webpage: "无法在浏览器打开保存的网址。可在「来源」核对网址和摘录。"
-        case .file: "无法打开该本机文件。可在「来源」核对路径或重新定位。"
+        case .file, .pdf: "无法打开该本机文件。可在「来源」核对路径或重新定位。"
         }
     }
 
     func resolve() async -> URL? {
         switch self {
         case .zotero(let url), .webpage(let url): return url
-        case .file(let reference): return await Task.detached { reference.resolve() }.value
+        case .file(let reference), .pdf(let reference, _, _): return await Task.detached { reference.resolve() }.value
         }
     }
 }
@@ -144,20 +177,43 @@ enum ResearchAnswerActions {
     static func openOriginal(_ source: ResearchAnswerSource, in window: NSWindow,
                              ifCurrent: @escaping () -> Bool = { true }) {
         guard let target = source.directTarget else { return }
+        open(target, source: source, background: false, in: window, ifCurrent: ifCurrent)
+    }
+
+    private static func open(_ target: ResearchDirectSource, source: ResearchAnswerSource, background: Bool,
+                             in window: NSWindow, ifCurrent: @escaping () -> Bool = { true }) {
         Task { [weak window] in
+            if case .pdf(let reference, let positions, let page) = target {
+                // Verify the very bytes the reader will display, including when the bookmark follows a move.
+                let result = await Task.detached(priority: .userInitiated) { () throws -> ResearchPDFEvidenceReader.Prepared? in
+                    guard let (url, data) = reference.verifiedPDF() else { return nil }
+                    let detail = positions.isEmpty && source.local?.positionDigest != nil ? source.positions(for: reference, background: background) : positions
+                    return try ResearchPDFEvidenceReader.prepare(data: data, filename: url.lastPathComponent,
+                                                                 positions: detail, firstPage: page)
+                }.result
+                guard ifCurrent(), let window, window.isVisible, window.attachedSheet == nil else { return }
+                switch result {
+                case .success(let prepared?):
+                    ResearchPDFEvidenceReader.present(prepared, in: window)
+                case .success(nil):
+                    if background { relink(source, background: true, in: window) }
+                    else { presentSource(source, file: nil, in: window) }
+                case .failure(let error):
+                    showError(error.localizedDescription, in: window)
+                }
+                return
+            }
             let url = await target.resolve()
             guard ifCurrent(), let window, window.isVisible, window.attachedSheet == nil else { return }
             guard let url else {
-                // A missing or changed file keeps its original excerpt and offers re-linking.
-                presentSource(source, file: nil, in: window)
+                if background { relink(source, background: true, in: window) }
+                else { presentSource(source, file: nil, in: window) }
                 return
             }
             do {
                 _ = try await NSWorkspace.shared.open(url, configuration: .init())
             } catch {
-                if window.isVisible, window.attachedSheet == nil {
-                    showError(target.openFailure, in: window)
-                }
+                if window.isVisible, window.attachedSheet == nil { showError(target.openFailure, in: window) }
             }
         }
     }
@@ -178,7 +234,7 @@ enum ResearchAnswerActions {
         if let expected = source.local?.file?.originalPath {
             if let file, file.path != expected { lines.append("文件已移动。已找到内容一致的文件：\(file.path)") }
             if file == nil { lines.append("原文件已移动、移除或变更。可选取内容一致的文件重新定位。") }
-        } else if source.zoteroURL == nil && source.webURL == nil && source.material != nil {
+        } else if source.directTarget == nil && source.material != nil {
             lines.append("没有可用的来源定位。仍可复制当时发送的摘录。")
         }
         alert.informativeText = lines.joined(separator: "\n")
@@ -194,23 +250,31 @@ enum ResearchAnswerActions {
             alert.accessoryView = preview
         }
         let canRelink = source.local?.file != nil && file == nil
-        if canRelink { alert.addButton(withTitle: "重新定位…") }
-        if source.material != nil { alert.addButton(withTitle: "复制摘录") }
-        alert.addButton(withTitle: "关闭").keyEquivalent = "\u{1b}"
-        alert.beginSheetModal(for: window) { response in
-            Task { @MainActor in
-                if canRelink, response == .alertFirstButtonReturn {
-                    relink(source, in: window)
-                } else if let text = source.material?.text,
-                          response == (canRelink ? .alertSecondButtonReturn : .alertFirstButtonReturn) {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(text, forType: .string)
-                }
+        var actions: [@MainActor () -> Void] = []
+        if canRelink {
+            alert.addButton(withTitle: "重新定位…")
+            actions.append { relink(source, in: window) }
+        }
+        if let target = source.backgroundTarget {
+            alert.addButton(withTitle: "打开背景文件原文")
+            actions.append { open(target, source: source, background: true, in: window) }
+        }
+        if let text = source.material?.text {
+            alert.addButton(withTitle: "复制摘录")
+            actions.append {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
             }
+        }
+        alert.addButton(withTitle: "关闭").keyEquivalent = "\u{1b}"
+        let choices = actions
+        alert.beginSheetModal(for: window) { response in
+            let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+            if choices.indices.contains(index) { Task { @MainActor in choices[index]() } }
         }
     }
 
-    private static func relink(_ source: ResearchAnswerSource, in window: NSWindow) {
+    private static func relink(_ source: ResearchAnswerSource, background: Bool = false, in window: NSWindow) {
         guard let reply = source.answer.reply else { return }
         let panel = NSOpenPanel()
         panel.message = "请选择与原始材料内容一致的文件。"
@@ -221,8 +285,8 @@ enum ResearchAnswerActions {
             Task { @MainActor in
                 do {
                     let session = source.session
-                    try await Task.detached { try ResearchProvenanceStore.live.relink(session: session, reply: reply, file: url) }.value
-                    showSource(ResearchAnswerSource(session: session, answer: source.answer), in: window)
+                    try await Task.detached { try ResearchProvenanceStore.live.relink(session: session, reply: reply, file: url, background: background) }.value
+                    showSource(ResearchAnswerSource(session: session, answer: source.answer, includePositions: false), in: window)
                 } catch { showError(error.localizedDescription, in: window) }
             }
         }

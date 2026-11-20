@@ -60,6 +60,25 @@ struct LongPDFCheck {
         let referenceRoot = folder.appendingPathComponent("sources")
         let store = ResearchProvenanceStore(root: referenceRoot)
         try makeFixture(file, pages: 52)
+        // Replace an open fixture during its first page progress callback. A stale index
+        // must never enter the cache, even though the original PDF handle remains readable.
+        let changing = folder.appendingPathComponent("changing-during-index.pdf")
+        try makeFixture(changing, pages: 2)
+        do {
+            _ = try ResearchPDFIndex.read(changing, title: "changing") { status in
+                if status.contains("第 1 /") { try! Data("replaced during indexing".utf8).write(to: changing, options: .atomic) }
+            }
+            fatalError("File changed during indexing but a stale corpus was returned")
+        } catch {
+            precondition(error.localizedDescription.contains("变化"), error.localizedDescription)
+        }
+        try makeFixture(changing, pages: 3)
+        let fresh = try ResearchPDFIndex.read(changing, title: "changing") { _ in }
+        let reused = try ResearchPDFIndex.read(changing, title: "changing") { _ in }
+        precondition(fresh === reused && reused.pages.count == 3)
+        try makeFixture(changing, pages: 1)
+        let changed = try ResearchPDFIndex.read(changing, title: "changing") { _ in }
+        precondition(changed !== reused && changed.pages.count == 1 && changed.reference.fingerprint != reused.reference.fingerprint)
         let before = try ResearchFileReference.capture(file)
         let suite = "LongPDFCheck." + UUID().uuidString
         let prefs = UserDefaults(suiteName: suite)!
@@ -80,6 +99,11 @@ struct LongPDFCheck {
             precondition(!ResearchMaterial.requestsFileBackground(question, filename: file.lastPathComponent))
         }
         let captured = try ResearchMaterial.selection("LARCH: fresh preview", source: "TextEdit", title: "Synthetic excerpts")
+        for withFile in [true, false] {
+            let scope = try ResearchDocumentScope.resolve(question: "翻译选区中作者的原话", mode: .ask,
+                selection: captured, hasFile: withFile, filename: withFile ? "fixture.pdf" : nil, captureFailed: false)
+            precondition(scope == .selection)
+        }
         let firstRead = client.beginSelectionTranslation(previewOnly: true)!
         client.finishSelectionTranslation(firstRead, result: .success(captured))
         precondition(client.appMaterial == captured && client.sessionID == nil && !client.hasPendingSubmission)
@@ -115,6 +139,38 @@ struct LongPDFCheck {
         try await wait("on-demand OCR") { !client.loadingResearchFile }
         guard let index = client.fixedMaterial?.pdfIndex else { throw ResearchMaterialError.message(client.materialError ?? "Missing index") }
         precondition(index.pages.count == 52 && index.pages[36].ocr && index.pages[36].text.contains("9375"), index.status)
+        let unrelated = client.beginSelectionTranslation(previewOnly: true)!
+        client.finishSelectionTranslation(unrelated, result: .success(captured))
+        // Verify the prepared range at the real client transport boundary on two synthetic routes.
+        let subscription = client.selectedResearchModel!
+        let alternative = ResearchModelSelection(provider: "deepseek-account", model: "fixture-paid", reasoningEffort: nil)
+        let rangeQuery = "翻译从 OPENING THISTLE 到 PAGE_1_END 的内容。"
+        let verifiedRange = try client.fixedMaterial!.pdfIndex!.prepare(rangeQuery)
+        precondition(verifiedRange.count == 1)
+        var packets: [String] = []
+        for route in [subscription, alternative] {
+            if route != client.selectedResearchModel {
+                client.selectResearchModel(route)
+                try await wait("explicit provider selection") { client.selectedResearchModel == route && !client.modelSwitching }
+            }
+            let count = client.conversationMessages.count
+            client.draft = rangeQuery
+            client.submitResearch()
+            try await wait("range on " + route.provider) {
+                (client.conversationMessages.count == count + 1 && !client.hasPendingSubmission) || client.lastError != nil
+            }
+            if let error = client.lastError { throw ResearchMaterialError.message(error) }
+            let sent = client.conversationMessages.last!.reply!.material!
+            precondition(sent.text == verifiedRange[0].text)
+            precondition(sent.text.contains("OPENING THISTLE") && sent.text.contains("PAGE_1_END") &&
+                         !sent.text.contains("PAGE_1_START") && !sent.text.contains("LARCH"))
+            precondition(store.read(session: client.sessionID!, reply: client.conversationMessages.last!.reply!)?.file?.fingerprint == before.fingerprint)
+            packets.append(sent.text)
+        }
+        precondition(packets[0] == packets[1])
+        client.selectResearchModel(subscription)
+        try await wait("restore explicit subscription") { client.selectedResearchModel == subscription && !client.modelSwitching }
+        client.removeResearchSelection()
         let all = try index.segments()
         precondition(all.count > 4 && all.allSatisfy { $0.text.utf16.count <= 7_200 })
         for page in index.pages {
@@ -141,14 +197,20 @@ struct LongPDFCheck {
         precondition(ResearchPDFIndex.wholeTask("不要翻译全文，只翻译第24页", mode: .ask) == nil)
         client.draft = ""
         let countBeforePreview = client.conversationMessages.count
-        let shown = client.fixedMaterial!.text
+        precondition(client.fixedMaterial!.text.isEmpty)
+        func approve(_ allow: Bool) async throws {
+            try await wait("batch plan") { client.pdfBatchApproval != nil }
+            client.resolvePDFApproval(client.pdfBatchApproval!.id, allow: allow)
+        }
         client.submitResearch(.translate)
-        try await wait("preview only") { client.conversationMessages.count > countBeforePreview && !client.hasPendingSubmission }
-        precondition(client.conversationMessages.last?.reply?.material?.text == shown)
+        try await approve(false)
+        try await wait("cancel before first call") { !client.pdfRequestRunning }
+        precondition(client.conversationMessages.count == countBeforePreview)
         for (question, additional) in [("请翻译全文", 0), ("请分析整篇 PDF", 1)] {
             let count = client.conversationMessages.count
             client.draft = question
             client.submitResearch()
+            try await approve(true)
             try await wait(question) { !client.pdfRequestRunning }
             precondition(client.pdfRequestStatus?.contains("已完成 \(all.count)/\(all.count) 段") == true,
                          client.pdfRequestStatus ?? "missing progress")
@@ -161,10 +223,12 @@ struct LongPDFCheck {
         let count = client.conversationMessages.count
         client.draft = "请分析全文。FAIL_SEGMENT"
         client.submitResearch()
+        try await approve(true)
         try await wait("reject") { !client.pdfRequestRunning }
         precondition(client.pdfRequestStatus?.contains("已完成 1/") == true && client.conversationMessages.count == count + 1)
         client.draft = "请翻译全文。CANCEL_SEGMENT"
         client.submitResearch()
+        try await approve(true)
         try await wait("cancel one admitted part") { client.conversationRunning }
         client.stopPDFWork()
         try await wait("cancel") { !client.pdfRequestRunning }
@@ -198,7 +262,7 @@ struct LongPDFCheck {
         precondition(client.lastError?.contains("尚无可发送的正文") == true && client.conversationMessages.count == priorReplies)
         client.recognizePDFScans()
         try await wait("all-image OCR") { !client.loadingResearchFile }
-        precondition(client.fixedMaterial?.text.contains("9375") == true && client.hasSendableResearchMaterial)
+        precondition(client.fixedMaterial?.text.isEmpty == true && client.fixedMaterial?.pdfIndex?.pages.first?.text.contains("9375") == true && client.hasSendableResearchMaterial)
         let blankOnly = folder.appendingPathComponent("all-blank.pdf")
         try makeFixture(blankOnly, pages: 1, blankLast: true)
         client.loadFixedMaterial(blankOnly, recognizeScans: true)

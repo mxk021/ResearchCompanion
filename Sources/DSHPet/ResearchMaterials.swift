@@ -4,7 +4,7 @@ import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// The exact excerpt displayed locally and passed to the bridge on an explicit send.
+/// A captured selection, an indexed attachment, or the evidence prepared for one request.
 struct ResearchMaterial: Equatable, Sendable {
     static let maximumLength = 24_000
     static let localSelectionLimit = 1_048_576
@@ -23,6 +23,8 @@ struct ResearchMaterial: Equatable, Sendable {
     var pdfPages: String? = nil
     var backgroundFile: ResearchFileReference? = nil
     var backgroundPages: String? = nil
+    var pdfPositions: [ResearchPDFSourcePosition]? = nil
+    var backgroundPositions: [ResearchPDFSourcePosition]? = nil
 
     var fields: [String: String] {
         var value = ["source": source, "title": title, "text": text, "scope": scope]
@@ -88,9 +90,9 @@ struct ResearchMaterial: Equatable, Sendable {
             throw ResearchMaterialError.message("完整选区与相关文件摘录合计超出单次材料上限。请缩小选区或单独提问。")
         }
         let scope = Self.bounded("主要来源为" + source + "选区；另附会话文件「" + background.title + "」" + range + "的相关摘录。", limit: 512)
-        return Self(id: id, source: "选区与会话文件", title: title, text: body, scope: scope, url: url,
+        return Self(id: id, source: "选区与会话文件", title: title, text: body, scope: scope, url: url, page: page,
                     fileReference: fileReference, localWebURL: localWebURL, backgroundFile: background.fileReference,
-                    backgroundPages: background.pdfPages)
+                    backgroundPages: background.pdfPages, pdfPositions: pdfPositions, backgroundPositions: background.pdfPositions)
     }
 
     private func relevantText(question: String, selection: String) throws -> Self {
@@ -249,53 +251,47 @@ struct ResearchMaterialCard: View {
                         .buttonStyle(.borderless).accessibilityLabel("清除取词提示").help("清除取词提示")
                 }
             }
-            if command.hasAssociatedFile {
-                HStack(spacing: 5) {
-                    Button { fileDetails.toggle() } label: {
-                        Image(systemName: fileDetails ? "chevron.down" : "chevron.right").frame(width: 12)
+            if command.hasAssociatedFile || command.associatedPDFName != nil {
+                if let name = command.associatedPDFName {
+                    let index = command.fixedMaterial?.pdfIndex
+                    HStack(alignment: .top, spacing: 5) {
+                        ResearchPDFCardContent(metadata: index?.metadata ?? ResearchPDFMetadata(), filename: name,
+                                               status: pdfStatus(index), statusDetail: command.materialError ?? index?.status)
+                        fileMenu
                     }
-                    .accessibilityLabel(fileDetails ? "收起文件详情" : "查看文件详情").help("会话文件详情")
-                    Text(command.fixedMaterial?.title ?? "会话文件").font(.caption.weight(.medium))
-                        .lineLimit(1).truncationMode(.middle).help(command.fixedMaterial?.title ?? "")
-                    Spacer(minLength: 2)
-                    if let file = command.fixedMaterial {
-                        Text(file.pdfIndex.map { "PDF · 已检查 \($0.pages.count) 页" } ?? file.source)
-                            .font(.caption).foregroundStyle(.secondary).fixedSize()
-                    }
-                    Menu {
-                        if let index = command.fixedMaterial?.pdfIndex {
-                            if index.canRequestOCR {
-                                Button("本机 OCR 识别缺字页") { command.recognizePDFScans() }
-                            }
-                            Button("翻译整篇 PDF") { command.submitWholePDF(.translation) }
-                                .disabled(!command.canUseAssociatedFile)
-                            Button("分析整篇 PDF") { command.submitWholePDF(.analysis) }
-                                .disabled(!command.canUseAssociatedFile)
-                            Divider()
+                } else {
+                    HStack(spacing: 5) {
+                        Button { fileDetails.toggle() } label: {
+                            Image(systemName: fileDetails ? "chevron.down" : "chevron.right").frame(width: 12)
                         }
-                        Button("移除会话文件") { command.removeResearchFile() }
-                    } label: { Image(systemName: "ellipsis.circle") }
-                    .menuStyle(.borderlessButton).fixedSize().disabled(command.pdfRequestRunning)
-                    .accessibilityLabel("会话文件操作").help("会话文件操作")
-                }.buttonStyle(.borderless)
-                if fileDetails, let file = command.fixedMaterial {
-                    Text(file.pdfIndex?.status ?? file.scope).font(.caption).textSelection(.enabled)
-                    HStack {
-                        if !file.text.isEmpty { Text("已读摘录预览").font(.caption).foregroundStyle(.secondary) }
-                        Spacer()
-                        Button("打开完整文件") { command.openAssociatedFile() }.buttonStyle(.link)
-                    }
-                    if !file.text.isEmpty {
-                        ScrollView { Text(file.text).font(.caption).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
-                            .frame(height: min(76, availableSize.height * 0.1))
-                            .accessibilityLabel("已读取的文件摘录")
+                        .accessibilityLabel(fileDetails ? "收起文件详情" : "查看文件详情").help("会话文件详情")
+                        Text(command.fixedMaterial?.title ?? "会话文件").font(.caption.weight(.medium))
+                            .lineLimit(1).truncationMode(.middle).help(command.fixedMaterial?.title ?? "")
+                        Spacer(minLength: 2)
+                        if let file = command.fixedMaterial {
+                            Text(file.source).font(.caption).foregroundStyle(.secondary).fixedSize()
+                        }
+                        fileMenu
+                    }.buttonStyle(.borderless)
+                    if fileDetails, let file = command.fixedMaterial, file.pdfIndex == nil {
+                        Text(file.scope).font(.caption).textSelection(.enabled)
+                        HStack {
+                            if !file.text.isEmpty { Text("已读摘录预览").font(.caption).foregroundStyle(.secondary) }
+                            Spacer()
+                            Button("打开完整文件") { command.openAssociatedFile() }.buttonStyle(.link)
+                        }
+                        if !file.text.isEmpty {
+                            ScrollView { Text(file.text).font(.caption).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                                .frame(height: min(76, availableSize.height * 0.1))
+                                .accessibilityLabel("已读取的文件摘录")
+                        }
                     }
                 }
             }
             if let progress = command.pdfRequestStatus {
                 Text(progress).font(.caption).foregroundStyle(.secondary).lineLimit(3).textSelection(.enabled)
             }
-            if let error = command.materialError ?? command.contextError {
+            if let error = (command.associatedPDFName == nil ? command.materialError : nil) ?? command.contextError {
                 Text(error).font(.caption).foregroundStyle(.secondary).lineLimit(3).textSelection(.enabled)
             }
         }
@@ -316,6 +312,35 @@ struct ResearchMaterialCard: View {
             command.loadFixedMaterial(url)
             return true
         } isTargeted: { dragOver = $0 }
+    }
+
+    private func pdfStatus(_ index: ResearchPDFIndex?) -> String {
+        if command.loadingResearchFile {
+            return command.materialError.flatMap { $0.contains(" / ") ? $0 : nil } ?? "正在解析…"
+        }
+        if let message = command.materialError, index == nil || message.contains("无法") || message.contains("已移走") {
+            return message
+        }
+        return index?.cardStatus ?? "文件失效或读取失败"
+    }
+
+    private var fileMenu: some View {
+        Menu {
+            if let index = command.fixedMaterial?.pdfIndex {
+                Button("打开完整文件") { command.openAssociatedFile() }
+                if index.canRequestOCR {
+                    Button("本机 OCR 识别缺字页") { command.recognizePDFScans() }
+                }
+                Button("翻译整篇 PDF") { command.submitWholePDF(.translation) }
+                    .disabled(!command.canUseAssociatedFile)
+                Button("分析整篇 PDF") { command.submitWholePDF(.analysis) }
+                    .disabled(!command.canUseAssociatedFile)
+                Divider()
+            }
+            Button("移除会话文件") { command.removeResearchFile() }
+        } label: { Image(systemName: "ellipsis.circle") }
+        .menuStyle(.borderlessButton).fixedSize().disabled(command.pdfRequestRunning)
+        .accessibilityLabel("会话文件操作").help("会话文件操作")
     }
 
     private func selectionHeight(_ selection: ResearchMaterial) -> CGFloat {
@@ -342,6 +367,38 @@ struct ResearchMaterialCard: View {
         panel.beginSheetModal(for: parent) { response in
             command.finishResearchFileChoice(response == .OK ? panel.url : nil)
         }
+    }
+}
+
+/// The attached PDF card only consumes bibliographic metadata and reading state.
+struct ResearchPDFCardContent: View {
+    let metadata: ResearchPDFMetadata
+    let filename: String
+    let status: String
+    let statusDetail: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(metadata.title ?? filename)
+                .font(.callout.weight(.semibold)).lineLimit(2)
+                .help(metadata.title.map { $0 + "\n" + filename } ?? filename)
+            if metadata.title == nil {
+                Text("论文标题未识别").font(.caption).foregroundStyle(.secondary)
+            }
+            Text("作者  " + (metadata.authorDisplay ?? "未识别"))
+                .lineLimit(1).help(metadata.authors.joined(separator: "、"))
+            if let url = metadata.link {
+                Link(destination: url) {
+                    Text(url.host == "doi.org" ? "DOI  " + String(url.path.dropFirst()) : url.absoluteString)
+                        .lineLimit(1).truncationMode(.middle)
+                }.help(url.absoluteString)
+            } else {
+                Text("网址或 DOI  未识别")
+            }
+            Text(status).foregroundStyle(.secondary).lineLimit(2).help(statusDetail ?? status)
+        }
+        .font(.caption).frame(maxWidth: .infinity, alignment: .leading)
+        .textSelection(.enabled)
     }
 }
 

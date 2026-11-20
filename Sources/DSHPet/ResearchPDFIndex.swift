@@ -7,24 +7,30 @@ import Vision
 /// segments is serialized. The original PDF is opened read-only and never rewritten.
 final class ResearchPDFIndex: Equatable, @unchecked Sendable {
     struct Page {
-        let number: Int                 // one-based physical position, independent of printed labels
-        let text: String
-        let ocr: Bool
+        let number: Int             // one-based physical page, independent of printed labels
+        var blocks: [ResearchPDFBlock]
+        let reliableOrder: Bool
+        let state: ResearchPDFPageState
+        var text: String { blocks.map(\.text).joined(separator: "\n\n") }
+        var utf16Length: Int { blocks.reduce(0) { $0 + $1.text.utf16.count + 2 } }
+        var ocr: Bool { blocks.contains { $0.lines.contains(where: \.ocr) } }
     }
-    private struct Passage {
-        let page: Int
-        let text: String
-        let words: Set<String>
-    }
-
+    private static let cache: NSCache<NSString, ResearchPDFIndex> = {
+        let cache = NSCache<NSString, ResearchPDFIndex>()
+        cache.countLimit = 5
+        cache.totalCostLimit = 40 * 1024 * 1024
+        return cache
+    }()
     enum WholeTask { case translation, analysis }
     let pages: [Page]
     let reference: ResearchFileReference
     let title: String
-    private let passages: [Passage]
+    let corpus: ResearchPDFCorpus
+    let metadata: ResearchPDFMetadata
+    let cardStatus: String
     let status: String
     let canRequestOCR: Bool
-    private let unavailable: Set<Int>
+    let unavailable: Set<Int>
     static func == (left: ResearchPDFIndex, right: ResearchPDFIndex) -> Bool { left === right }
 
     static func summaryGroups(_ notes: [String]) throws -> [String] {
@@ -45,94 +51,266 @@ final class ResearchPDFIndex: Equatable, @unchecked Sendable {
 
     static func read(_ url: URL, title: String, recognizeScans: Bool = false, progress: @Sendable (String) -> Void) throws -> ResearchPDFIndex {
         let reference = try ResearchFileReference.capture(url)
+        let key = "\(url.standardizedFileURL.path)|\(reference.fingerprint)|\(recognizeScans)" as NSString
+        if let existing = cache.object(forKey: key) {
+            try Task.checkCancellation()
+            return existing
+        }
         guard let doc = PDFDocument(url: url), !doc.isLocked, doc.pageCount > 0 else {
             throw ResearchMaterialError.message("PDF 无法打开、没有页面或受到密码保护。")
         }
         let count = doc.pageCount
         var pages: [Page] = []
-        var passages: [Passage] = []
-        var needsOCR: [Int] = []
-        var failed: [Int] = []
+        var inReferences = false
         var lastUpdate: TimeInterval = -.infinity
         for i in 0..<count {
             try Task.checkCancellation()
             try autoreleasepool {
-                let page = doc.page(at: i)
-                let native = page?.string ?? ""
+                let number = i + 1
+                guard let page = doc.page(at: i) else {
+                    pages.append(Page(number: number, blocks: [], reliableOrder: false, state: .failed))
+                    return
+                }
+                let geometry = ResearchPDFLayout.Geometry(page)
+                let native = page.string ?? ""
                 let readable = ResearchMaterial.hasReadableText(native)
-                // Some scans contain only a page-number text layer over a raster image.
-                if page == nil { failed.append(i + 1) }
-                let thinLayer = !readable || native.trimmingCharacters(in: .whitespacesAndNewlines).count < 16
-                if page != nil && thinLayer { needsOCR.append(i + 1) }
-                let useOCR = recognizeScans && thinLayer && page != nil
+                let length = native.trimmingCharacters(in: .whitespacesAndNewlines).count
+                // Scans can have a native page number or a cover line over a raster body.
+                let thin = !readable || (length < 420 && hasScanImage(page))
+                    || (length < 16 && native.range(of: #"^\s*(?:\d+|[ivx]+)\s*$"#, options: [.regularExpression, .caseInsensitive]) != nil)
+                let useOCR = thin && recognizeScans
                 let now = ProcessInfo.processInfo.systemUptime
                 if now - lastUpdate >= 0.15 || i == count - 1 {
-                    progress("正在" + (useOCR ? "本机 OCR" : "建立页索引") + " · PDF 第 \(i + 1) / \(count) 页")
+                    progress("正在" + (useOCR ? "本机 OCR" : "建立页索引") + " · PDF 第 \(number) / \(count) 页")
                     lastUpdate = now
                 }
-                var recognized = ""
-                if useOCR, let page {
-                    do { recognized = try recognize(page) }
-                    catch is CancellationError { throw CancellationError() }
-                    catch { failed.append(i + 1) }
+                var fragments = readable ? try ResearchPDFLayout.native(page, text: native, geometry: geometry) : []
+                var state: ResearchPDFPageState = thin ? .needsOCR : .native
+                if useOCR {
+                    do {
+                        let seen = try recognize(page, geometry: geometry)
+                        // Prefer the PDF's exact glyphs wherever OCR merely re-read the same native text.
+                        let extra = seen.lines.filter { observation in
+                            !fragments.contains { native in
+                                let intersection = native.box.intersection(observation.box)
+                                return intersection.width > min(native.box.width, observation.box.width) * 0.72
+                                    && intersection.height > min(native.box.height, observation.box.height) * 0.60
+                                    && observation.line.text.localizedCaseInsensitiveContains(native.line.text)
+                            }
+                        }
+                        fragments += extra
+                        state = extra.isEmpty || seen.incomplete ? .unreadable : .ocr
+                    } catch is CancellationError { throw CancellationError() }
+                    catch { state = .failed }
                 }
-                let fromOCR = ResearchMaterial.hasReadableText(recognized) && (!readable || recognized.count > native.count)
-                let text = fromOCR ? recognized : (readable ? native : "")
-                pages.append(Page(number: i + 1, text: text, ocr: fromOCR))
-                for slice in try split(text, limit: 1_700) {
-                    passages.append(Passage(page: i + 1, text: slice, words: tokens(slice)))
-                }
+                let layout = ResearchPDFLayout.blocks(fragments, geometry: geometry, pageNumber: number, inReferences: &inReferences)
+                pages.append(Page(number: number, blocks: layout.blocks, reliableOrder: layout.reliableOrder, state: state))
             }
         }
+        try distinguishRunningMargins(&pages)
+        let index = try ResearchPDFIndex(pages: pages, metadata: ResearchPDFMetadata.read(doc), reference: reference, title: title)
         try Task.checkCancellation()
         guard reference.matches(url) else {
             throw ResearchMaterialError.message("建立索引时原文件已变化，请重新读取。")
         }
-        return ResearchPDFIndex(pages: pages, passages: passages, reference: reference, title: title, needsOCR: needsOCR, failed: failed, attemptedOCR: recognizeScans)
+        if !pages.contains(where: { $0.state == .failed }) {
+            let cost = pages.reduce(0) { total, page in
+                total + page.utf16Length * 32 + page.blocks.reduce(0) { $0 + 192 * $1.lines.count }
+            }
+            cache.setObject(index, forKey: key, cost: cost)
+        }
+        return index
     }
 
-    private init(pages: [Page], passages: [Passage], reference: ResearchFileReference, title: String, needsOCR: [Int], failed: [Int], attemptedOCR: Bool) {
+    /// Repeated journal/running titles are useful in the source view but interrupt a
+    /// paragraph at a page break. An isolated line in the margin can still be body text.
+    private static func distinguishRunningMargins(_ pages: inout [Page]) throws {
+        func key(_ block: ResearchPDFBlock) -> String? {
+            guard let margin = block.marginCandidate, block.kind == .body || block.kind == .header || block.kind == .footer,
+                  block.lines.count <= 2, block.text.count < 180 else { return nil }
+            let normal = block.text.lowercased().replacingOccurrences(of: #"[0-9]+"#, with: "#", options: .regularExpression)
+                .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            return (margin == .header ? "h" : "f") + normal
+        }
+        var counts: [String: Int] = [:]
+        for page in pages {
+            try Task.checkCancellation()
+            for value in Set(page.blocks.compactMap(key)) { counts[value, default: 0] += 1 }
+        }
+        for i in pages.indices {
+            try Task.checkCancellation()
+            for j in pages[i].blocks.indices {
+                let block = pages[i].blocks[j]
+                if let value = key(block), counts[value, default: 0] >= 2, let margin = block.marginCandidate {
+                    pages[i].blocks[j].kind = margin
+                }
+            }
+        }
+    }
+
+    private static func hasScanImage(_ page: PDFPage) -> Bool {
+        guard let dictionary = page.pageRef?.dictionary else { return false }
+        var resources: CGPDFDictionaryRef?
+        var objects: CGPDFDictionaryRef?
+        guard CGPDFDictionaryGetDictionary(dictionary, "Resources", &resources), let resources,
+              CGPDFDictionaryGetDictionary(resources, "XObject", &objects), let objects else { return false }
+        var found = false
+        CGPDFDictionaryApplyBlock(objects, { _, object, _ in
+            var stream: CGPDFStreamRef?
+            if CGPDFObjectGetValue(object, .stream, &stream), let stream, let dictionary = CGPDFStreamGetDictionary(stream) {
+                var width = 0
+                var height = 0
+                if CGPDFDictionaryGetInteger(dictionary, "Width", &width),
+                   CGPDFDictionaryGetInteger(dictionary, "Height", &height), width >= 240 && height >= 100 {
+                    found = true
+                }
+            }
+            return !found
+        }, nil)
+        return found
+    }
+
+    init(pages: [Page], metadata: ResearchPDFMetadata, reference: ResearchFileReference, title: String) throws {
         self.pages = pages
-        self.passages = passages
+        self.corpus = try ResearchPDFCorpus(pages: pages)
+        self.metadata = metadata
         self.reference = reference
         self.title = title
-        let missing = pages.filter { $0.text.isEmpty }.map(\.number)
-        unavailable = Set(missing + failed)
-        canRequestOCR = !needsOCR.isEmpty && (!attemptedOCR || !failed.isEmpty)
-        let ocrPages = pages.filter(\.ocr).map(\.number)
-        var lines = ["本机已检查全部 \(pages.count) 页。"]
-        if !attemptedOCR && !needsOCR.isEmpty { lines.append("可在材料卡「…」中用本机 OCR 识别文字层缺失或过少的文件页 \(Self.pageList(needsOCR))。") }
-        if !ocrPages.isEmpty { lines.append("本机 OCR 页 \(Self.pageList(ocrPages))。") }
-        if !missing.isEmpty { lines.append("无可提取文字的文件页 \(Self.pageList(missing))。") }
-        if !failed.isEmpty { lines.append("读取或识别失败的文件页 \(Self.pageList(failed))。") }
-        status = lines.joined(separator: " ")
-
+        let needsOCR = pages.filter { $0.state == .needsOCR }.map(\.number)
+        let missing = pages.filter { $0.state == .unreadable }.map(\.number)
+        let failed = pages.filter { $0.state == .failed }.map(\.number)
+        let unavailable = Set(needsOCR + missing + failed)
+        self.unavailable = unavailable
+        canRequestOCR = !needsOCR.isEmpty || !failed.isEmpty
+        let ocr = pages.filter(\.ocr).map(\.number)
+        let uncertain = pages.filter { !unavailable.contains($0.number) &&
+            (!$0.reliableOrder || $0.blocks.contains { !$0.reliable }) }.map(\.number)
+        if failed.count == pages.count { cardStatus = "文件读取失败" }
+        else if needsOCR.count == pages.count { cardStatus = "需要本机 OCR · \(needsOCR.count) 页" }
+        else if missing.count == pages.count { cardStatus = "未识别到正文 · \(missing.count) 页" }
+        else if !failed.isEmpty { cardStatus = "部分页面读取失败 · \(failed.count) 页" }
+        else if !needsOCR.isEmpty { cardStatus = "部分页面需要 OCR · \(needsOCR.count) 页" }
+        else if !missing.isEmpty { cardStatus = "部分页面无文本或未识别 · \(missing.count) 页" }
+        else { cardStatus = "已完成全文索引 · \(pages.count) 页" }
+        var details = [cardStatus]
+        if !needsOCR.isEmpty { details.append("可运行本机 OCR 的文件页 \(Self.pageList(needsOCR))。") }
+        if !missing.isEmpty { details.append("OCR 未取得可核对正文的文件页 \(Self.pageList(missing))。") }
+        if !failed.isEmpty { details.append("读取或识别失败的文件页 \(Self.pageList(failed))。") }
+        if !ocr.isEmpty { details.append("本机 OCR 页 \(Self.pageList(ocr))。") }
+        if !uncertain.isEmpty { details.append("部分文字或版面顺序需核对的文件页 \(Self.pageList(uncertain))。") }
+        status = details.joined(separator: " ")
     }
 
-    /// Snapshot of a CGPDF page keeps rendering independent of the AppKit main thread.
-    private static func recognize(_ page: PDFPage) throws -> String {
+    /// Vision boxes use the upright rendered image. Invert the exact render transform so
+    /// the stored locator uses PDF coordinates even for rotated pages or offset crop boxes.
+    private static func recognize(_ page: PDFPage, geometry: ResearchPDFLayout.Geometry) throws -> (lines: [ResearchPDFLayout.Fragment], incomplete: Bool) {
         try Task.checkCancellation()
-        guard let original = page.pageRef else { return "" }
-        let bounds = original.getBoxRect(.cropBox)
-        guard !bounds.isEmpty, !bounds.isInfinite, bounds.width.isFinite, bounds.height.isFinite else { return "" }
-        let rotated = abs(original.rotationAngle) % 180 == 90
-        let size = rotated ? CGSize(width: bounds.height, height: bounds.width) : bounds.size
+        guard let original = page.pageRef, !geometry.canvas.isEmpty, !geometry.canvas.isInfinite else { return ([], true) }
+        let size = geometry.canvas.size
         let scale = min(3, 2400 / max(size.width, size.height))
         let target = CGRect(x: 0, y: 0, width: max(1, (size.width * scale).rounded()), height: max(1, (size.height * scale).rounded()))
         guard let canvas = CGContext(data: nil, width: Int(target.width), height: Int(target.height), bitsPerComponent: 8,
-                                     bytesPerRow: 0, space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return "" }
+                                     bytesPerRow: 0, space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) else {
+            throw ResearchMaterialError.message("无法渲染 OCR 页面。")
+        }
         canvas.setFillColor(gray: 1, alpha: 1)
         canvas.fill(target)
-        canvas.concatenate(original.getDrawingTransform(.cropBox, rect: target, rotate: 0, preserveAspectRatio: true))
+        let transform = original.getDrawingTransform(.cropBox, rect: target, rotate: 0, preserveAspectRatio: true)
+        canvas.concatenate(transform)
         canvas.drawPDFPage(original)
-        guard let image = canvas.makeImage() else { return "" }
+        guard let image = canvas.makeImage() else { return ([], true) }
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
-        request.usesLanguageCorrection = true
-        try VNImageRequestHandler(cgImage: image).perform([request])
+        request.usesLanguageCorrection = false
+        let detector = VNDetectTextRectanglesRequest()
+        try VNImageRequestHandler(cgImage: image).perform([request, detector])
         try Task.checkCancellation()
-        return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+        let observations = request.results ?? []
+        // With Chinese and English enabled, Vision may give a clear Latin line a score of
+        // 0.5. Recheck borderline Latin text with the English recognizer and an independent
+        // fast decoding pass. Agreement must include the entire string and the same location.
+        var latinResults: [VNRecognizedTextObservation] = []
+        var fastResults: [VNRecognizedTextObservation] = []
+        if observations.contains(where: {
+            guard let top = $0.topCandidates(1).first else { return false }
+            return top.confidence < 0.65 && top.string.unicodeScalars.allSatisfy(\.isASCII)
+        }) {
+            let latin = VNRecognizeTextRequest()
+            latin.recognitionLevel = .accurate
+            latin.recognitionLanguages = ["en-US"]
+            latin.usesLanguageCorrection = false
+            let fast = VNRecognizeTextRequest()
+            fast.recognitionLevel = .fast
+            fast.recognitionLanguages = ["en-US"]
+            fast.usesLanguageCorrection = false
+            if (try? VNImageRequestHandler(cgImage: image).perform([latin, fast])) != nil {
+                latinResults = latin.results ?? []
+                fastResults = fast.results ?? []
+            }
+            try Task.checkCancellation()
+        }
+        func confirms(_ candidate: VNRecognizedText, in box: CGRect, with results: [VNRecognizedTextObservation],
+                      minimum: Float) -> Bool {
+            results.contains { result in
+                guard let other = result.topCandidates(1).first, other.confidence >= minimum,
+                      other.string == candidate.string else { return false }
+                let overlap = box.intersection(result.boundingBox)
+                let union = box.union(result.boundingBox)
+                return !overlap.isNull && overlap.width * overlap.height > union.width * union.height * 0.48
+            }
+        }
+        let scaleToPixels = CGAffineTransform(scaleX: target.width, y: target.height)
+        func fragment(_ text: String, _ imageBox: CGRect, confidence: Float, confirmed: Bool) -> ResearchPDFLayout.Fragment {
+            let bounds = imageBox.applying(scaleToPixels).applying(transform.inverted())
+            return .init(line: .init(text: text, bounds: bounds, sourceRanges: [], confidence: confidence, ocr: true, corroboratedOCR: confirmed),
+                         box: bounds.applying(geometry.display))
+        }
+        // Detection can find a region of text even when recognition returns no transcription.
+        // Keep readable lines for inspection but never assert a complete range on such a page.
+        var incomplete = (detector.results ?? []).contains { detected in
+            let box = detected.boundingBox
+            guard box.width * target.width >= 12, box.height * target.height >= 5 else { return false }
+            return !observations.contains { item in
+                let intersection = box.intersection(item.boundingBox)
+                return intersection.width * intersection.height >= box.width * box.height * 0.44
+                    && !intersection.isNull
+            }
+        }
+        let words = try NSRegularExpression(pattern: #"\S+"#)
+        var result: [ResearchPDFLayout.Fragment] = []
+        for observation in observations {
+            try Task.checkCancellation()
+            guard let top = observation.topCandidates(1).first, ResearchMaterial.hasReadableText(top.string) else {
+                incomplete = true
+                continue
+            }
+            let confirmed = top.confidence < 0.65 &&
+                confirms(top, in: observation.boundingBox, with: latinResults, minimum: 0.8) &&
+                confirms(top, in: observation.boundingBox, with: fastResults, minimum: 0.5)
+            if top.confidence < 0.50 && !confirmed { incomplete = true }
+            let whole = fragment(top.string, observation.boundingBox, confidence: top.confidence, confirmed: confirmed)
+            guard observation.boundingBox.width > 0.37 else { result.append(whole); continue }
+            // Vision occasionally treats aligned columns as one observation. Its accurate-mode
+            // word rectangles expose the intervening whitespace; retain the original substrings.
+            let text = top.string
+            var groups: [(range: NSRange, box: CGRect)] = []
+            var valid = true
+            for match in words.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+                guard let range = Range(match.range, in: text),
+                      let wordBox = (try? top.boundingBox(for: range))?.boundingBox else { valid = false; break }
+                if let previous = groups.last,
+                   (wordBox.minX - previous.box.maxX) * target.width < max(target.width * 0.022, wordBox.height * target.height) {
+                    groups[groups.count - 1] = (NSUnionRange(previous.range, match.range), previous.box.union(wordBox))
+                } else { groups.append((match.range, wordBox)) }
+            }
+            if valid && groups.count > 1 {
+                for group in groups {
+                    result.append(fragment((text as NSString).substring(with: group.range), group.box, confidence: top.confidence, confirmed: confirmed))
+                }
+            } else { result.append(whole) }
+        }
+        return (result, incomplete)
     }
 
     static func split(_ text: String, limit: Int) throws -> [String] {
@@ -191,33 +369,8 @@ final class ResearchPDFIndex: Equatable, @unchecked Sendable {
         return ranges.joined(separator: "、")
     }
 
-    private func material(_ ids: [Int], scope: String) -> ResearchMaterial {
-        let numbers = ids.map { passages[$0].page }
-        let range = Self.pageList(numbers)
-        var last = 0
-        var body = ""
-        for id in ids {
-            let passage = passages[id]
-            if passage.page != last {
-                if !body.isEmpty { body += "\n\n" }
-                body += "【PDF 文件第 \(passage.page) 页" + (pages[passage.page - 1].ocr ? " · 本机 OCR" : "") + "】\n"
-            } else if id > 0 && !ids.contains(id - 1) {
-                body += "\n[…]\n"
-            }
-            body += passage.text
-            last = passage.page
-        }
-        return ResearchMaterial(source: "PDF 文件", title: title, text: body,
-            scope: ResearchMaterial.bounded("\(scope) · 文件页 \(range) / 共 \(pages.count) 页。", limit: 510),
-            fileReference: reference, pdfPages: range)
-    }
-
     var preview: ResearchMaterial {
-        var value = passages.isEmpty
-            ? ResearchMaterial(source: "PDF 文件", title: title, text: "", scope: status, fileReference: reference)
-            : material([0], scope: "本机索引预览")
-        value.pdfIndex = self
-        return value
+        ResearchMaterial(source: "PDF 文件", title: title, text: "", scope: status, fileReference: reference, pdfIndex: self)
     }
 
     static func wholeTask(_ question: String, mode: ResearchPromptMode) -> WholeTask? {
@@ -233,111 +386,4 @@ final class ResearchPDFIndex: Equatable, @unchecked Sendable {
         return nil
     }
 
-    private func pageFilter(_ query: String) throws -> Set<Int>? {
-        let q = query.lowercased()
-        var selected = Set<Int>()
-        func choose(_ a: Int, _ b: Int) throws {
-            guard a >= 1, b >= a, b <= pages.count else {
-                throw ResearchMaterialError.message("所问页码超出 PDF 的文件页 1–\(pages.count)。")
-            }
-            selected.formUnion(a...b)
-        }
-        let groupPattern = #"(?:第\s*)?([0-9]+(?:\s*[-–—至到、,，和与及]\s*(?:第\s*)?[0-9]+)*)\s*页|(?:\bpages?\s+|\bp\.\s*)([0-9]+(?:\s*(?:[-–—,]|and|to)\s*[0-9]+)*)"#
-        let groups = try NSRegularExpression(pattern: groupPattern)
-        let ranges = try NSRegularExpression(pattern: #"([0-9]+)(?:\s*(?:[-–—至到]|to)\s*(?:第\s*)?([0-9]+))?"#)
-        for group in groups.matches(in: q, range: NSRange(q.startIndex..., in: q)) {
-            let parts = group.range(at: 1).location == NSNotFound ? group.range(at: 2) : group.range(at: 1)
-            for part in ranges.matches(in: q, range: parts) {
-                guard let first = Range(part.range(at: 1), in: q), let a = Int(q[first]) else {
-                    throw ResearchMaterialError.message("无法识别 PDF 文件页码。")
-                }
-                var b = a
-                if let end = Range(part.range(at: 2), in: q) {
-                    guard let parsed = Int(q[end]) else { throw ResearchMaterialError.message("无法识别 PDF 文件页码。") }
-                    b = parsed
-                }
-                try choose(a, b)
-            }
-        }
-        if q.range(of: #"最后一页|末页|末尾|结尾|尾页|\blast page\b|\bfinal page\b"#, options: .regularExpression) != nil { selected.insert(pages.count) }
-        if q.range(of: #"第一页|首页|开头|\bfirst page\b|\bopening page\b"#, options: .regularExpression) != nil { selected.insert(1) }
-        if q.range(of: #"中间页|中间部分|中部|\bmiddle page\b"#, options: .regularExpression) != nil { selected.insert((pages.count + 1) / 2) }
-        return selected.isEmpty ? nil : selected
-    }
-
-    func retrieve(_ question: String, backgroundKeywords: String? = nil) throws -> ResearchMaterial {
-        let filter = try pageFilter(question)
-        if let filter {
-            let missing = unavailable.intersection(filter)
-            if !missing.isEmpty { throw missingPages(Array(missing), whole: false) }
-        }
-        let candidates = passages.indices.filter { filter?.contains(passages[$0].page) ?? true }
-        guard !candidates.isEmpty else { throw ResearchMaterialError.message("所问页没有可读取的文字，无法引用。") }
-        var query = question
-        for (phrase, terms) in [("附录", " appendix appendices supplement"), ("讨论", " discussion"),
-                                ("结论", " conclusion conclusions"), ("方法", " methods methodology"),
-                                ("结果", " results findings"), ("摘要", " abstract")] where query.contains(phrase) { query += terms }
-        let words = backgroundKeywords.map { Self.searchTerms(query + " " + $0) } ?? Self.tokens(query)
-        var frequency = [String: Int]()
-        for id in candidates {
-            try Task.checkCancellation()
-            for word in words.intersection(passages[id].words) { frequency[word, default: 0] += 1 }
-        }
-        var ranked = candidates.map { id -> (Int, Double) in
-            let score = words.intersection(passages[id].words).reduce(0.0) { sum, word in
-                sum + log(1 + Double(candidates.count) / Double(frequency[word] ?? 1))
-            }
-            return (id, score)
-        }
-        ranked.sort { $0.1 == $1.1 ? $0.0 < $1.0 : $0.1 > $1.1 }
-        var order = ranked.filter { $0.1 > 0 }.map(\.0)
-        // An open-ended question should see the beginning, middle and end even with no term hit.
-        if backgroundKeywords != nil, filter == nil, order.isEmpty {
-            throw ResearchMaterialError.message("整篇索引中没有找到与选区或问题相关的文件段落。请指定文件页或关键词。")
-        }
-        if backgroundKeywords == nil, candidates.count > 1 {
-            for n in [0, 4, 2, 1, 3] { order.append(candidates[(candidates.count - 1) * n / 4]) }
-        }
-        if backgroundKeywords == nil || filter != nil { order += candidates }
-        let budget = backgroundKeywords == nil ? 12_000 : 4_000
-        var ids = Set<Int>()
-        var length = 0
-        for id in order where !ids.contains(id) {
-            let cost = passages[id].text.utf16.count + 52
-            if length + cost <= budget { ids.insert(id); length += cost }
-            if length >= budget - 50 { break }
-        }
-        if let filter {
-            let omitted = filter.subtracting(ids.map { passages[$0].page })
-            if !omitted.isEmpty {
-                throw ResearchMaterialError.message("所问页段超过一次问答的材料上限，无法同时带入文件第 \(Self.pageList(Array(omitted))) 页。请缩小页段或使用整篇分析。")
-            }
-        }
-        return material(ids.sorted(), scope: "从整篇本机索引选取的问答摘录")
-    }
-
-    private func missingPages(_ missing: [Int], whole: Bool) -> ResearchMaterialError {
-        let next = canRequestOCR ? "可在材料卡「…」中运行本机 OCR，或另选可读页。" : "请另选可读页。"
-        return .message((whole ? "无法完成整篇处理。" : "所问页段不完整。") + "文件第 \(Self.pageList(missing)) 页缺少可核对的正文。" + next)
-    }
-
-    func segments() throws -> [ResearchMaterial] {
-        guard unavailable.isEmpty else { throw missingPages(Array(unavailable), whole: true) }
-        var result: [ResearchMaterial] = []
-        var ids: [Int] = []
-        var length = 0
-        for id in passages.indices {
-            try Task.checkCancellation()
-            let cost = passages[id].text.utf16.count + 52
-            if !ids.isEmpty && length + cost > 7_200 {
-                result.append(material(ids, scope: "整篇按文件页序连续分段"))
-                ids.removeAll(keepingCapacity: true)
-                length = 0
-            }
-            ids.append(id)
-            length += cost
-        }
-        if !ids.isEmpty { result.append(material(ids, scope: "整篇按文件页序连续分段")) }
-        return result
-    }
 }

@@ -391,3 +391,31 @@ test('research prompt labels untrusted source evidence and never invents page nu
   assert.throws(() => researchPrompt('', 'translate', null, DEFAULT_PERSONA), /先选择.*材料/)
   assert.throws(() => researchPrompt('x', 'arbitrary-tool-execution', null, DEFAULT_PERSONA), /Invalid research mode/)
 })
+
+test('subscription and DeepSeek agent admission receive identical verified PDF evidence', async () => {
+  await harness(async ({client, calls}) => {
+    const target = {workspaceId: 'research-workspace', sessionId: 'research-session'}
+    const material = {source: 'PDF', title: 'Synthetic measurement', scope: 'Exact range, file pages 2–3',
+      text: 'First sample: λ = 0.5.\nData continue on the next page.\nFinal sample: β = 1.'}
+    const question = 'Translate this verified interval.'
+    const selections = [{provider: 'chatgpt', model: 'gpt-test', reasoningEffort: 'medium'},
+                        {provider: 'deepseek-account', model: 'deepseek-flash'}]
+    const snapshots = []
+    for (const selection of selections) {
+      await client.request('researchSelectModel', {...target, selection})
+      const reply = await client.request('researchPrompt', {...target, requestId: 'interval-' + selection.provider,
+        selection, mode: 'ask', text: question, includeContext: true, material})
+      assert.deepEqual(reply.selection, selection)
+      const call = calls.filter(item => item[0] === 'prompt').at(-1)[1]
+      const prompt = call.content[0].text
+      const json = prompt.split('，JSON 引用数据】\n')[1].split('\n\n【用户问题】')[0]
+      const evidence = JSON.parse(json)
+      assert.equal(evidence.text, material.text)
+      assert.equal(evidence.truncated, false)
+      assert.equal(evidence.scope, material.scope)
+      assert.equal(evidence.title, material.title)
+      snapshots.push(prompt)
+    }
+    assert.equal(snapshots[0], snapshots[1])
+  })
+})

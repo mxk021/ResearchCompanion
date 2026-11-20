@@ -66,7 +66,7 @@ struct ResearchTranscript: NSViewRepresentable {
                 var values: [String: Any] = ["id": Self.id(row), "role": row.role, "text": row.text,
                     "original": row.originalPrompt ?? "", "streaming": streaming]
                 if !streaming, row.role == "assistant", row.reply?.material != nil,
-                   let source = ResearchAnswerSource(session: session, answer: row).sourcePresentation {
+                   let source = ResearchAnswerSource(session: session, answer: row, includePositions: false).sourcePresentation {
                     // Display metadata only. Native retains the URL and file identity.
                     values["sourceDisplay"] = source.display
                     values["sourceTitle"] = source.title
@@ -253,7 +253,7 @@ struct ResearchTranscript: NSViewRepresentable {
                       let row = current.answer(for: id), let window = web?.window,
                       window.attachedSheet == nil {
                 // Resolve from the current answer's stored capture. HTML sends an ID, never a URL or path.
-                ResearchAnswerActions.openOriginal(ResearchAnswerSource(session: session, answer: row), in: window) { [weak self] in
+                ResearchAnswerActions.openOriginal(ResearchAnswerSource(session: session, answer: row, includePositions: false), in: window) { [weak self] in
                     guard let self, self.request?.session == session else { return false }
                     guard keyboardToken != nil else { return true }
                     guard let web = self.web, let window = self.readingWindow(web) else { return false }
@@ -264,7 +264,7 @@ struct ResearchTranscript: NSViewRepresentable {
                       let current = request, current.session == session,
                       let row = current.answer(for: id), let window = web?.window,
                       window.attachedSheet == nil {
-                let source = ResearchAnswerSource(session: session, answer: row)
+                let source = ResearchAnswerSource(session: session, answer: row, includePositions: false)
                 if body["sourceID"] != nil {
                     ResearchAnswerActions.showSource(source, in: window)
                 } else {

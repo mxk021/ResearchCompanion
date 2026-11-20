@@ -20,6 +20,18 @@ struct ResearchSourceMaterial: Decodable, Equatable {
     let pageIndex: Int?
 }
 
+/// One piece of the exact evidence sent. Page numbers are physical (one-based) and
+/// bounds use the PDF page's coordinate space, including a nonzero crop-box origin.
+struct ResearchPDFSourcePosition: Codable, Equatable, Sendable {
+    let page: Int
+    let bounds: CGRect
+    var column: Int? = nil
+    var blockIndex: Int? = nil
+    var blockRange: NSRange? = nil
+    var sourceRange: NSRange? = nil
+    var ocr: Bool = false
+}
+
 struct ResearchFileReference: Codable, Equatable, Sendable {
     let originalPath: String
     let bookmark: Data?
@@ -84,15 +96,30 @@ struct ResearchFileReference: Codable, Equatable, Sendable {
         return (try? Self.digest(url)) == fingerprint
     }
 
+    func verifiedPDFData(at url: URL) -> Data? {
+        guard url.isFileURL, url.pathExtension.lowercased() == "pdf",
+              let bytes = try? Data(contentsOf: url, options: .uncached),
+              SHA256.hash(data: bytes).map({ String(format: "%02x", $0) }).joined() == fingerprint else { return nil }
+        return bytes
+    }
+
     func resolve() -> URL? {
+        locate { matches($0) ? $0 : nil }
+    }
+
+    func verifiedPDF() -> (URL, Data)? {
+        locate { url in verifiedPDFData(at: url).map { (url, $0) } }
+    }
+
+    private func locate<Value>(_ verify: (URL) -> Value?) -> Value? {
         let original = URL(fileURLWithPath: originalPath)
-        if matches(original) { return original }
+        if let match = verify(original) { return match }
         var stale = false
         if let bookmark,
            let moved = try? URL(resolvingBookmarkData: bookmark, options: [.withoutUI, .withoutMounting],
                                 relativeTo: nil, bookmarkDataIsStale: &stale),
-           moved.path != originalPath, matches(moved) {
-            return moved
+           moved.path != originalPath {
+            return verify(moved)
         }
         return nil
     }
@@ -154,6 +181,14 @@ struct ResearchProvenanceStore {
         var pdfPages: String? = nil
         var backgroundFile: ResearchFileReference? = nil
         var backgroundPages: String? = nil
+        var pdfPositions: [ResearchPDFSourcePosition]? = nil
+        var backgroundPositions: [ResearchPDFSourcePosition]? = nil
+        var positionDigest: String? = nil
+    }
+
+    private struct Positions: Codable {
+        let primary: [ResearchPDFSourcePosition]?
+        let background: [ResearchPDFSourcePosition]?
     }
 
     init(root: URL) { self.root = root }
@@ -199,34 +234,66 @@ struct ResearchProvenanceStore {
         guard !FileManager.default.fileExists(atPath: url.path) else { return } // Retry keeps its original capture.
         let reference = LocalReference(title: material.title, textFingerprint: fingerprint(material.text),
                                        file: material.fileReference, web: web, pdfPages: material.pdfPages,
-                                       backgroundFile: material.backgroundFile, backgroundPages: material.backgroundPages)
+                                       backgroundFile: material.backgroundFile, backgroundPages: material.backgroundPages,
+                                       pdfPositions: material.pdfPositions, backgroundPositions: material.backgroundPositions)
         try write(reference, to: url)
     }
 
     private func write(_ reference: LocalReference, to url: URL) throws {
-        try JSONEncoder().encode(reference).write(to: url, options: [.atomic])
+        var header = reference
+        if reference.pdfPositions != nil || reference.backgroundPositions != nil {
+            let locations = Positions(primary: reference.pdfPositions, background: reference.backgroundPositions)
+            let data = try JSONEncoder().encode(locations)
+            let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            let sidecar = url.deletingLastPathComponent().appendingPathComponent(digest + ".positions")
+            try data.write(to: sidecar, options: [.atomic])
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: sidecar.path)
+            header.pdfPositions = nil
+            header.backgroundPositions = nil
+            header.positionDigest = digest
+        }
+        // Publish the small, backwards-readable header after its immutable position list.
+        try JSONEncoder().encode(header).write(to: url, options: [.atomic])
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
-    func read(session: String, reply: ResearchReplyContext) -> LocalReference? {
+    func read(session: String, reply: ResearchReplyContext, includePositions: Bool = true) -> LocalReference? {
         guard let id = reply.requestId, let material = reply.material,
               let url = try? location(session: session, requestID: id, create: false),
               let meta = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]),
-              meta.isRegularFile == true, meta.isSymbolicLink != true, (meta.fileSize ?? Int.max) <= 65536,
-              let data = try? Data(contentsOf: url), let value = try? JSONDecoder().decode(LocalReference.self, from: data),
+              meta.isRegularFile == true, meta.isSymbolicLink != true, (meta.fileSize ?? Int.max) <= 512 * 1024,
+              let data = try? Data(contentsOf: url), var value = try? JSONDecoder().decode(LocalReference.self, from: data),
               value.title == material.title, value.textFingerprint == fingerprint(material.text) else { return nil }
+        if includePositions, let digest = value.positionDigest,
+           digest.count == 64, digest.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) {
+            let sidecar = url.deletingLastPathComponent().appendingPathComponent(digest + ".positions")
+            if let info = try? sidecar.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]),
+               info.isRegularFile == true, info.isSymbolicLink != true, (info.fileSize ?? Int.max) <= 16 * 1_048_576,
+               let bytes = try? Data(contentsOf: sidecar),
+               SHA256.hash(data: bytes).map({ String(format: "%02x", $0) }).joined() == digest,
+               let positions = try? JSONDecoder().decode(Positions.self, from: bytes) {
+                value.pdfPositions = positions.primary
+                value.backgroundPositions = positions.background
+            }
+        }
         return value
     }
 
-    func relink(session: String, reply: ResearchReplyContext, file: URL) throws {
-        guard let prior = read(session: session, reply: reply), let previousFile = prior.file, let id = reply.requestId,
+    func relink(session: String, reply: ResearchReplyContext, file: URL, background: Bool = false) throws {
+        guard let prior = read(session: session, reply: reply, includePositions: false), let previousFile = background ? prior.backgroundFile : prior.file,
+              let id = reply.requestId,
               let recordURL = try location(session: session, requestID: id, create: false),
               previousFile.matches(file) else {
             throw ResearchMaterialError.message("所选文件与发送材料时的原始文件内容不同。来源未更改。")
         }
+        let replacement = try ResearchFileReference.capture(file)
+        guard replacement.fingerprint == previousFile.fingerprint else {
+            throw ResearchMaterialError.message("重新定位时文件内容发生了变化。")
+        }
         let local = LocalReference(title: prior.title, textFingerprint: prior.textFingerprint,
-                                   file: try .capture(file), web: prior.web, pdfPages: prior.pdfPages,
-                                   backgroundFile: prior.backgroundFile, backgroundPages: prior.backgroundPages)
+                                   file: background ? prior.file : replacement, web: prior.web, pdfPages: prior.pdfPages,
+                                   backgroundFile: background ? replacement : prior.backgroundFile, backgroundPages: prior.backgroundPages,
+                                   pdfPositions: prior.pdfPositions, backgroundPositions: prior.backgroundPositions, positionDigest: prior.positionDigest)
         try write(local, to: recordURL)
     }
 

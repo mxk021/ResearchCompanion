@@ -25,6 +25,15 @@ struct ResearchComposerView: View {
                     .font(.caption).foregroundStyle(.orange).textSelection(.enabled)
                     .frame(maxHeight: 58, alignment: .topLeading)
             }
+            if let plan = command.pdfBatchApproval {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(plan.description).font(.caption).fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Button("开始分段处理") { command.resolvePDFApproval(plan.id, allow: true) }
+                        Button("取消") { command.resolvePDFApproval(plan.id, allow: false) }
+                    }.controlSize(.small)
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
             composer
             footer
         }

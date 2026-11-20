@@ -16,6 +16,7 @@ def serve(listener, path, selection_check):
     subscription = dict(provider="chatgpt", model="gpt-6.2-sol", reasoningEffort="low")
     paid = dict(provider="deepseek-account", model="fixture-paid")
     default = paid if selection_check else subscription
+    range_packets = []
     cancel_polls = 0
     with listener.accept()[0] as conn, conn.makefile("rwb") as wire:
         for line in wire:
@@ -45,6 +46,12 @@ def serve(listener, path, selection_check):
             elif action == "researchPrompt":
                 assert request["selection"] == selected[request["sessionId"]]
                 deliberate = selection_check and request["material"]["source"] == "Fixture explicit paid choice"
+                if not selection_check and request["text"] == "翻译从 OPENING THISTLE 到 PAGE_1_END 的内容。":
+                    deliberate = len(range_packets) == 1
+                    packet = request["material"]
+                    range_packets.append(packet)
+                    if deliberate:
+                        assert range_packets[0] == packet
                 assert request["selection"] == (paid if deliberate else subscription), "Unexpected paid translation or prompt"
                 history = replies[request["sessionId"]]
                 result["selection"] = request["selection"]
