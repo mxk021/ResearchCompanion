@@ -66,6 +66,9 @@ def install(contents, executable, local_archive, signing_identity):
                 out.write(source.extractfile(member).read())
     if binary_arch(library) != arch:
         raise ValueError('PDFium and the application executable require different architectures.')
+    # The pinned distribution includes debug symbols with the upstream build
+    # machine's absolute paths. Drop those before signing; keep exported symbols.
+    subprocess.run(['/usr/bin/strip', '-S', str(library)], check=True)
     timestamp = ['--timestamp'] if signing_identity != '-' else []
     subprocess.run(['/usr/bin/codesign', '--force', '--sign', signing_identity, *timestamp, str(library)], check=True)
     subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(library)], check=True)
