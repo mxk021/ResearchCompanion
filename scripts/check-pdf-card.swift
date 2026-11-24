@@ -305,17 +305,20 @@ struct PDFCardCheck {
             let comparisonWindow = NSWindow(contentViewController: comparison)
             comparisonWindow.setContentSize(NSSize(width: 720, height: 460))
             window.beginSheet(comparisonWindow, completionHandler: nil)
-            var compared: PDFView?
             let reviewDeadline = ContinuousClock.now.advanced(by: .seconds(12))
-            while compared?.currentPage == nil {
-                if ContinuousClock.now > reviewDeadline { throw Failure("Review did not load the fingerprinted PDF") }
+            // PDFKit exposes page 1 as soon as it loads the document. The
+            // reader reveals and highlights the requested page on appearance.
+            while true {
+                guard !accepted else { throw Failure("Review silently accepted its candidate") }
+                let compared = reader(comparison.view)
+                if let document = compared?.document, let page = compared?.currentPage,
+                   document.index(for: page) == 1, page.annotations.contains(where: { $0.type == "Square" }) { break }
+                if ContinuousClock.now > reviewDeadline {
+                    let page = compared?.currentPage.flatMap { compared?.document?.index(for: $0) }
+                    throw Failure("Review did not reveal and highlight the fingerprinted PDF page (current index: \(String(describing: page)))")
+                }
                 try await Task.sleep(for: .milliseconds(30))
-                compared = reader(comparison.view)
             }
-            guard let compared, let comparedPage = compared.currentPage,
-                  comparedPage === compared.document?.page(at: 1),
-                  comparedPage.annotations.contains(where: { $0.type == "Square" }),
-                  !accepted else { throw Failure("Review opened without its source or silently accepted") }
             try await save(comparison.view, to: directory.appendingPathComponent("review.png"))
             window.endSheet(comparisonWindow)
             window.orderOut(nil)
