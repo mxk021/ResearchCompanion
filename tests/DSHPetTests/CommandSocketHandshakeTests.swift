@@ -353,7 +353,9 @@ private final class CommandSocketServer: @unchecked Sendable {
     }
 
     func waitForActionCount(_ action: String, atLeast count: Int) async {
-        for _ in 0..<100 {
+        // The client waits two seconds before reconnecting. Leave room for
+        // scheduling and the actual handshake on a shared runner.
+        for _ in 0..<250 {
             if lock.withLock({ actions.filter { $0 == action }.count >= count }) { return }
             try? await Task.sleep(nanoseconds: 20_000_000)
         }

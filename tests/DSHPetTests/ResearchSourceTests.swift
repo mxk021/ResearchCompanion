@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import DSHPet
 
@@ -210,42 +211,52 @@ final class ResearchSourceTests: XCTestCase {
         XCTAssertNil(invalidURL)
     }
 
-    func testServiceLocatorRequiresCompleteMatchingTextAndPreservesSubmittedBytes() throws {
-        let fromService = try ResearchMaterial.selection("页面\r\n第二行", source: "Safari", title: "浏览器选区")
-        let fromAccessibility = try ResearchMaterial.selection("页面\n第二行", source: "Safari", title: "实际网页",
-                                                               url: "https://example.net/page")
-        let enriched = try XCTUnwrap(fromService.withLocator(from: fromAccessibility))
-        XCTAssertEqual(enriched.text, "页面\r\n第二行")
-        XCTAssertEqual(enriched.url, "https://example.net/page")
-        let different = try ResearchMaterial.selection("另一段选区", source: "Safari", title: "不同页面")
-        XCTAssertNil(fromService.withLocator(from: different))
-        let long = try ResearchMaterial.selection(String(repeating: "a", count: ResearchMaterial.maximumLength + 1),
-                                                  source: "Safari", title: "部分选区")
+    func testBrowserCapturePreservesSelectedBytesAndKeepsNavigationDetailsLocal() throws {
+        let body = "原文 α₁ — 逐字匹配\r\n保留空格  "
+        let destination = try XCTUnwrap(URL(string: "https://example.net/page?edition=2#figure-1"))
+        let capture = try ResearchSelectionCapture.exactSelection(body, source: "Safari", title: "实际网页", webURL: destination)
+        XCTAssertEqual(Array(capture.text.utf8), Array(body.utf8))
+        XCTAssertEqual(capture.fields["text"], body)
+        XCTAssertEqual(capture.fields["url"], "https://example.net/page")
+        XCTAssertEqual(capture.localWebURL, destination.absoluteString)
+
+        let largeBody = String(repeating: "a", count: ResearchMaterial.maximumLength + 1)
+        let long = try ResearchSelectionCapture.exactSelection(largeBody, source: "Safari", title: "完整选区")
         XCTAssertTrue(long.selectionIsComplete)
-        XCTAssertEqual(long.withLocator(from: long)?.text.utf16.count, 24_001)
+        XCTAssertEqual(Array(long.text.utf8), Array(largeBody.utf8))
     }
 
-    func testSystemServiceKeepsUnconfirmedBodyUntilNativeSelectionMatches() throws {
+    @MainActor
+    func testUnboundSystemServicePreservesSelectedBytesWithoutInferringDestination() async throws {
         let body = "原文 α₁ — 逐字匹配\r\n保留空格  "
-        let service = try ResearchMaterial.selection(body, source: ResearchMaterial.selectionServiceSource, title: "正文已取得 · 出处未确认")
-        let stale = try ResearchMaterial.selection("不同选区", source: "Safari", title: "上一个标签页",
-                                                   url: "https://example.invalid/old")
-        XCTAssertNil(service.withLocator(from: stale))
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        XCTAssertThrowsError(try ResearchSelectionCapture.serviceSelectionText(from: board))
+        board.clearContents()
+        XCTAssertTrue(board.setString(body, forType: .string))
+        let revision = board.changeCount
+        let text = try ResearchSelectionCapture.serviceSelectionText(from: board)
+        let service = try ResearchSelectionCapture.exactSelection(text, source: ResearchMaterial.selectionServiceSource,
+                                                                  title: "正文已取得 · 出处未确认")
         XCTAssertEqual(service.source, "系统服务")
         XCTAssertNil(service.url)
+        XCTAssertNil(service.localWebURL)
         XCTAssertEqual(Array(service.text.utf8), Array(body.utf8))
+        XCTAssertEqual(board.changeCount, revision)
 
-        var exact = try ResearchMaterial.selection(body.replacingOccurrences(of: "\r\n", with: "\n"),
-                                                    source: "Safari", title: "已核对的网页标题", url: "https://example.invalid/current")
-        exact.selectionIsComplete = false
-        XCTAssertNil(service.withLocator(from: exact))
-        exact.selectionIsComplete = true
-        let capture = try XCTUnwrap(service.withLocator(from: exact))
-        XCTAssertEqual(capture.id, service.id)
-        XCTAssertEqual(Array(capture.text.utf8), Array(body.utf8))
-        XCTAssertEqual(capture.source, "Safari")
-        XCTAssertEqual(capture.title, "已核对的网页标题")
-        XCTAssertEqual(capture.url, "https://example.invalid/current")
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ResearchProvenanceStore(root: root)
+        try store.record(session: "session", requestID: "service", material: service)
+        let evidence = ResearchSourceMaterial(key: "inline:fixture", title: service.title, text: service.text,
+                                              source: service.source, scope: service.scope, url: nil,
+                                              pageLabel: nil, pageIndex: nil)
+        let reply = ResearchReplyContext(question: "Explain", questionId: "q", requestId: "service",
+                                         time: nil, material: evidence)
+        let answer = ResearchChatMessage(id: "reply", role: "assistant", text: "[Suggested link](https://example.invalid/model)",
+                                         originalPrompt: nil, reply: reply)
+        let source = ResearchAnswerSource(session: "session", answer: answer, store: store)
+        XCTAssertNil(source.directTarget)
     }
     func testSelectionBackgroundRequiresDocumentIntent() {
         for query in ["不要结合 PDF，只解释这一句", "仅翻译选区", "what is the meaning of “paper”?", "Explain this selection only."] {
