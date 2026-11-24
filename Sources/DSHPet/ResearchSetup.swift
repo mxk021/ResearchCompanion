@@ -8,8 +8,13 @@ struct ResearchSetup {
     static let identifier = "com.deepseek.dsh"
     static let supportedVersion = "0.2.2-rc.5"
     static let bridgeName = "dsh-research-companion"
-    static let archiveName = bridgeName + "-0.2.4.tgz"
     static let download = URL(string: "https://www.deepseek.com/harness/")!
+    private static let communityBridges: [String: (archive: String, installed: String)] = [
+        "0.2.3": ("fed8184516967505b5a747ca0c76a0580854dca8f467bc8c6c050d7812900f72",
+                  "f984135ea2b42a75ba36750602483e2cc281007aa6ab4e425570ecd8f8ac0555"),
+        "0.2.4": ("4bd2cb3025fe81bc77ff41b149f5e930e4eebbf700b4c527197a8529ed0d4b9b",
+                  "aae20432c77d9ceb704067ec430d87780134629d605a4881edcd887a2849e1fd"),
+    ]
     let desktop: URL?
     let home: URL
     let archive: URL?
@@ -25,7 +30,18 @@ struct ResearchSetup {
         let app = Bundle(url: standard)?.bundleIdentifier == identifier
             ? standard : NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier)
         return Self(desktop: app, home: FileManager.default.homeDirectoryForCurrentUser,
-                    archive: Bundle.main.url(forResource: archiveName, withExtension: nil))
+                    archive: packagedArchive(in: .main))
+    }
+
+    private static func isBridgeArchiveName(_ name: String) -> Bool {
+        name.range(of: #"^dsh-research-companion-[0-9]+\.[0-9]+\.[0-9]+\.tgz\z"#, options: .regularExpression) != nil
+    }
+
+    static func packagedArchive(in bundle: Bundle) -> URL? {
+        guard bundle.object(forInfoDictionaryKey: "ResearchCompanionPublicDistribution") as? Bool == true,
+              let name = bundle.object(forInfoDictionaryKey: "ResearchCompanionBridgeArchive") as? String,
+              isBridgeArchiveName(name) else { return nil }
+        return bundle.url(forResource: name, withExtension: nil)
     }
 
     enum BridgeState: Equatable { case uninitialized, absent, selected, upgradeable, customPrevious, disabled, invalid }
@@ -43,25 +59,26 @@ struct ResearchSetup {
             guard let manifest = try? Data(contentsOf: package.appendingPathComponent("package.json")),
                   let installed = (try? JSONSerialization.jsonObject(with: manifest)) as? [String: Any],
                   installed["name"] as? String == Self.bridgeName else { return .invalid }
-            if installed["version"] as? String == "0.2.3" {
-                return isOriginalCommunityBridge(dependency, installed: package) ? .upgradeable : .customPrevious
+            if let version = installed["version"] as? String, let expected = Self.communityBridges[version] {
+                return isOriginalCommunityBridge(dependency, installed: package, version: version, digests: expected)
+                    ? .upgradeable : .customPrevious
             }
             return .selected
         }
         return dependency == nil ? .absent : .disabled
     }
 
-    /// Limit in-place upgrades to the unmodified bridge installed by the previous public release.
-    private func isOriginalCommunityBridge(_ dependency: String, installed: URL) -> Bool {
-        let previousDigest = "fed8184516967505b5a747ca0c76a0580854dca8f467bc8c6c050d7812900f72"
+    /// Match both the released tarball and the installed execution files before changing the profile.
+    private func isOriginalCommunityBridge(_ dependency: String, installed: URL, version: String,
+                                           digests: (archive: String, installed: String)) -> Bool {
         guard dependency.hasPrefix("file:") else { return false }
         let pathname = String(dependency.dropFirst("file:".count))
         let resolved = (pathname as NSString).isAbsolutePath ? URL(fileURLWithPath: pathname) : profile.appendingPathComponent(pathname)
-        let original = home.appendingPathComponent(".dsh/local-plugins/ResearchCompanion/" + previousDigest)
-            .appendingPathComponent(Self.bridgeName + "-0.2.3.tgz")
+        let original = home.appendingPathComponent(".dsh/local-plugins/ResearchCompanion/" + digests.archive)
+            .appendingPathComponent("\(Self.bridgeName)-\(version).tgz")
         guard resolved.standardizedFileURL == original.standardizedFileURL,
               original.resolvingSymlinksInPath().standardizedFileURL == original.standardizedFileURL,
-              let bytes = try? Data(contentsOf: original), SHA256.hash(data: bytes).hexString == previousDigest else { return false }
+              let bytes = try? Data(contentsOf: original), SHA256.hash(data: bytes).hexString == digests.archive else { return false }
         // A replaced entry point, manifest, UI or cordis patch may belong to a
         // private integration even when the old tarball is still in place.
         var executable = SHA256()
@@ -70,7 +87,7 @@ struct ResearchSetup {
             executable.update(data: data)
             executable.update(data: Data([0]))
         }
-        return executable.finalize().hexString == "f984135ea2b42a75ba36750602483e2cc281007aa6ab4e425570ecd8f8ac0555"
+        return executable.finalize().hexString == digests.installed
     }
 
     enum Failure: LocalizedError {
@@ -82,6 +99,7 @@ struct ResearchSetup {
 
     func install() throws {
         guard let desktop, version == Self.supportedVersion, let cli, let archive,
+              Self.isBridgeArchiveName(archive.lastPathComponent),
               FileManager.default.isExecutableFile(atPath: cli.path) else {
             throw Failure.detail("未找到匹配的 DSH 桌面版或随应用分发的科研桥。")
         }
@@ -102,7 +120,7 @@ struct ResearchSetup {
         let bytes = try Data(contentsOf: archive)
         let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
         let directory = home.appendingPathComponent(".dsh/local-plugins/ResearchCompanion/" + digest)
-        let destination = directory.appendingPathComponent(Self.archiveName)
+        let destination = directory.appendingPathComponent(archive.lastPathComponent)
         guard directory.resolvingSymlinksInPath().standardizedFileURL == directory.standardizedFileURL else {
             throw Failure.detail("本地插件目录重定向到了其他位置，安装已停止。")
         }
@@ -148,6 +166,9 @@ struct ResearchSetupView: View {
     private var guidance: String {
         guard let version = environment.version else { return "问答需要 DeepSeek Harness 桌面版。先从开发者网站取得兼容版本。" }
         guard compatible else { return "当前 DSH 为 " + version + "。已验证版本为 " + ResearchSetup.supportedVersion + "，请先核对版本。" }
+        if [.absent, .upgradeable].contains(bridge), environment.archive == nil {
+            return "此应用副本未附科研桥。请使用公开发行安装盘，或按原方式维护科研桥。"
+        }
         switch bridge {
         case .uninitialized: return "请先打开 DSH，等待桌面初始化，然后从其应用菜单正常退出。"
         case .absent: return isRunning ? "请先保存工作并正常退出 DSH，待其退出后安装本地科研桥。" : "安装科研桥后，重新打开 DSH 即会创建本账号的科研工作区。"
@@ -166,7 +187,7 @@ struct ResearchSetupView: View {
             HStack {
                 if environment.version == nil || !compatible {
                     Link("DSH 官方下载", destination: ResearchSetup.download)
-                } else if [.absent, .upgradeable].contains(bridge) && !isRunning {
+                } else if [.absent, .upgradeable].contains(bridge) && !isRunning && environment.archive != nil {
                     Button(installing ? "正在安装…" : bridge == .upgradeable ? "更新科研桥" : "安装科研桥") { install() }.disabled(installing)
                 } else if !isRunning, let desktop = environment.desktop {
                     Button("打开 DSH") { NSWorkspace.shared.openApplication(at: desktop, configuration: .init()) { _, _ in } }

@@ -20,8 +20,8 @@ private final class Ready: NSObject, WKScriptMessageHandler, WKNavigationDelegat
     var sourceID: String?
     var directSource: [String: String]?
     var noteReveals: [[String: String]] = []
-    var wholeAnswerNotes: [[String: String]] = []
     var notes: [(id: String, session: String, selection: String, mode: String?)] = []
+    var notePreviewRequested = false
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         if (message.body as? [String: Bool])?["ready"] == true {
@@ -39,11 +39,7 @@ private final class Ready: NSObject, WKScriptMessageHandler, WKNavigationDelegat
                 notes.append((id, session, selection, body["noteMode"]))
             }
         }
-        if let body = message.body as? [String: Any], body["readingWholeAnswer"] as? Bool == true,
-           let id = body["noteID"] as? String, let session = body["session"] as? String,
-           let token = body["readingToken"] as? String {
-            wholeAnswerNotes.append(["id": id, "session": session, "token": token])
-        }
+        if (message.body as? [String: Any])?["notePreviewID"] != nil { notePreviewRequested = true }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -58,8 +54,9 @@ private final class Ready: NSObject, WKScriptMessageHandler, WKNavigationDelegat
 @main
 private struct TranscriptCheck {
     @MainActor static func main() {
-        guard CommandLine.arguments.count == 2 else {
-            fputs("Usage: check-transcript path/to/Transcript\n", stderr)
+        let arguments = CommandLine.arguments
+        guard arguments.count == 2 || (arguments.count == 4 && arguments[2] == "-AppleShowScrollBars") else {
+            fputs("Usage: check-transcript path/to/Transcript [-AppleShowScrollBars Always|WhenScrolling]\n", stderr)
             exit(2)
         }
         let native = NSApplication.shared
@@ -220,6 +217,46 @@ private struct TranscriptCheck {
         try check(bridge.copied?.id == "saved" && bridge.copied?.session == "fixture", "Copy did not resolve the persisted row ID")
         print("WebKit: delta rendering keeps stable elements and selection, matches Markdown, and remaps copy at finalization")
 
+        let appended = try await evaluate(#"""
+            const transcript = window.ResearchTranscript;
+            const base = '😀 **原文的论点：';
+            const row = { id: 'local', role: 'assistant', streaming: true, original: '', text: base };
+            const patch = { session: 'compact-strong', jump: 1 };
+            transcript.update({ ...patch, rows: [row], order: [row.id] });
+            const article = document.querySelector('#messages > article');
+            const body = article.querySelector('.message-body');
+            const partial = body.textContent.includes('**原文的论点：') && !body.querySelector('strong');
+            const suffix = '**梯度下降，$x_i^2$。';
+            transcript.update({ ...patch, rows: [{ ...row, text: suffix, appendAfterUTF16: base.length }] });
+            const bold = body.querySelector('strong')?.textContent === '原文的论点：';
+            const math = body.querySelector('[data-latex]')?.dataset.latex === 'x_i^2';
+            const header = article.querySelector('.message-header');
+            const observer = new MutationObserver(() => {});
+            observer.observe(header, { subtree: true, attributes: true, childList: true });
+            const oldText = body.textContent;
+            let rejected = false;
+            try {
+              transcript.update({ ...patch, rows: [{ ...row, text: '丢失的基准', appendAfterUTF16: base.length }] });
+            } catch (_) {
+              rejected = body.textContent === oldText;
+            }
+            const final = base + suffix + ' 再核验。';
+            transcript.update({ ...patch, rows: [{ ...row, text: final }] });
+            const headerUntouched = observer.takeRecords().length === 0;
+            observer.disconnect();
+            transcript.update({ ...patch, rows: [{ ...row, id: 'settled', streaming: false, text: final }], order: ['settled'] });
+            const settled = document.querySelector('#messages > article');
+            transcript.update({ ...patch, session: 'elsewhere', rows: [], order: [] });
+            transcript.update({ ...patch, rows: [{ ...row, id: 'settled', streaming: false, text: final }], order: ['settled'] });
+            const reopened = document.querySelector('#messages > article');
+            return partial && bold && math && rejected && headerUntouched && settled === article &&
+                reopened.querySelector('strong')?.textContent === '原文的论点：' &&
+                reopened.querySelector('[data-latex]')?.dataset.latex === 'x_i^2';
+            """#)
+        try check(appended as? Bool == true,
+                  "WebKit lost the UTF-16 stream base, Markdown correction, retained header, or reopened history")
+        print("WebKit: compact bold updates, UTF-16 append and rejected-base recovery survive settling and reopening")
+
         let noteFeedback = try await evaluate("""
             window.ResearchTranscript.update({ session: 'notes', jump: 2, order: ['quoted'],
               rows: [{ id: 'quoted', role: 'assistant', text: sample, original: '' }], busy: '' });
@@ -278,6 +315,21 @@ private struct TranscriptCheck {
                   "Finder reveal used an older receipt or transmitted an arbitrary path")
         print("WebKit: note actions preserve selection, LaTeX and explicit save mode with current Finder receipt and readable status")
 
+        let unobtrusiveNotes = try await evaluate("""
+            window.getSelection().removeAllRanges();
+            const split = document.querySelector('.note-split');
+            const save = split.querySelector('.answer-note');
+            const notice = document.querySelector('#reading-feedback');
+            const before = [notice.hidden, notice.textContent];
+            split.dispatchEvent(new Event('pointerenter'));
+            split.dispatchEvent(new Event('focusin', { bubbles: true }));
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            return !save.hasAttribute('title') && save.hasAttribute('aria-description') &&
+              notice.hidden === before[0] && notice.textContent === before[1];
+            """)
+        try check(unobtrusiveNotes as? Bool == true && !bridge.notePreviewRequested && bridge.notes.count == 6,
+                  "Hover and keyboard focus must not show instructions or perform note work")
+
         let direct = try await evaluate("""
             const view = window.ResearchTranscript;
             const openButton = row => row.querySelector('.answer-direct-source');
@@ -286,7 +338,8 @@ private struct TranscriptCheck {
             const hiddenWithoutCapture = openButton(existing).hidden;
             window.ResearchTranscript.update({ session: 'notes', jump: 3, order: ['quoted', 'shortcut', 'live-source', 'source-without-link'],
               rows: [{ id: 'shortcut', role: 'assistant', text: '[模型网址](https://example.invalid/model)', original: '',
-                       sourceTitle: '实际合成科研材料的完整而且很长的校准标题'.repeat(5), sourcePage: 'PDF 文件第 8 页', sourceDisplay: '材料甲 · PDF 文件第 8 页', sourceDetails: '材料甲 · PDF 文件第 8 页 · 阅读器页标签 iv', canOpenSource: true },
+                       sourceObjects: '式 (5) · Fig. 1', sourceTitle: '实际合成科研材料的完整而且很长的校准标题'.repeat(5), sourcePage: 'PDF 文件第 8 页', sourceDisplay: '式 (5) · Fig. 1 · 材料甲 · PDF 文件第 8 页', sourceDetails: '材料甲 · PDF 文件第 8 页 · 阅读器页标签 iv',
+                       sourceWarning: '图注边界未能核实，已取得的摘录可能不完整。请打开原页核对。', canOpenSource: true },
                      { id: 'live-source', role: 'assistant', text: '未完成', original: '', streaming: true,
                        sourceDisplay: '未完成材料', canOpenSource: true },
                      { id: 'source-without-link', role: 'assistant', text: '旧网页仅有摘录', original: '',
@@ -294,72 +347,26 @@ private struct TranscriptCheck {
               busy: '' });
             const ready = matches.children[1];
             const directVisible = !openButton(ready).hidden && !ready.querySelector('.answer-source').hidden;
+            const partialCaptionVisible = ready.querySelector('.answer-source').textContent === '图注待核对' &&
+              ready.querySelector('.answer-source').title.includes('可能不完整');
             const hiddenDuringStream = openButton(matches.children[2]).hidden;
             const showsLabels = openButton(ready).getAttribute('aria-label').includes('PDF 文件第 8 页') &&
+              openButton(ready).querySelector('.source-objects').textContent.includes('式 (5) · Fig. 1') &&
+              openButton(ready).querySelector('.source-objects').getClientRects().length > 0 &&
               openButton(ready).title.endsWith('阅读器页标签 iv');
             const old = matches.children[3];
             const noFabricatedLink = openButton(old).hidden &&
+              old.querySelector('.source-objects').hidden &&
               old.querySelector('.answer-source').textContent.includes('网页乙 <记录>');
             openButton(ready).click();
             await new Promise(resolve => requestAnimationFrame(resolve));
-            return { hiddenWithoutCapture, directVisible, hiddenDuringStream, showsLabels, noFabricatedLink };
+            return { hiddenWithoutCapture, directVisible, partialCaptionVisible, hiddenDuringStream, showsLabels, noFabricatedLink };
             """) as? [String: Bool]
-        try check(direct?["hiddenWithoutCapture"] == true && direct?["directVisible"] == true &&
+        try check(direct?["hiddenWithoutCapture"] == true && direct?["directVisible"] == true && direct?["partialCaptionVisible"] == true &&
                   direct?["hiddenDuringStream"] == true && direct?["showsLabels"] == true &&
                   direct?["noFabricatedLink"] == true && bridge.directSource == ["directSourceID": "shortcut", "session": "notes"],
                   "Direct jump must send just the completed answer IDs, leave the source sheet, and hide without provenance")
         print("WebKit: direct source targets the settled answer by ID without passing an arbitrary URL")
-
-        let priorKeyboardNotes = bridge.notes.count
-        let keyboard = try await evaluate("""
-            const view = window.ResearchTranscript;
-            const list = document.querySelector('#messages');
-            const quote = list.children[0];
-            const formula = quote.querySelector('.math .katex-html');
-            document.querySelector('#transcript').dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }));
-            view.readingCommand('saveSelection', 'notes', 'no-target', true);
-            const noTargetPrompt = document.querySelector('#reading-feedback').textContent.includes('聚焦一条回答');
-            const range = document.createRange();
-            range.selectNodeContents(formula);
-            const selection = window.getSelection();
-            selection.removeAllRanges();
-            selection.addRange(range);
-            view.readingCommand('saveSelection', 'different-session', 'wrong-session', true);
-            view.readingCommand('saveSelection', 'notes', 'no-focus', false);
-            const noFocusPrompt = !document.querySelector('#reading-feedback').hidden;
-            view.readingCommand('saveSelection', 'notes', 'formula-key', true);
-            const formulaTarget = quote.classList.contains('answer-target');
-            selection.removeAllRanges();
-            list.children[1].dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-            const hoverKeepsTarget = quote.classList.contains('answer-target');
-            view.readingCommand('saveSelection', 'notes', 'whole-key', true);
-            const cross = document.createRange();
-            cross.setStart(quote.querySelector('.message-body'), 0);
-            cross.setEnd(list.children[1].querySelector('.message-body'), 1);
-            selection.addRange(cross);
-            view.readingCommand('saveSelection', 'notes', 'cross', true);
-            const crossPrompt = document.querySelector('#reading-feedback').textContent.includes('同一条回答');
-            selection.removeAllRanges();
-            list.children[3].focus();
-            view.readingCommand('openSource', 'notes', 'no-locator', true);
-            const noLocatorPrompt = document.querySelector('#reading-feedback').textContent.includes('没有可直接打开');
-            selection.addRange(range);
-            list.children[1].querySelector('.answer-direct-source').focus();
-            const focusedByControl = list.children[1].classList.contains('answer-target') && selection.isCollapsed;
-            window.dispatchEvent(new Event('blur'));
-            const stableAfterReturn = list.children[1].classList.contains('answer-target');
-            view.readingCommand('openSource', 'notes', 'open-key', true);
-            await new Promise(resolve => requestAnimationFrame(resolve));
-            return { noFocusPrompt, noTargetPrompt, crossPrompt, noLocatorPrompt, formulaTarget,
-              hoverKeepsTarget, focusedByControl, stableAfterReturn };
-            """) as? [String: Bool]
-        try check(keyboard?.count == 8 && keyboard?.values.allSatisfy({ $0 }) == true &&
-                  bridge.notes.count == priorKeyboardNotes + 1 &&
-                  bridge.notes.last?.selection == #"$\frac{1}{x}$"# &&
-                  bridge.wholeAnswerNotes == [["id": "quoted", "session": "notes", "token": "whole-key"]] &&
-                  bridge.directSource == ["directSourceID": "shortcut", "session": "notes", "readingToken": "open-key"],
-                  "Reading commands must preserve LaTeX and stable focus, and refuse absent, stale and ambiguous targets")
-        print("WebKit: keyboard reading targets follow explicit focus and selections, preserve LaTeX and ignore hover")
 
         let compactLayout = try await evaluate("""
             const second = document.querySelector('#messages').children[1];
@@ -375,10 +382,10 @@ private struct TranscriptCheck {
               more.querySelectorAll('button').length === 1 && visible(more.querySelector('.copy-original')) &&
               Math.abs(arrow.getBoundingClientRect().left - save.getBoundingClientRect().right) <= 2 &&
               second.querySelector('.answer-material-label').scrollWidth > second.querySelector('.answer-material-label').clientWidth &&
-              visible(second.querySelector('.source-page'));
+              visible(second.querySelector('.source-page')) && visible(second.querySelector('.source-objects'));
             more.querySelector('.copy-original').click();
             \(layout)
-            return compact && !more.open && second.classList.contains('answer-target') && document.body.scrollWidth <= innerWidth;
+            return compact && !more.open && document.body.scrollWidth <= innerWidth;
             """)
         try check(compactLayout as? Bool == true && bridge.copied?.id == "shortcut",
                   "Compact menu must preserve the selected answer's copy and close after choosing")
@@ -398,16 +405,25 @@ private struct TranscriptCheck {
             range.selectNodeContents(document.querySelector('.message-body p'));
             window.getSelection().addRange(range);
             window.ResearchTranscript.update({ session: 'next', jump: 1, order: ['one'],
-              rows: [{ id: 'one', role: 'assistant', text: '另一个会话', original: '' }], busy: '' });
+              rows: [{ id: 'one', role: 'assistant', text: '另一个会话', original: '',
+                       sourceObjects: '式 (2)', sourceDisplay: '式 (2) · 材料丙', canOpenSource: true }], busy: '' });
             const list = document.querySelector('#messages');
-            const newTargetCleared = list.querySelector('.answer-target') === null;
-            window.ResearchTranscript.readingCommand('saveSelection', 'next', 'switched-session', true);
+            const onlyCurrentSource = list.querySelector('.source-objects').textContent.includes('式 (2)') &&
+                !list.textContent.includes('Fig. 1') && !list.textContent.includes('图注待核对');
             return list.children.length === 1 && list.textContent.includes('另一个会话') &&
-              window.getSelection().isCollapsed && newTargetCleared &&
-              document.querySelector('#reading-feedback').textContent.includes('聚焦一条回答');
+              window.getSelection().isCollapsed && onlyCurrentSource &&
+              window.ResearchTranscript.readingCommand === undefined;
             """)
         try check(reset as? Bool == true, "Switching conversations retained prior content or selection")
 
+        let mathSource = #"其中 $x_t$ 是参数，$\hat{g}_t$ 是估计，$H_t^{-1}$ 是逆矩阵。"# +
+            "\n\n" + #"$$\begin{pmatrix}1&0\\0&1\end{pmatrix}\frac{1}{x_t^2}$$"# +
+            "\n\n$$\n" + long + "\n$$"
+        let mathRow = ["id": "math", "role": "assistant", "text": mathSource, "original": mathSource]
+        _ = try await evaluate("""
+            window.ResearchTranscript.update({ session: 'math-layout', jump: 1, order: ['math'],
+              rows: [{ ...mathRow, streaming: true }], busy: '' });
+            """, arguments: ["mathRow": mathRow])
         for (appearance, dark) in [(NSAppearance.Name.aqua, false), (.darkAqua, true)] {
             surface.appearance = NSAppearance(named: appearance)
             let matched = try await evaluate("""
@@ -422,7 +438,56 @@ private struct TranscriptCheck {
                    (dark ? 'rgb(35, 36, 39)' : 'rgb(252, 252, 253)');
                 """, arguments: ["dark": dark])
             try check(matched as? Bool == true, "WebKit did not apply the \(appearance.rawValue) palette")
+            for width in [365, 625] {
+                surface.setContentSize(NSSize(width: CGFloat(width), height: 270))
+                let result = try await evaluate("""
+                    await document.fonts.ready;
+                    \(layout)
+                    const formulas = [...document.querySelectorAll('.math-inline')];
+                    const displays = [...document.querySelectorAll('.math-display')];
+                    const layout = formulas.map(formula => {
+                      const probe = () => {
+                        const node = document.createElement('span');
+                        node.style.cssText = 'display:inline-block;width:0;height:0';
+                        return node;
+                      };
+                      const outside = probe();
+                      const inside = probe();
+                      formula.before(outside);
+                      formula.prepend(inside);
+                      const style = getComputedStyle(formula);
+                      const measured = { display: style.display, overflow: style.overflowX,
+                        baselineDelta: Math.abs(inside.getBoundingClientRect().top - outside.getBoundingClientRect().top) };
+                      inside.remove();
+                      outside.remove();
+                      return measured;
+                    });
+                    const wide = displays.at(-1);
+                    wide.scrollLeft = wide.scrollWidth;
+                    const endReachable = wide.scrollLeft > 0 && wide.scrollLeft + wide.clientWidth >= wide.scrollWidth - 2;
+                    wide.scrollLeft = 0;
+                    return { layout, endReachable, operatorsPreserved: formulas.length === 3 && displays.length === 2 &&
+                        formulas.every(formula => formula.querySelector('.katex-html') &&
+                          formula.querySelector('annotation')?.textContent === formula.dataset.latex) &&
+                        displays[0].querySelector('.katex-html') && displays[0].dataset.latex.includes('pmatrix') };
+                    """) as? [String: Any]
+                try check(result?["operatorsPreserved"] as? Bool == true, "Native math layout lost superscripts or matrix markup")
+                try check(result?["endReachable"] as? Bool == true, "Wide displayed formula cannot scroll to the end")
+                let inline = result?["layout"] as? [[String: Any]] ?? []
+                try check(inline.count == 3 && inline.allSatisfy { item in
+                    item["display"] as? String == "inline" && item["overflow"] as? String == "visible" &&
+                        (item["baselineDelta"] as? Double ?? .infinity) <= 1
+                }, "Inline math left the text baseline at width \(width) in \(appearance.rawValue): \(inline)")
+            }
+            if !dark {
+                _ = try await evaluate("""
+                    window.ResearchTranscript.update({ session: 'math-layout', jump: 1, order: ['math'], rows: [mathRow], busy: '' });
+                    window.ResearchTranscript.update({ session: 'math-history', jump: 1, order: ['math'], rows: [mathRow], busy: '' });
+                    """, arguments: ["mathRow": mathRow])
+            }
         }
         print("WebKit: light and dark AppKit appearances applied readable palettes")
+        let scrollbars = NSScroller.preferredScrollerStyle == .legacy ? "always visible" : "overlay"
+        print("WebKit: inline math stays on the text baseline, wide display math remains scrollable (\(scrollbars) scrollbars)")
     }
 }

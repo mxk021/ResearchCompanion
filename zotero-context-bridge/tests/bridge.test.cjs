@@ -66,6 +66,7 @@ function fixture() {
   let onRead;
   let attachment = {
     id: 42, key: 'PDF00042', libraryID: 1, isAttachment: () => true,
+    isFileAttachment: () => true, isPDFAttachment: () => true,
     getField: key => key === 'title' ? 'Local PDF' : '',
     parentItem: { key: 'ITEM0042', libraryID: 1, getCreators: () => [{ firstName: 'A', lastName: 'Researcher' }],
       getField: key => ({ title: 'A real paper', date: '2026-11-15', abstractNote: 'Abstract.' }[key] || '') }
@@ -297,15 +298,87 @@ test('explicit translation reads only the active reader selection including mult
   const doc = { hasFocus:()=>true, getSelection:()=>null, activeElement:{} };
   const view = {_iframeWindow:{document:doc}, _selectionRanges:[2,0,1].map(n=>({text:'Page '+n,position:{pageIndex:n}}))};
   f.Zotero.getMainWindow=()=>win;
-  f.Zotero.Reader.getByTabID=()=>({itemID:42,_internalReader:{_lastView:view}});
+  const reader = {itemID:42,_internalReader:{_lastView:view}};
+  f.Zotero.Reader.getByTabID=()=>reader;
   const run=()=>core.liveSelection(f.Zotero,win,requestId);
   assert.equal(JSON.parse(run()[2]).liveSelection.text,'Page 0\nPage 1\nPage 2');
   assert.equal(core.liveSelection(f.Zotero,{},requestId)[0],409);
   doc.hasFocus=()=>false; assert.equal(run()[0],422);
-  doc.hasFocus=()=>true; view._selectionRanges=[]; assert.equal(run()[0],422);
-  doc.getSelection=()=>({rangeCount:1,isCollapsed:false,toString:()=>'DOM sample'});
-  assert.equal(JSON.parse(run()[2]).liveSelection.text,'DOM sample');
-  doc.getSelection=()=>({rangeCount:1,isCollapsed:false,toString:()=>'A'.repeat(24001)});
+  doc.hasFocus=()=>true; view._selectionRanges=[];
+  doc.getSelection=()=>({rangeCount:1,isCollapsed:false,toString:()=>'old DOM mirror'});
+  assert.equal(run()[0],422);
+  view._selectionRanges=[{text:'A'.repeat(24001),position:{pageIndex:1}}];
   assert.equal(run()[0],413);
   doc.activeElement={isContentEditable:true};assert.equal(run()[0],422);
+});
+
+test('desktop Zotero PDF uses its exact canvas text despite a nonempty, shifted DOM mirror', () => {
+  const expected = 'A careful test of x² and ∂L/∂x, with data  —\nincluding the last glyph −𝛼.';
+  let native = [{text:expected,position:{pageIndex:5}}];
+  const doc = {
+    activeElement:{}, hasFocus:()=>true,
+    getSelection:()=>({rangeCount:1,isCollapsed:false,toString:()=>'ulation. '+expected.slice(0,-7)})
+  };
+  const view = {_iframeWindow:{document:doc}, _selectionRanges:native};
+  const reader = {_internalReader:{_lastView:view}};
+  const read=()=>core.readerSelection(reader,true);
+  for (const value of [expected, 'Second selection / α₂', expected]) {
+    view._selectionRanges=[{text:value,position:{pageIndex:5}}];
+    assert.equal(read().selection.text,value);
+    assert.equal(read().method,'pdf-canvas');
+  }
+  for (const invalid of [[native[0], native[0]], [native[0],{text:'Skip',position:{pageIndex:7}}], [native[0], {position:{pageIndex:6}}]]) {
+    view._selectionRanges=invalid;
+    assert.deepEqual(read(),{error:'SELECTION_UNVERIFIED'});
+  }
+  view._selectionRanges=[];
+  assert.deepEqual(read(),{error:'NO_SELECTION'});
+});
+
+test('native DOM reads do not borrow the PDF canvas selection or leave the current text layer', () => {
+  const doc={activeElement:{},hasFocus:()=>true};
+  const a={nodeType:1,ownerDocument:doc,closest:selector=>selector==='.textLayer' ? {} : null};
+  const b={nodeType:3,parentElement:a};
+  const selected={rangeCount:1,isCollapsed:false,getRangeAt:()=>({startContainer:a,endContainer:b}),
+    toString:()=>'Native α  \n exact'};
+  doc.getSelection=()=>selected;
+  const view={_iframeWindow:{document:doc},_nativeTextSelection:{enabled:true},_selectionRanges:[{text:'False mirror'}]};
+  const reader={_internalReader:{_lastView:view}};
+  assert.equal(core.readerSelection(reader,true).selection.text,selected.toString());
+  a.closest=()=>null;
+  assert.deepEqual(core.readerSelection(reader,true),{error:'SELECTION_UNVERIFIED'});
+  delete view._selectionRanges;
+  assert.equal(core.readerSelection(reader,true).method,'document-dom');
+  a.ownerDocument={};
+  assert.deepEqual(core.readerSelection(reader,true),{error:'SELECTION_UNVERIFIED'});
+});
+
+test('live replies are tagged with the active attachment and reject a changed tab during capture', () => {
+  const f=fixture();
+  const win={Zotero_Tabs:{selectedID:'Reader-1',selectedType:'reader'},document:{hasFocus:()=>true}};
+  const view={_iframeWindow:{document:{hasFocus:()=>true,activeElement:{}}},_selectionRanges:[
+    {text:'α₁ exact',position:{pageIndex:4}}],_getPageLabel:()=> 'iv'};
+  const reader={itemID:42,_internalReader:{_lastView:view}};
+  f.Zotero.getMainWindow=()=>win;
+  f.Zotero.Reader.getByTabID=()=>reader;
+  const req='00000000-0000-4000-8000-000000000003';
+  const send=()=>core.liveSelection(f.Zotero,win,req);
+  const result=JSON.parse(send()[2]).liveSelection;
+  assert.deepEqual(result.capture,{method:'pdf-canvas',tabID:'Reader-1',attachmentID:42,attachmentKey:'PDF00042'});
+  assert.deepEqual(result.location,{library:'library',attachmentKey:'PDF00042',pageIndex:4,pageLabel:'iv'});
+  assert.equal(result.text,'α₁ exact');
+  assert.equal(result.requestId,req);
+  const attachment=f.Zotero.Items.get(42);
+  attachment.libraryID=7;
+  assert.equal(JSON.parse(send()[2]).liveSelection.location,undefined);
+  f.Zotero.Groups={getGroupIDFromLibraryID: id=>id===7 ? 123 : null};
+  assert.deepEqual(JSON.parse(send()[2]).liveSelection.location,{library:'groups/123',attachmentKey:'PDF00042',pageIndex:4,pageLabel:'iv'});
+  attachment.isPDFAttachment=()=>false;
+  assert.deepEqual(JSON.parse(send()[2]).liveSelection.location,{library:'groups/123',attachmentKey:'PDF00042'});
+  attachment.isFileAttachment=()=>false;
+  assert.equal(JSON.parse(send()[2]).liveSelection.location,undefined);
+  view._getPageLabel=()=>{win.Zotero_Tabs.selectedID='Reader-2'; return '5';};
+  const changed=send();
+  assert.equal(changed[0],409);
+  assert.equal(JSON.parse(changed[2]).error,'SOURCE_CHANGED');
 });

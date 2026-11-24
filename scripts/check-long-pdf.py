@@ -2,6 +2,7 @@
 import json
 import os
 import platform
+import re
 from pathlib import Path
 import socket
 import subprocess
@@ -19,9 +20,14 @@ def serve(listener, path, selection_check):
     # resolves its default effort. Planning and answering must use the same resolved tuple.
     default = paid if selection_check else dict(provider=subscription["provider"], model=subscription["model"])
     range_packets = []
+    grid_requests = 0
+    grid_combined = "结合论文解释这段观测的依据"
+    grid_cancelled = "结合论文解释这段观测的含义"
     cancel_polls = 0
     rejected_part = False
     first_part_requests = 0
+    incomplete_ack_id = None
+    recovered_ack = False
     plan_steps = {}
     semantic = "为什么两次记录各用一种代号？"
     cold_question = "有什么要留意的？"
@@ -59,7 +65,7 @@ def serve(listener, path, selection_check):
                 route = request["selection"]
                 session = request["sessionId"]
                 assert request["workspaceId"] == "pdf" and session in sessions
-                assert route == selected[session] == subscription and doc["pages"] == (1 if q == cold_question else 52)
+                assert route == selected[session] == subscription and doc["pages"] == (1 if q in (cold_question, grid_combined, grid_cancelled) else 52)
                 assert "originalPath" not in doc and "bookmark" not in doc and len(doc["id"]) == 64
                 stamp = (session, doc["id"], route["provider"], route["model"], route["reasoningEffort"])
                 previous = plan_steps.setdefault(q, [])
@@ -67,7 +73,13 @@ def serve(listener, path, selection_check):
                 assert ("feedback" in doc) == bool(previous)
                 if previous:
                     assert doc["feedback"].startswith("【已读取的证据】") == (q != "这行代号怎么理解？")
-                if q == cold_question:
+                if q in (grid_combined, grid_cancelled):
+                    assert doc["selection"] == "My current excerpt about local measurements"
+                    if previous:
+                        assert q == grid_combined, "Declining a layout must terminate the planning loop"
+                        assert doc["selection"] in doc["feedback"] and "West observation 0" in doc["feedback"]
+                    plan = {"action": "useEvidence"} if previous else {"action": "combined", "query": "第1页 zqnonmatchingv"}
+                elif q == cold_question:
                     assert not previous
                     plan = {"action": "pages", "pageStart": 1, "pageEnd": 1}
                 elif q == semantic:
@@ -104,6 +116,37 @@ def serve(listener, path, selection_check):
                 assert len(material["text"].encode("utf-16-le")) // 2 <= 24_000
                 assert request["includeContext"] and request["sessionId"] in sessions
                 question = request["text"]
+                if "用户修正并核验" in material.get("scope", ""):
+                    assert "ABSENT" not in question
+                    if "CANCEL_SEGMENT" in question:
+                        assert question.startswith("CANCEL_SEGMENT 请把从 OPENING THISTLE 到 PAGE_52_END 的原文逐段翻译成中文。")
+                    else:
+                        assert question == "请把从 OPENING THISTLE 到 PAGE_1_END 的原文逐段翻译成中文。"
+                if selection_check:
+                    retry_fixture = question == "只用选区，指出这句话的主语。"
+                    if material["source"] == "Explicit mode fixture":
+                        assert request["mode"] == ("ask" if retry_fixture else "explain")
+                    else:
+                        assert request["mode"] == "translate"
+                    if retry_fixture:
+                        if incomplete_ack_id is None:
+                            incomplete_ack_id = request["requestId"]
+                            wire.write(json.dumps({**result, "accepted": False}).encode() + b"\n")
+                            wire.flush()
+                            continue
+                        assert not recovered_ack and request["requestId"] == incomplete_ack_id
+                        recovered_ack = True
+                if question == "翻译从 West observation 0 到 East observation 2 的内容。":
+                    grid_requests += 1
+                    assert grid_requests == 1 and "经用户对照" in material["scope"]
+                    assert "West observation 0" in material["text"] and "East observation 2" in material["text"]
+                    cell = r"(?:West|Center|East) observation [0-2]"
+                    wanted = sorted(f"{side} observation {row}" for side in ["West", "Center", "East"] for row in range(3))
+                    assert sorted(re.findall(cell, material["text"])) == wanted
+                    assert not re.sub(cell, "", material["text"]).strip(), "The candidate included text outside the grid"
+                assert question != grid_cancelled, "A declined proposal must not be submitted"
+                if question == grid_combined:
+                    assert "经用户对照" in material["scope"] and "My current excerpt" in material["text"]
                 if question in plan_steps:
                     assert len(plan_steps[question]) == (1 if question in (inferred_range, cold_question) else 2)
                     assert all(step[0] == request["sessionId"] and step[2:] ==
@@ -130,6 +173,11 @@ def serve(listener, path, selection_check):
                 raise ValueError(action)
             wire.write(json.dumps(result, ensure_ascii=False).encode() + b"\n")
             wire.flush()
+    if not selection_check:
+        assert len(plan_steps[grid_cancelled]) == 1 and len(plan_steps[grid_combined]) == 2
+        assert grid_requests == 1, "Only the current, confirmed candidate may reach the provider."
+    else:
+        assert recovered_ack, "The incomplete acknowledgement was not retried with the saved request id."
 
 if __name__ == "__main__":
     project = Path(__file__).resolve().parent.parent

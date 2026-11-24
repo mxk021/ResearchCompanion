@@ -41,7 +41,6 @@ struct SettingsPanelView: View {
         case .appearance: AppearanceSettingsPage(settings: settings, library: petLibrary)
         case .interaction: InteractionSettingsPage(settings: settings)
         case .researchNotes: ResearchNotesSettingsPage(settings: .shared)
-        case .shortcuts: ShortcutsSettingsPage(settings: settings)
         case .petManagement: PetManagementPage(settings: settings, library: petLibrary)
         case .connection: HarnessConnectionSettingsPage(model: model, connections: connections, commandClient: model.commandClient)
         case .about: AboutSettingsPage()
@@ -53,7 +52,6 @@ private enum SettingsPage: String, CaseIterable, Identifiable {
     case appearance = "桌宠外观"
     case interaction = "交互与提醒"
     case researchNotes = "科研笔记"
-    case shortcuts = "快捷键"
     case petManagement = "宠物管理"
     case connection = "Harness 连接"
     case about = "关于与更新"
@@ -64,7 +62,6 @@ private enum SettingsPage: String, CaseIterable, Identifiable {
         case .appearance: return "paintbrush"
         case .interaction: return "hand.tap"
         case .researchNotes: return "note.text"
-        case .shortcuts: return "command"
         case .petManagement: return "pawprint"
         case .connection: return "point.3.connected.trianglepath.dotted"
         case .about: return "info.circle"
@@ -629,6 +626,13 @@ private struct InteractionSettingsPage: View {
                     .padding(.vertical, 13)
                 }
             }
+            SettingsCard(title: "选取文字", verticalPadding: 8) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("读取其他应用的选区需要辅助功能授权。也可从原应用的「服务」菜单选择「选取文字（科研助手）」。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    SelectionAuthorizationView()
+                }
+            }
             SettingsCard(title: "状态提醒", verticalPadding: 8) {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(alignment: .top, spacing: 12) {
@@ -791,106 +795,6 @@ private struct DSHPetDetailsSheet: View {
         }
         .padding(24)
         .frame(width: 480, height: 270)
-    }
-}
-
-// MARK: - Shortcuts
-
-private struct ShortcutsSettingsPage: View {
-    @ObservedObject var settings: PetSettings
-    @State private var recordingGlobal = false
-    @State private var recordingTranslation = false
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            SettingsPageHeader(title: "快捷键", subtitle: "分清全局唤起与菜单操作，避免快捷键互相打扰。", bottomPadding: 14)
-            SettingsCard(title: "全局唤起", verticalPadding: 8) {
-                VStack(alignment: .leading, spacing: 0) {
-                    HStack(alignment: .center, spacing: 16) {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("显示并聚焦输入框")
-                            Text("在任意应用中使用；重复按下保留当前草稿。")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 12)
-                        HotKeyRecorderView(keyCode: $settings.globalHotKeyKeyCode, modifiers: $settings.globalHotKeyModifiers, isRecording: $recordingGlobal)
-                            .frame(width: 205, height: 30)
-                        Toggle("启用", isOn: $settings.globalHotKeyEnabled)
-                            .labelsHidden().toggleStyle(.switch)
-                    }
-                    .padding(.vertical, 8)
-                    HStack(spacing: 7) {
-                        Image(systemName: settings.globalHotKeyStatus == nil ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                        Text(settings.globalHotKeyStatus ?? (settings.globalHotKeyEnabled ? "已成功注册" : "快捷键已关闭"))
-                    }
-                    .font(.caption)
-                    .foregroundStyle(settings.globalHotKeyStatus == nil ? Color.green : Color.orange)
-                }
-            }
-            SettingsCard(title: "翻译选区", verticalPadding: 8) {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text("翻译前台应用的选中文字")
-                        Spacer()
-                        HotKeyRecorderView(keyCode: $settings.translationHotKey.keyCode,
-                            modifiers: Binding(get: { settings.translationHotKey.modifiers.rawValue },
-                                set: { settings.translationHotKey.modifiers = NSEvent.ModifierFlags(rawValue: $0) }),
-                            isRecording: $recordingTranslation)
-                            .frame(width: 205, height: 30)
-                        Toggle("启用翻译选区快捷键", isOn: $settings.translationHotKey.isEnabled)
-                            .labelsHidden().toggleStyle(.switch)
-                    }
-                    Text(settings.translationHotKeyStatus ?? (settings.translationHotKey.isEnabled ? "已注册 · 选中文字后按下即发送翻译" : "快捷键已关闭"))
-                        .font(.caption).foregroundStyle(settings.translationHotKeyStatus == nil ? Color.secondary : Color.orange)
-                    SelectionAuthorizationView()
-                }
-            }
-            SettingsCard(title: "菜单快捷键", verticalPadding: 8) {
-                VStack(alignment: .leading, spacing: 0) {
-                    Text("用于 Research Companion 菜单操作，不会注册为系统全局快捷键。")
-                        .font(.caption).foregroundStyle(.secondary).padding(.bottom, 4)
-                    HStack {
-                        Text("操作").frame(maxWidth: .infinity, alignment: .leading)
-                        Text("快捷键").frame(width: 205, alignment: .leading)
-                        Text("启用").frame(width: 48, alignment: .trailing)
-                    }
-                    .font(.caption).foregroundStyle(.secondary)
-                    .padding(.bottom, 2)
-                    ForEach(DSHPetShortcutAction.allCases) { action in
-                        ShortcutEditorRow(action: action, settings: settings)
-                        Divider().opacity(0.4)
-                    }
-                    HStack {
-                        Button("恢复默认快捷键") { settings.resetShortcuts() }.controlSize(.small)
-                        Text("点击按键区域可重新录入；冲突时会显示原因。")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    .padding(.top, 8)
-                }
-            }
-        }
-    }
-}
-
-private struct ShortcutEditorRow: View {
-    let action: DSHPetShortcutAction
-    @ObservedObject var settings: PetSettings
-    @State private var recording = false
-    private var configuration: GlobalHotKeyConfiguration { settings.shortcutConfiguration(for: action) }
-    var body: some View {
-        HStack(spacing: 16) {
-            Text(action.label)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            HotKeyRecorderView(keyCode: Binding(get: { configuration.keyCode }, set: { settings.setShortcutKeyCode($0, for: action) }), modifiers: Binding(get: { configuration.modifiers.rawValue }, set: { settings.setShortcutModifiers($0, for: action) }), isRecording: $recording).frame(width: 190, height: 24)
-            Toggle("启用", isOn: Binding(get: { configuration.isEnabled }, set: { settings.setShortcutEnabled($0, for: action) }))
-                .labelsHidden().toggleStyle(.switch).frame(width: 48, alignment: .trailing)
-        }
-        .padding(.vertical, 1)
-        .overlay(alignment: .bottomLeading) {
-            if let conflict = settings.shortcutConflict(for: action) {
-                Text(conflict).font(.caption2).foregroundStyle(.orange).offset(y: 13)
-            }
-        }
-        .padding(.bottom, settings.shortcutConflict(for: action) == nil ? 0 : 10)
     }
 }
 
@@ -1141,5 +1045,36 @@ private struct AboutValueRow: View {
             Text(value).foregroundStyle(.secondary)
         }
         .padding(.vertical, 9)
+    }
+}
+
+private struct SelectionAuthorizationView: View {
+    @State private var trusted = ResearchSelectionCapture.accessibilityAvailable
+    @Environment(\.openURL) private var openURL
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text(trusted ? "本进程已获辅助功能授权" : "本进程尚未获辅助功能授权")
+                Button(trusted ? "重新检查" : "检查授权…") {
+                    trusted = ResearchSelectionCapture.accessibilityAvailable
+                    if !trusted { trusted = ResearchSelectionCapture.requestAccessibility() }
+                }.controlSize(.small)
+                if !trusted {
+                    Button("打开辅助功能设置") {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") { openURL(url) }
+                    }.controlSize(.small)
+                }
+            }
+            if !trusted, ResearchSelectionCapture.identity.isAdHoc {
+                Text("如果系统设置里的旧条目已经开启，请移除该条目，重新添加下方路径的应用并启用。")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text(ResearchSelectionCapture.identity.description).textSelection(.enabled)
+        }
+        .font(.caption).foregroundStyle(.secondary)
+        .onAppear { trusted = ResearchSelectionCapture.accessibilityAvailable }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            trusted = ResearchSelectionCapture.accessibilityAvailable
+        }
     }
 }

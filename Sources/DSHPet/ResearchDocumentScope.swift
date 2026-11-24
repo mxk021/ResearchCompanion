@@ -4,6 +4,8 @@ import Foundation
 enum ResearchDocumentScope {
     case general, selection, file, combined, automatic
 
+    var usesFile: Bool { self == .file || self == .combined || self == .automatic }
+
     static func resolve(question: String, mode: ResearchPromptMode, selection: ResearchMaterial?,
                         hasFile: Bool, filename: String?, captureFailed: Bool) throws -> Self {
         let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -23,15 +25,15 @@ enum ResearchDocumentScope {
             if case .anchors = ResearchPDFAddress.parse(q) { return .file }
             if ignoresSelection { return .file }
             if combined && (selectionNamed || deictic), selection != nil { return .combined }
-            let selectedTask = mentions(#"(?:翻译|解释|读出|分析)(?:一下|一下子)?(?:当前|本次|这次)?(?:选区|选中(?:的文字|的句子)|所选(?:文字|内容))|\b(?:translate|explain) (?:the |my )?(?:selection|highlighted text|selected text)\b"#)
             let widerScope = mentions(#"下一页|跨页|起点|终点|全文|接下去|接下来|往后|继续到|next page|continue|through"#)
-            if selectionNamed && selectedTask && !combined && !widerScope && !ResearchPDFIndex.requestsLocation(q) {
-                guard selection != nil else { throw ResearchMaterialError.message("本次未取得选区。请重新选中文字。") }
-                return .selection
-            }
             if q.isEmpty && mode != .ask { return selection == nil ? .file : .selection }
-            if ResearchPDFIndex.requestsLocation(q) || ResearchMaterial.requestsFileBackground(q, filename: filename) {
+            if ResearchPDFIndex.requestsLocation(q) || !ResearchPDFObjectID.addresses(in: q).isEmpty ||
+                ResearchMaterial.requestsFileBackground(q, filename: filename) {
                 return .file
+            }
+            if selection != nil, !widerScope, selectionNamed || deictic { return .selection }
+            if selectionNamed, selection == nil, !widerScope, !combined {
+                throw ResearchMaterialError.message("本次未取得选区。请重新选中文字。")
             }
             return .automatic
         }

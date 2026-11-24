@@ -14,7 +14,7 @@ export interface ResearchModelRuntime {
   listProviders(): readonly { id: string; name: string }[]
   listConfigurableProviders(): readonly { provider: string; settingsNs: string }[]
   listModels(provider: string): Promise<readonly { id: string; name: string }[]>
-  resolveModelInfo(provider: string, model: string): Promise<{ reasoning?: Reasoning }>
+  resolveModelInfo(provider: string, model: string): Promise<{ reasoning?: Reasoning; inputModalities?: readonly string[] }>
   resolveCallConfig(selection: ResearchSelection, signal: AbortSignal): Promise<ResearchSelection>
 }
 
@@ -29,7 +29,7 @@ function registeredSubscriptions(llm?: ResearchModelRuntime): string[] {
 export type ResearchProviderState = {
   id: string
   name: string
-  models: readonly { id: string; name: string; reasoning?: Reasoning }[]
+  models: readonly { id: string; name: string; reasoning?: Reasoning; inputModalities?: readonly string[] }[]
   error?: string
 }
 
@@ -95,7 +95,8 @@ export async function researchModelCatalog(llm: ResearchModelRuntime | undefined
         const list = await llm.listModels(id)
         return Promise.all(list.map(async model => {
           const info = await llm.resolveModelInfo(id, model.id)
-          return { id: model.id, name: model.name, ...(info.reasoning ? { reasoning: info.reasoning } : {}) }
+          return { id: model.id, name: model.name, ...(info.reasoning ? { reasoning: info.reasoning } : {}),
+            ...(info.inputModalities ? { inputModalities: info.inputModalities.filter(value => value === 'text' || value === 'image') } : {}) }
         }))
       })
       return { id, name, models, ...(models.length === 0 ? { error: '当前账号没有可用模型，请在 DSH 检查授权。' } : {}) }

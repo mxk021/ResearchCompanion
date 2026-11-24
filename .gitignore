@@ -23,6 +23,7 @@
 !/tests/
 /tests/retirement-install-finalize.py
 !/scripts/
+/scripts/check-paper-sample.json
 /scripts/install-retirement.py
 /scripts/verify-research-live.mjs
 !/zotero-context-bridge/
@@ -31,9 +32,6 @@
 !/docs/SETUP.md
 !/docs/BUILD.md
 !/docs/THIRD_PARTY.md
-!/docs/images/
-/docs/images/*
-!/docs/images/research-transcript.png
 
 # Generated material and local secrets at any depth
 .DS_Store

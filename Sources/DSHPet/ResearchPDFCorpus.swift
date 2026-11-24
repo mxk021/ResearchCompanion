@@ -24,6 +24,7 @@ struct ResearchPDFCorpus {
     let passages: [Passage]
     let frequency: [String: Int]
     let narrative: ResearchPDFSearchText
+    let narrativeSource: NSString
 
     init(pages: [ResearchPDFIndex.Page]) throws {
         var raw = ""
@@ -36,10 +37,11 @@ struct ResearchPDFCorpus {
                 try Task.checkCancellation()
                 guard block.kind != .header, block.kind != .footer else { continue }
                 let size = block.text.utf16.count
-                // Footnotes live outside the running text. They remain searchable as
-                // independent passages and are included in page and whole-document reads.
+                // Floating captions, diagram labels and footnotes are independent of the running
+                // prose across a page break. Keep them in search, page reads and full-document reads.
                 var span: NSRange?
-                if block.kind != .footnote {
+                if !block.detachedCaption && block.kind != .footnote && block.kind != .figureLabel &&
+                    block.paragraphRole != .algorithm {
                     if !raw.isEmpty { raw += "\n\n"; length += 2 }
                     span = NSRange(location: length, length: size)
                     raw += block.text
@@ -62,6 +64,7 @@ struct ResearchPDFCorpus {
         self.passages = passages
         self.frequency = frequency
         self.narrative = try ResearchPDFSearchText(raw)
+        self.narrativeSource = raw as NSString
     }
 
     func full(_ entry: Int) -> ResearchPDFSlice {
@@ -118,6 +121,9 @@ struct ResearchPDFSearchText {
                 next = trailing.endIndex
                 end += trailing.utf16.count
                 append(" ", end: end)
+            } else if ch == "−" {
+                // Mathematical subtraction is not a hyphenated word break.
+                append("-", end: end)
             } else if Self.hyphens.contains(ch) {
                 let trailing = raw[next...].prefix(while: \.isWhitespace)
                 if trailing.contains(where: \.isNewline), trailing.endIndex < raw.endIndex,
@@ -150,7 +156,9 @@ struct ResearchPDFSearchText {
 
     /// Match only inside the requested source interval. Limit results after applying that
     /// constraint so a repeated header on an earlier page cannot hide a later exact match.
-    func occurrences(_ anchor: String, within source: NSRange? = nil, limit: Int = 2) throws -> [NSRange] {
+    func occurrences(_ anchor: String, within source: NSRange? = nil, limit: Int = 2,
+                     allowOpeningInflection: Bool = false, beforeCitationNumber: Bool = false,
+                     allowMathematicalTypography: Bool = false, startsAfterPrintedWrap: Bool = false) throws -> [NSRange] {
         let query = try ResearchPDFSearchText(anchor.trimmingCharacters(in: .whitespacesAndNewlines)).folded
         guard !query.isEmpty, query.utf16.count <= 2_048 else {
             throw ResearchMaterialError.message("请给出非空、可核对的原文短句（每处最多 2048 个字符）。")
@@ -158,16 +166,58 @@ struct ResearchPDFSearchText {
         let marker = String(Self.wrappedHyphen)
         var pattern = ""
         var previousLetter = false
-        for ch in query {
+        let firstWord = query.prefix { $0.isASCII && $0.isLetter }
+        let inflect = allowOpeningInflection && firstWord.count >= 4 &&
+            query.split(whereSeparator: \.isWhitespace).count >= 5 && query.dropFirst(firstWord.count).first == " "
+        if allowOpeningInflection && !inflect { return [] }
+        let characters = Array(query)
+        let hasNotation = query.range(of: #"[=+×÷^|]|\b[a-z][(][a-z][)]|[\p{Greek}]\p{L}*[_^]|-\s*(?:log\b|\d)"#,
+                                      options: .regularExpression) != nil
+        if allowMathematicalTypography && !hasNotation { return [] }
+        let operators: Set<Character> = ["=", "+", "-", "×", "÷", "(", ")", "|"]
+        for (index, ch) in characters.enumerated() {
+            let previous = index > 0 ? characters[index - 1] : nil
+            let next = index + 1 < characters.count ? characters[index + 1] : nil
+            if inflect && index == firstWord.count {
+                pattern += "(?:" + marker + ")?(?:ing|ed|es|s)"
+            }
+            if allowMathematicalTypography {
+                if ch == " ", previous.map(operators.contains) == true || next.map(operators.contains) == true {
+                    pattern += " ?"
+                    previousLetter = false
+                    continue
+                }
+                if (ch == "_" || ch == "^"), let previous, let next, previous.isLetter, next.isLetter || next.isNumber {
+                    // A superscript/subscript marker may be present only in the
+                    // question. The adjacent printed symbol is still required.
+                    pattern += "[\\_\\^]? ?"
+                    previousLetter = false
+                    continue
+                }
+            }
             if previousLetter && ch.isLetter { pattern += marker + "?" }
+            if allowMathematicalTypography, operators.contains(ch), previous != nil, previous != " " { pattern += " ?" }
             if ch == "-" || ch == Self.wrappedHyphen { pattern += "[-" + marker + "]" + (ch == Self.wrappedHyphen ? "?" : "") }
             else { pattern += NSRegularExpression.escapedPattern(for: String(ch)) }
+            if allowMathematicalTypography, operators.contains(ch), next != nil, next != " " { pattern += " ?" }
             previousLetter = ch.isLetter
         }
         // Avoid finding a whole English word inside a longer one. CJK users often
         // quote fragments without word separators.
-        if query.first?.isASCII == true, query.first?.isLetter == true { pattern = "(?<![a-zA-Z0-9" + marker + "])" + pattern }
-        if query.last?.isASCII == true, query.last?.isLetter == true { pattern += "(?![a-zA-Z0-9" + marker + "])" }
+        if startsAfterPrintedWrap {
+            guard query.first?.isLetter == true, query.split(whereSeparator: \.isWhitespace).count >= 4 else { return [] }
+            pattern = "(?<=" + marker + ")" + pattern
+        } else if query.first?.isASCII == true, query.first?.isLetter == true {
+            pattern = "(?<![a-zA-Z0-9" + marker + "])" + pattern
+        }
+        if beforeCitationNumber {
+            guard query.split(whereSeparator: \.isWhitespace).count >= 3,
+                  let lastWord = query.split(whereSeparator: \.isWhitespace).last,
+                  lastWord.count >= 3, lastWord.allSatisfy({ $0.isASCII && $0.isLetter }) else { return [] }
+            pattern += #"(?=[0-9]{1,3}[.,;:])"#
+        } else if query.last?.isASCII == true, query.last?.isLetter == true {
+            pattern += "(?![a-zA-Z0-9" + marker + "])"
+        }
         let regex = try NSRegularExpression(pattern: "(?=(" + pattern + "))")
         var hits: [NSRange] = []
         func lowerBound(_ location: Int) -> Int {

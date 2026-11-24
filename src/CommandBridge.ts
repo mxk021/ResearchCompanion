@@ -90,7 +90,7 @@ export interface CommandHandlers {
   researchDocumentPlan?: (request: OpenSessionCommand & { text: string; document: PlanningDocument; selection: ResearchSelection; signal: AbortSignal }) => Promise<unknown>
   researchRetirement?: (request: RetirementRequest) => Promise<unknown>
   researchHistory?: (request: ResearchHistoryRequest) => Promise<unknown>
-  researchPrompt?: (request: OpenSessionCommand & { requestId: string; text: string; mode: string; contextKey?: string; includeContext: boolean; expectedSelection?: ResearchSelection; material?: ResearchContext }) => Promise<unknown>
+  researchPrompt?: (request: OpenSessionCommand & { requestId: string; text: string; mode: string; contextKey?: string; includeContext: boolean; expectedSelection?: ResearchSelection; material?: ResearchContext; documentImages: readonly PromptImage[] }) => Promise<unknown>
   capabilities?: () => readonly string[]
   fileCandidates?: (request: OpenSessionCommand & { query: string }) => Promise<{ candidates: readonly { path: string; kind: 'file' | 'directory' }[] }>
   skillCandidates?: (request: OpenSessionCommand) => Promise<{ skills: readonly { name: string; description: string; conflict: boolean }[] }>
@@ -399,12 +399,20 @@ export class CommandBridge {
           try { material = decodeInlineMaterial(request.material) }
           catch (error) { throw new CommandError('invalid-request', error instanceof Error ? error.message : '材料无效。') }
         }
+        if (Array.isArray(request.images) && request.images.length > 4) {
+          throw new CommandError('invalid-request', '原页裁图最多四处。')
+        }
+        const documentImages = imageFields(request.images, this.handlers.imageAttachmentLimits)
+        const expectedSelection = selectionField(request.selection)
+        if (documentImages.length && (!material || !expectedSelection)) {
+          throw new CommandError('invalid-request', '原页裁图必须绑定确切模型和本轮原文。')
+        }
         this.respond(client.socket, id, await this.handlers.researchPrompt({
           workspaceId: stringField(request.workspaceId, 'workspaceId'), sessionId: stringField(request.sessionId, 'sessionId'),
           requestId: stringField(request.requestId, 'requestId'), text: optionalStringField(request.text, 'text') ?? '',
           mode: optionalStringField(request.mode, 'mode') ?? 'ask', contextKey,
           includeContext: request.includeContext !== false, ...(material ? { material } : {}),
-          expectedSelection: selectionField(request.selection),
+          expectedSelection, documentImages,
         })); return
       }
       if (action === 'workspaces') {

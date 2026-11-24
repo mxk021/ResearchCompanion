@@ -22,7 +22,7 @@ final class DSHPetPanel: NSPanel {
         static let y = "dsh-pet.ballPositionY"
     }
 
-    override var canBecomeKey: Bool { true }
+    override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
     override var acceptsFirstResponder: Bool { true }
 
@@ -53,6 +53,10 @@ final class DSHPetPanel: NSPanel {
         UserDefaults.standard.set(Double(frame.origin.y), forKey: PositionKeys.y)
         appLog.info("persistPosition -> \(Int(self.frame.origin.x)),\(Int(self.frame.origin.y))")
     }
+}
+
+private final class PetHostingView: NSHostingView<DSHPetView> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 /// Separate control surface below the pet. Keeping it in its own panel means
@@ -106,7 +110,7 @@ private struct PetContextView: View {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private let model = DSHPetModel.shared
     private var panel: DSHPetPanel?
     private var composerPanel: DSHPetComposerPanel?
@@ -123,25 +127,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var researchVisibilitySink: AnyCancellable?
     private var taskPanelSink: AnyCancellable?
     private var connectionSink: AnyCancellable?
-    private var hotKeySink: AnyCancellable?
-    private var translationHotKeySink: AnyCancellable?
     private var statusItem: NSStatusItem?
     private var statusSink: AnyCancellable?
     private var statusHeaderItem: NSMenuItem?
     private var togglePetMenuItem: NSMenuItem?
-    private var shortcutMenuItems: [DSHPetShortcutAction: [NSMenuItem]] = [:]
-    private var readingMenuItems: [ResearchReadingAction: NSMenuItem] = [:]
     private var lastIconColor: Color?
-    private let globalHotKeyManager = GlobalHotKeyManager()
-    private let translationHotKeyManager = GlobalHotKeyManager(id: 2)
-    private var captureFrontPID: pid_t?
     private var taskPanelEventMonitors: [Any] = []
     private var isTaskPanelClosing = false
     private var lastExternalApplication: NSRunningApplication?
     private var panelSelectionOrigin: (app: NSRunningApplication, target: ResearchSelectionCapture.Target)?
-    private var servicePreviousApplication: NSRunningApplication?
-    private var serviceActivationSource: (app: NSRunningApplication, expiresAt: TimeInterval)?
     private var selectionActivationTask: Task<Void, Never>?
+    private var selectionCapture: SelectionCapture?
+    private var selectionWindowReturn: SelectionWindowReturn?
+    private var safariSelectionService: SafariSelectionService?
+
+    private struct SelectionCapture {
+        let request: DSHPetCommandClient.SelectionRequest
+        let source: ResearchSelectionCapture.Target
+        let chatWindow: NSWindow
+        var phase: ResearchSelectionHandoff
+    }
+
+    private struct SelectionWindowReturn {
+        let id: UUID
+        let sourcePID: pid_t
+        let chatWindow: NSWindow
+    }
+
+    // System Services carries the text on a private board, but supplies no
+    // caller or request token. Only one issued Safari action may await a reply.
+    private final class SafariSelectionService {
+        let requestID: UUID
+        let document: ResearchSelectionCapture.CopyDocument
+        var reply: Result<ResearchMaterial, Error>?
+        var interrupted = false
+
+        init(requestID: UUID, document: ResearchSelectionCapture.CopyDocument) {
+            self.requestID = requestID
+            self.document = document
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         ResearchLaunchLog.write("delegate-launched")
@@ -161,9 +186,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         // 菜单栏彩色图标（NSStatusItem 非模板渲染）+ 标准主菜单
         setupStatusItem()
         setupMainMenu()
-        recordServiceForeground(NSWorkspace.shared.frontmostApplication)
+        recordSelectionForeground(NSWorkspace.shared.frontmostApplication)
         NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(serviceForegroundChanged(_:)),
+            self, selector: #selector(selectionForegroundChanged(_:)),
             name: NSWorkspace.didActivateApplicationNotification, object: nil
         )
         NSApp.servicesProvider = self
@@ -175,7 +200,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         setupPetContextPanel()
         setupComposerPanel()
         setupTaskPanel()
-        setupGlobalHotKey()
         model.start()
         startHoverMonitor()
         observeVisibility()
@@ -183,7 +207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         observeBubble()
         observeComposer()
         ResearchLaunchLog.write("panels-created")
-        showComposerFromGlobalHotKey()
+        showComposer()
         ResearchLaunchLog.write("first-panel-presented")
         // 显示器增删/分辨率变化时，把球收回可视区（避免被 macOS 甩到屏幕外）
         NotificationCenter.default.addObserver(
@@ -207,7 +231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         NSWorkspace.shared.notificationCenter.removeObserver(
             self, name: NSWorkspace.didActivateApplicationNotification, object: nil
         )
-        selectionActivationTask?.cancel()
+        cancelSelectionCapture()
         researchWindow?.persistFrame()
         model.commandClient.flushDraftPersistence()
         model.stop()
@@ -227,8 +251,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         taskPanelSink = nil
         connectionSink?.cancel()
         connectionSink = nil
-        hotKeySink?.cancel()
-        hotKeySink = nil
         removeTaskPanelEventMonitors()
         dismissPetContext()
         model.closeTaskPanel()
@@ -247,15 +269,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
+        finishSelectionWindowReturn()
         updateResearchForeground()
     }
 
     func applicationDidResignActive(_ notification: Notification) {
-        model.commandClient.setResearchWindowForeground(false)
+        updateResearchForeground()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        showComposerFromGlobalHotKey()
+        if selectionWindowReturn != nil {
+            finishSelectionWindowReturn()
+        } else {
+            showComposer()
+        }
         return false
     }
 
@@ -300,9 +327,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             self?.showPetContext(at: point)
         }
 
-        let hosting = NSHostingView(rootView: DSHPetView(
+        let hosting = PetHostingView(rootView: DSHPetView(
             model: model,
             settings: PetSettings.shared,
+            onActivateChat: { [weak self] in self?.activateResearchComposerFromPet() },
             onOpenHarness: { [weak self] in self?.model.openHarness() }
         ))
         hosting.wantsLayer = true
@@ -709,16 +737,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private func focusResearchPanel() {
         guard model.isResearchPanelOpen else { return }
         cancelSelectionCapture()
+        if let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid(),
+           app.activationPolicy == .regular {
+            lastExternalApplication = app
+            panelSelectionOrigin = ResearchSelectionCapture.target(app).map { (app, $0) }
+        }
         if NSApp.isHidden { NSApp.unhide(nil) }
-        if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+        if !NSApp.isActive { NSApp.activate() }
         researchWindow?.present()
     }
 
     private func updateResearchForeground() {
         let window = researchWindow?.window
-        let foreground = model.isResearchPanelOpen && NSApp.isActive && !NSApp.isHidden
+        let visible = model.isResearchPanelOpen && !NSApp.isHidden
             && window?.isVisible == true && window?.isMiniaturized == false
-        model.commandClient.setResearchWindowForeground(foreground)
+        // An owned PDF handoff leaves the conversation onscreen. Avoid a
+        // draft flush and immediate bridge refresh for this activation pulse.
+        if visible, researchWindow?.isKeepingSelectionVisible == true { return }
+        model.commandClient.setResearchWindowForeground(visible && NSApp.isActive)
     }
 
     private var expandedComposerSize: NSSize {
@@ -956,21 +992,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         menu.addItem(.separator())
 
-        menu.addItem(makeShortcutMenuItem(
-            action: .inputMessage,
+        menu.addItem(makeMenuItem(
             title: "打开科研对话",
-            selector: #selector(inputMessageFromMenu)
+            selector: #selector(showComposer)
         ))
 
-        togglePetMenuItem = makeShortcutMenuItem(
-            action: .togglePetVisibility,
+        togglePetMenuItem = makeMenuItem(
             title: PetSettings.shared.isPetVisible ? "隐藏宠物" : "显示宠物",
             selector: #selector(togglePetVisibility)
         )
         menu.addItem(togglePetMenuItem!)
 
-        menu.addItem(makeShortcutMenuItem(
-            action: .openSettings,
+        menu.addItem(makeMenuItem(
             title: "设置…",
             selector: #selector(toggleSettingsPanel)
         ))
@@ -1010,215 +1043,287 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         item.button?.setAccessibilityLabel(model.statusText)
         statusHeaderItem?.title = model.statusText
         togglePetMenuItem?.title = PetSettings.shared.isPetVisible ? "隐藏宠物" : "显示宠物"
-        applyMenuShortcuts()
     }
 
-    private func makeShortcutMenuItem(
-        action: DSHPetShortcutAction,
-        title: String,
-        selector: Selector
-    ) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+    private func makeMenuItem(title: String, selector: Selector, keyEquivalent: String = "") -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: selector, keyEquivalent: keyEquivalent)
         item.target = self
-        shortcutMenuItems[action, default: []].append(item)
         return item
-    }
-
-    private func applyMenuShortcuts() {
-        let settings = PetSettings.shared
-        for action in DSHPetShortcutAction.allCases {
-            let configuration = settings.shortcutConfiguration(for: action)
-            let keyEquivalent = configuration.isEnabled && settings.shortcutConflict(for: action) == nil
-                ? configuration.menuKeyEquivalent
-                : nil
-            let modifierMask = configuration.modifiers.intersection([.command, .option, .control, .shift])
-            for item in shortcutMenuItems[action, default: []] {
-                item.keyEquivalent = keyEquivalent ?? ""
-                item.keyEquivalentModifierMask = keyEquivalent == nil ? [] : modifierMask
-            }
-        }
-        updateReadingMenuShortcuts()
-    }
-
-    private func updateReadingMenuShortcuts() {
-        let settings = PetSettings.shared
-        let configured = [settings.globalHotKeyConfiguration, settings.translationHotKey] + DSHPetShortcutAction.allCases.map {
-            settings.shortcutConfiguration(for: $0)
-        }
-        for (action, item) in readingMenuItems {
-            let shortcut = action.shortcut
-            let conflict = configured.contains {
-                $0.isEnabled && $0.keyCode == shortcut.keyCode && $0.modifiers == shortcut.modifiers
-            }
-            item.keyEquivalent = conflict ? "" : (shortcut.menuKeyEquivalent ?? "")
-            item.keyEquivalentModifierMask = conflict ? [] : shortcut.modifiers
-        }
-    }
-
-    @objc func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        if menuItem.action == #selector(readingActionFromMenu(_:)) {
-            return researchWindow?.readingMenuAvailable == true
-        }
-        return true
-    }
-
-    @objc private func readingActionFromMenu(_ sender: NSMenuItem) {
-        guard let value = sender.representedObject as? String, let action = ResearchReadingAction(rawValue: value) else { return }
-        researchWindow?.performReadingAction(action)
     }
 
     @objc private func togglePetVisibility() {
         PetSettings.shared.isPetVisible.toggle()
     }
 
-    // MARK: - 全局快捷键
-
-    private func setupGlobalHotKey() {
-        globalHotKeyManager.onTrigger = { [weak self] in self?.showComposerFromGlobalHotKey() }
-        translationHotKeyManager.onTrigger = { [weak self] in self?.translateFrontSelection() }
-        translationHotKeySink = PetSettings.shared.$translationHotKey.combineLatest(PetSettings.shared.$shortcuts)
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _, _ in self?.applyTranslationHotKey() }
-        hotKeySink = Publishers.CombineLatest3(
-            PetSettings.shared.$globalHotKeyEnabled,
-            PetSettings.shared.$globalHotKeyKeyCode,
-            PetSettings.shared.$globalHotKeyModifiers
-        )
-        .receive(on: RunLoop.main)
-        .sink { [weak self] _, _, _ in
-            self?.applyGlobalHotKeyConfiguration()
-        }
-        applyGlobalHotKeyConfiguration()
-    }
-
-    private func applyTranslationHotKey() {
-        let settings = PetSettings.shared
-        let desired = settings.translationHotKey
-        let fallback = translationHotKeyManager.registeredConfiguration.map { " · 当前有效 " + $0.displayName } ?? " · 当前未注册"
-        let protected = [settings.globalHotKeyConfiguration] + DSHPetShortcutAction.allCases.map { settings.shortcutConfiguration(for: $0) }
-            + ResearchReadingAction.allCases.map(\.shortcut)
-        if desired.isEnabled, protected.contains(where: { $0.isEnabled && $0.keyCode == desired.keyCode && $0.modifiers == desired.modifiers }) {
-            settings.translationHotKeyStatus = "与现有快捷键重复，请换一个组合键。" + fallback
-            return
-        }
-        switch translationHotKeyManager.update(desired) {
-        case .success: settings.translationHotKeyStatus = nil
-        case .failure(let error): settings.translationHotKeyStatus = error.localizedDescription + fallback
-        }
-        updateReadingMenuShortcuts()
-    }
-
-    private func applyGlobalHotKeyConfiguration() {
-        defer { applyTranslationHotKey() }
-        updateReadingMenuShortcuts()
-        let settings = PetSettings.shared
-        let result = globalHotKeyManager.update(settings.globalHotKeyConfiguration)
-        switch result {
-        case .success:
-            if globalHotKeyManager.isRegistered {
-                ResearchLaunchLog.write("hotkey-ready")
-                ResearchLaunchLog.write(settings.globalHotKeyConfiguration == .default
-                    ? "hotkey-default-option-space" : "hotkey-custom-registered")
-            } else { ResearchLaunchLog.write("hotkey-disabled") }
-            settings.setGlobalHotKeyStatus(nil)
-        case .failure(let error):
-            ResearchLaunchLog.write("hotkey-unavailable")
-            settings.setGlobalHotKeyStatus(error.localizedDescription + "；已保留上一次有效快捷键")
-        }
-    }
-
-    private func cancelSelectionCapture() {
+    private func cancelSelectionCapture(interrupted: Bool = false) {
         selectionActivationTask?.cancel()
+        if let selectionCapture {
+            self.selectionCapture = nil
+            if interrupted {
+                model.commandClient.finishResearchSelectionCapture(selectionCapture.request, result: .failure(SelectionCaptureError.sourceChanged))
+            } else {
+                model.commandClient.cancelResearchSelectionCapture()
+            }
+        }
         selectionActivationTask = nil
-        captureFrontPID = nil
+        selectionWindowReturn = nil
+        finishSelectionWindowVisibility()
     }
 
-    private func showComposerFromGlobalHotKey() {
+    @objc func cancelResearchTextFromPanel(_ sender: Any?) {
+        cancelSelectionCapture()
+        model.commandClient.rejectResearchSelection("本次取词已取消。")
+    }
+
+    @objc private func showComposer() {
         cancelSelectionCapture()
         activateResearchComposer()
     }
 
     @objc func selectResearchTextFromPanel(_ sender: Any?) {
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
-            translateFrontSelection(previewOnly: true)
+        guard model.isResearchPanelOpen, let chat = researchWindow?.window,
+              chat.isVisible, !chat.isMiniaturized else { return }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid() else {
+            captureFrontSelection(in: chat)
             return
         }
-        // AppKit can deliver the first button action before NSWorkspace posts
-        // our activation notification. Bind the immediately preceding external
-        // app's current window here; only identity, never old text, is reused.
+        // Keep only the previously active app and window identity. Read the
+        // selection itself for this action, never when the chat was raised.
         let source = panelSelectionOrigin ?? lastExternalApplication.flatMap { app in
             ResearchSelectionCapture.target(app).map { (app: app, target: $0) }
         }
-        guard let origin = source, !origin.app.isTerminated,
-              let windowID = origin.target.windowID,
-              ResearchSelectionCapture.target(origin.app)?.windowID == windowID else {
+        guard let origin = source, !origin.app.isTerminated, origin.target.hasSameDocument() else {
             cancelSelectionCapture()
-            model.commandClient.rejectResearchSelection("无法确认之前的来源窗口。请在原窗口选中文字，并按翻译选区快捷键。")
+            model.commandClient.rejectResearchSelection("无法确认之前的来源窗口。请在原窗口重新选中文字，再通过「服务 → 选取文字（科研助手）」预览。")
+            _ = focusSelectionEditor(in: chat)
             return
         }
-        translateSelection(in: origin.app, target: origin.target, restoringFocus: true, previewOnly: true)
+        captureSelection(in: origin.app, target: origin.target, chatWindow: chat, beginsInChat: true)
     }
 
-    private func translateFrontSelection(previewOnly: Bool = false) {
+    private func captureFrontSelection(in chat: NSWindow) {
         guard let app = NSWorkspace.shared.frontmostApplication, let target = ResearchSelectionCapture.target(app),
               target.isFrontmost() else {
             cancelSelectionCapture()
             model.commandClient.rejectResearchSelection(SelectionCaptureError.unsupported.localizedDescription)
-            activateResearchComposer()
+            _ = focusSelectionEditor(in: chat)
             return
         }
-        translateSelection(in: app, target: target, restoringFocus: false, previewOnly: previewOnly)
+        captureSelection(in: app, target: target, chatWindow: chat, beginsInChat: false)
     }
 
-    private func translateSelection(in app: NSRunningApplication, target: ResearchSelectionCapture.Target, restoringFocus: Bool, previewOnly: Bool) {
+    private func captureSelection(in app: NSRunningApplication, target: ResearchSelectionCapture.Target,
+                                  chatWindow: NSWindow, beginsInChat: Bool) {
         cancelSelectionCapture()
         let command = model.commandClient
-        guard let request = command.beginSelectionTranslation(previewOnly: previewOnly) else { activateResearchComposer(); return }
+        guard let request = command.beginResearchSelectionCapture() else {
+            _ = focusSelectionEditor(in: chatWindow)
+            return
+        }
+        ResearchSelectionTrace.mark(request.id, "capture-source-pid", Int(target.pid))
+        ResearchSelectionTrace.mark(request.id, "capture-window", Int(target.windowID ?? 0))
+        selectionCapture = SelectionCapture(request: request, source: target, chatWindow: chatWindow,
+                                            phase: beginsInChat ? .readingInChat : .readingSource)
         selectionActivationTask = Task { @MainActor [weak self] in
             guard let self, !Task.isCancelled else { return }
-            if restoringFocus {
-                // The button temporarily returns focus to the exact previous window. No selection
-                // text is read while the panel is shown or retained between triggers.
-                if #available(macOS 14.0, *) { NSApp.yieldActivation(to: app) }
-                _ = app.activate(options: [])
-                let deadline = ProcessInfo.processInfo.systemUptime + 1.0
-                while !target.isFrontmost(), !Task.isCancelled,
-                      ProcessInfo.processInfo.systemUptime < deadline {
-                    // App activation can precede its focused AX window/document.
-                    // Wait for that same bound window, including the interval
-                    // after its PID is foreground. Cancel if anyone else wins focus.
-                    let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
-                    guard pid == getpid() || pid == target.pid else { break }
-                    try? await Task.sleep(for: .milliseconds(20))
+            let result: Result<ResearchSelectionRead, Error>
+            do {
+                let background = beginsInChat ? try await self.readSelectionWithoutActivation(target, requestID: request.id) : nil
+                if let background {
+                    result = .success(background)
+                } else {
+                    if beginsInChat { try await self.activateSelectionSource(app, target: target, requestID: request.id) }
+                    result = .success(try await self.readForegroundSelection(target, requestID: request.id))
                 }
+            } catch {
+                result = .failure(error)
             }
             guard !Task.isCancelled else { return }
-            guard target.isFrontmost() else {
-                command.finishSelectionTranslation(request, result: .failure(SelectionCaptureError.sourceChanged))
-                self.selectionActivationTask = nil
-                return
-            }
-            self.captureFrontPID = target.pid
-            let worker = Task.detached(priority: .userInitiated) {
-                try Task.checkCancellation()
-                guard target.isFrontmost() else { throw SelectionCaptureError.sourceChanged }
-                let material = try await ResearchSelectionCapture.current(target, requestID: request.id)
-                try Task.checkCancellation()
-                let serviceReturned = await MainActor.run { ResearchSafariService.returned(request.id, target: target) }
-                guard target.isFrontmost() || serviceReturned else { throw SelectionCaptureError.sourceChanged }
-                return material
-            }
-            let result = await withTaskCancellationHandler { await worker.result } onCancel: { worker.cancel() }
-            guard !Task.isCancelled else { return }
-            self.selectionActivationTask = nil
-            self.captureFrontPID = nil
-            guard target.isFrontmost() || ResearchSafariService.returned(request.id, target: target) else {
-                command.finishSelectionTranslation(request, result: .failure(SelectionCaptureError.sourceChanged))
-                return
-            }
-            command.finishSelectionTranslation(request, result: result)
-            self.activateResearchComposer()
+            self.completeSelectionCapture(request.id, result: result)
         }
+    }
+
+    private func readSelectionWithoutActivation(_ target: ResearchSelectionCapture.Target, requestID: UUID) async throws -> ResearchSelectionRead? {
+        // The existing paired Zotero endpoint authorizes only its focused reader.
+        guard !target.isZotero else { return nil }
+        ResearchSelectionTrace.mark(requestID, "background-ax-start")
+        let worker = Task.detached(priority: .userInitiated) { () throws -> ResearchSelectionRead? in
+            do {
+                let material = try await ResearchSelectionCapture.readWithoutActivation(target, ownerPID: getpid())
+                ResearchSelectionTrace.mark(requestID, "background-ax-read")
+                return .init(material: material)
+            } catch let failure as SelectionCaptureError where [.unsupported, .empty, .timedOut].contains(failure) {
+                // Protected or changed sources must never reach native Copy.
+                ResearchSelectionTrace.failure(requestID, "background-ax-unavailable", failure)
+                return try await ResearchSelectionCapture.copyWPSWithoutActivation(target, ownerPID: getpid(), requestID: requestID)
+            }
+        }
+        return try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+    }
+
+    private func activateSelectionSource(_ app: NSRunningApplication, target: ResearchSelectionCapture.Target,
+                                         requestID: UUID) async throws {
+        try Task.checkCancellation()
+        guard let capture = selectionCapture, capture.request.id == requestID,
+              model.commandClient.isCurrentSelectionRequest(capture.request), NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid(), target.hasSameDocument() else {
+            throw SelectionCaptureError.sourceChanged
+        }
+        selectionCapture?.phase = .activatingSource
+        if target.isSafari || target.isWPS { researchWindow?.keepSelectionVisible(in: capture.chatWindow) }
+        ResearchSelectionTrace.mark(requestID, "source-activation-requested")
+        NSApp.yieldActivation(to: app)
+        _ = app.activate(options: [])
+        let deadline = ContinuousClock.now + .seconds(1)
+        while !target.isFrontmost(), ContinuousClock.now < deadline {
+            try Task.checkCancellation()
+            let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            guard front == getpid() || front == target.pid else { throw SelectionCaptureError.sourceChanged }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        guard selectionCapture?.request.id == requestID, model.commandClient.isCurrentSelectionRequest(capture.request),
+              target.isFrontmost() else {
+            throw SelectionCaptureError.sourceChanged
+        }
+        selectionCapture?.phase = .readingSource
+        ResearchSelectionTrace.mark(requestID, "source-foreground")
+    }
+
+    private func readForegroundSelection(_ target: ResearchSelectionCapture.Target, requestID: UUID) async throws -> ResearchSelectionRead {
+        let worker = Task.detached(priority: .userInitiated) { [weak self] in
+            try Task.checkCancellation()
+            guard target.isFrontmost() else { throw SelectionCaptureError.sourceChanged }
+            return try await ResearchSelectionCapture.current(target, requestID: requestID) { document, copy in
+                try await self?.readSafariSelectionService(document, copy: copy, requestID: requestID)
+            }
+        }
+        return try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+    }
+
+    private func readSafariSelectionService(_ document: ResearchSelectionCapture.CopyDocument,
+                                             copy: AXUIElement, requestID: UUID) async throws -> ResearchSelectionRead? {
+        guard safariSelectionService == nil,
+              let item = document.safariServiceCommand(copy: copy) else {
+            ResearchSelectionTrace.mark(requestID, "safari-private-service-unavailable")
+            return nil
+        }
+        try Task.checkCancellation()
+        guard let active = selectionCapture, active.request.id == requestID,
+              model.commandClient.isCurrentSelectionRequest(active.request) else { throw SelectionCaptureError.sourceChanged }
+        let service = SafariSelectionService(requestID: requestID, document: document)
+        guard let input = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown], handler: { _ in
+            service.interrupted = true
+        }) else { return nil }
+        defer { NSEvent.removeMonitor(input) }
+        safariSelectionService = service
+        selectionCapture?.phase = .readingSafariService
+        // AXPress can wait for our Services provider. Keep it off the main
+        // actor so the incoming private board can be handled immediately.
+        let action = Task.detached(priority: .userInitiated) { () -> AXError? in
+            guard !Task.isCancelled, document.isCurrent(),
+                  ResearchSelectionCapture.CopyDocument.isEnabled(copy) else { return nil }
+            AXUIElementSetMessagingTimeout(item, 1.0)
+            ResearchSelectionTrace.mark(requestID, "safari-private-service-issued")
+            return AXUIElementPerformAction(item, kAXPressAction as CFString)
+        }
+        let status = await withTaskCancellationHandler { await action.value } onCancel: { action.cancel() }
+        if let status { ResearchSelectionTrace.mark(requestID, "safari-private-service-action", Int(status.rawValue)) }
+        let unissued = status == nil || status == .actionUnsupported || status == .notImplemented
+        defer {
+            if (unissued || service.reply != nil),
+               safariSelectionService === service { safariSelectionService = nil }
+            // A dispatcher timeout may still deliver later. Keep that one
+            // reply reserved for its expired request, never for a new one.
+        }
+        try Task.checkCancellation()
+        if unissued {
+            guard selectionCapture?.request.id == requestID, document.isCurrent() else { throw SelectionCaptureError.sourceChanged }
+            selectionCapture?.phase = .readingSource
+            return nil
+        }
+        guard status == .success || status == .cannotComplete else { throw SelectionCaptureError.pdfServiceUnavailable }
+        let deadline = ContinuousClock.now + .seconds(1)
+        while service.reply == nil, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(15))
+        }
+        guard !service.interrupted else { throw SelectionCaptureError.sourceChanged }
+        guard let reply = service.reply else { throw SelectionCaptureError.pdfServiceUnavailable }
+        return .init(material: try reply.get())
+    }
+
+    private func completeSelectionCapture(_ id: UUID, result: Result<ResearchSelectionRead, Error>) {
+        guard let capture = selectionCapture, capture.request.id == id else { return }
+        selectionCapture = nil
+        selectionActivationTask = nil
+        defer { if selectionWindowReturn == nil { finishSelectionWindowVisibility() } }
+        guard model.commandClient.isCurrentSelectionRequest(capture.request) else { return }
+        let chat = capture.chatWindow
+        if !model.isResearchPanelOpen || researchWindow?.window !== chat || !chat.isVisible || chat.isMiniaturized {
+            model.commandClient.cancelResearchSelectionCapture()
+            return
+        }
+        let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let allowed = capture.phase.permits(front, owner: getpid(), source: capture.source.pid)
+        let sourceStillBound = capture.source.hasSameDocument()
+        let checked = allowed && sourceStillBound ? result : .failure(SelectionCaptureError.sourceChanged)
+        switch checked {
+        case .success(let read):
+            model.commandClient.finishResearchSelectionCapture(capture.request, result: .success(read.material), clipboard: read.clipboard)
+            ResearchSelectionTrace.mark(id, model.commandClient.appMaterial?.id == read.material.id ? "material-saved" : "material-not-saved")
+        case .failure(let error):
+            model.commandClient.finishResearchSelectionCapture(capture.request, result: .failure(error))
+            ResearchSelectionTrace.failure(id, "capture-failed", error)
+        }
+        if front == getpid() {
+            _ = focusSelectionEditor(in: chat)
+        } else if capture.phase.shouldReturn(from: front, source: capture.source.pid, sourceStillBound: sourceStillBound) {
+            returnToSelectionWindow(chat, from: capture.source.pid, requestID: id)
+        }
+    }
+
+    private func focusSelectionEditor(in chat: NSWindow) -> Bool {
+        guard model.isResearchPanelOpen, NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid(),
+              researchWindow?.focusAfterSelection(in: chat) == true else { return false }
+        model.focusComposerEditor()
+        return true
+    }
+
+    private func returnToSelectionWindow(_ chat: NSWindow, from sourcePID: pid_t, requestID: UUID) {
+        guard selectionWindowReturn == nil, model.isResearchPanelOpen, researchWindow?.window === chat,
+              chat.isVisible, !chat.isMiniaturized, chat.attachedSheet == nil,
+              let source = NSWorkspace.shared.frontmostApplication, source.processIdentifier == sourcePID else { return }
+        selectionWindowReturn = SelectionWindowReturn(id: requestID, sourcePID: sourcePID, chatWindow: chat)
+        // Transfer activation from this particular reader. An asynchronous
+        // LaunchServices reopen can arrive after the user has switched to Finder.
+        guard NSRunningApplication.current.activate(from: source, options: []) else {
+            selectionWindowReturn = nil
+            return
+        }
+        finishSelectionWindowReturn()
+        guard selectionWindowReturn?.id == requestID, researchWindow?.isKeepingSelectionVisible == true else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(450))
+            guard let self, self.selectionWindowReturn?.id == requestID else { return }
+            self.finishSelectionWindowReturn()
+            if self.selectionWindowReturn?.id == requestID {
+                self.selectionWindowReturn = nil
+                self.finishSelectionWindowVisibility()
+            }
+        }
+    }
+
+    private func finishSelectionWindowReturn() {
+        guard let pending = selectionWindowReturn,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid() else { return }
+        selectionWindowReturn = nil
+        if focusSelectionEditor(in: pending.chatWindow) {
+            ResearchSelectionTrace.mark(pending.id, "composer-focused")
+        }
+        finishSelectionWindowVisibility()
+    }
+
+    private func finishSelectionWindowVisibility() {
+        guard researchWindow?.endSelectionVisibility() == true else { return }
+        updateResearchForeground()
     }
 
     private func activateResearchComposer() {
@@ -1226,126 +1331,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         focusResearchPanel()
     }
 
-    @objc private func serviceForegroundChanged(_ notification: Notification) {
+    private func activateResearchComposerFromPet() {
+        ResearchLaunchLog.write("pet-chat-clicked")
+        activateResearchComposer()
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier != getpid(),
+              Bundle.main.bundleURL.pathExtension == "app" else { return }
+
+        // A click in a nonactivating panel may restore the window without activating
+        // its app. Ask Launch Services to reopen the same running bundle, like its Dock icon.
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.createsNewApplicationInstance = false
+        configuration.addsToRecentItems = false
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration)
+    }
+
+    @objc private func selectionForegroundChanged(_ notification: Notification) {
         let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-        recordServiceForeground(app)
-        if let expected = captureFrontPID, app?.processIdentifier != expected {
-            if app?.processIdentifier == getpid(), ResearchSafariService.allowsActivation(from: expected) { return }
-            cancelSelectionCapture()
-            model.commandClient.rejectResearchSelection(SelectionCaptureError.sourceChanged.localizedDescription)
+        recordSelectionForeground(app)
+        let front = app?.processIdentifier
+        if let pending = selectionWindowReturn, front != getpid(), front != pending.sourcePID {
+            selectionWindowReturn = nil
+            finishSelectionWindowVisibility()
+        } else if front == getpid() {
+            finishSelectionWindowReturn()
+        }
+        if let capture = selectionCapture {
+            if !capture.phase.permits(front, owner: getpid(), source: capture.source.pid) {
+                cancelSelectionCapture(interrupted: true)
+            }
         }
     }
 
-    private func recordServiceForeground(_ application: NSRunningApplication?) {
+    private func recordSelectionForeground(_ application: NSRunningApplication?) {
         if application?.processIdentifier == ProcessInfo.processInfo.processIdentifier {
-            if let app = lastExternalApplication, let target = ResearchSelectionCapture.target(app) {
-                panelSelectionOrigin = (app, target)
-            } else { panelSelectionOrigin = nil }
+            // Preserve a window identity already captured before the user-triggered raise.
+            if panelSelectionOrigin?.app.processIdentifier != lastExternalApplication?.processIdentifier {
+                panelSelectionOrigin = lastExternalApplication.flatMap { app in
+                    ResearchSelectionCapture.target(app).map { (app, $0) }
+                }
+            }
         } else {
             lastExternalApplication = application?.activationPolicy == .regular ? application : nil
             panelSelectionOrigin = nil
         }
-        serviceActivationSource = nil
-        if application?.processIdentifier == ProcessInfo.processInfo.processIdentifier {
-            if let preceding = servicePreviousApplication {
-                serviceActivationSource = (preceding, ProcessInfo.processInfo.systemUptime + 2)
-            }
-            servicePreviousApplication = nil
-        } else if let application, let bundleID = application.bundleIdentifier,
-                  ResearchSelectionCapture.appIDs.contains(bundleID) {
-            servicePreviousApplication = application
-        } else {
-            servicePreviousApplication = nil
-        }
     }
 
-    private func consumeResearchServiceOrigin() -> NSRunningApplication? {
-        let activation = serviceActivationSource
-        serviceActivationSource = nil
-        servicePreviousApplication = nil
-        guard let front = NSWorkspace.shared.frontmostApplication else { return nil }
-        if let bundleID = front.bundleIdentifier, ResearchSelectionCapture.appIDs.contains(bundleID) {
-            return front
-        }
-        // AppKit may activate our service before delivery. Only accept the
-        // immediately preceding foreground app for that single transition.
-        if front.processIdentifier == ProcessInfo.processInfo.processIdentifier,
-           let activation, !activation.app.isTerminated,
-           ProcessInfo.processInfo.systemUptime <= activation.expiresAt {
-            return activation.app
-        }
-        return nil
-    }
-
-    /// Services forwards the payload chosen in the origin app, including when it launches us.
-    @objc func translateResearchSelection(
-        _ pasteboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>
-    ) {
-        consumeSelectionService(pasteboard, previewOnly: false, error: error)
-    }
-
+    /// macOS hands the user's exact selection to this service on a private
+    /// board. No source document identifier accompanies that payload.
     @objc func previewResearchSelection(
         _ pasteboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>
     ) {
-        if ResearchSafariService.consume(pasteboard) { return }
-        consumeSelectionService(pasteboard, previewOnly: true, error: error)
-    }
-
-    private func consumeSelectionService(
-        _ pasteboard: NSPasteboard, previewOnly: Bool, error: AutoreleasingUnsafeMutablePointer<NSString?>
-    ) {
-        let origin = consumeResearchServiceOrigin()
+        if let service = safariSelectionService {
+            guard service.reply == nil else { return }
+            let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            guard let active = selectionCapture, active.request.id == service.requestID,
+                  model.commandClient.isCurrentSelectionRequest(active.request),
+                  active.phase.permits(front, owner: getpid(), source: active.source.pid),
+                  !service.interrupted else {
+                // We cannot tell which invocation supplied an unbound board.
+                // Clearing the reservation here could expose an even later
+                // automatic reply to the normal, manually invoked handler.
+                ResearchSelectionTrace.mark(service.requestID, "safari-private-service-reply-expired")
+                error.pointee = "上一次 Safari 文字服务尚未确认结束。请重开科研助手后再使用系统文字服务。" as NSString
+                return
+            }
+            service.reply = Result {
+                let text = try ResearchSelectionCapture.serviceSelectionText(from: pasteboard)
+                let material = try service.document.serviceMaterial(text)
+                ResearchSelectionTrace.mark(service.requestID, "safari-private-service-selection-verified", text.utf16.count)
+                return material
+            }
+            return
+        }
         cancelSelectionCapture()
         let command = model.commandClient
-        guard let request = command.beginSelectionTranslation(previewOnly: previewOnly) else { activateResearchComposer(); return }
-        let result = Result {
-            let legacy = NSPasteboard.PasteboardType(rawValue: "NSStringPboardType")
-            guard pasteboard.name != .general,
-                  let text = pasteboard.string(forType: .string) ?? pasteboard.string(forType: legacy) else { throw SelectionCaptureError.empty }
-            let source = origin.map(ResearchSelectionCapture.sourceName) ?? "系统服务"
-            return try ResearchSelectionCapture.exactSelection(text, source: source, title: source + "选区")
-        }
-        command.finishSelectionTranslation(request, result: result)
-        if case .failure(let issue) = result { error.pointee = issue.localizedDescription as NSString }
-        activateResearchComposer()
-    }
-
-    /// AppKit hands us the user-selected text on a service-specific pasteboard.
-    @objc func captureResearchSelection(
-        _ pasteboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>
-    ) {
-        ResearchLaunchLog.write("selection-service-invoked")
-        guard let scope = userData, scope == "preview" || scope == "browser" else {
-            ResearchLaunchLog.write("selection-service-origin-rejected")
-            let message = "未能确认选区来自预览或支持的浏览器。"
-            model.commandClient.rejectResearchSelection(message)
-            error.pointee = message as NSString
-            return
-        }
-        // The two system menu entries are individually constrained by bundle ID.
-        // Window activation order is only used to enrich that scope with an app name.
-        let origin = consumeResearchServiceOrigin().flatMap { app -> NSRunningApplication? in
-            (app.bundleIdentifier == "com.apple.Preview") == (scope == "preview") ? app : nil
-        }
-        let legacy = NSPasteboard.PasteboardType(rawValue: "NSStringPboardType")
-        guard let text = pasteboard.string(forType: .string) ?? pasteboard.string(forType: legacy) else {
-            ResearchLaunchLog.write("selection-service-empty")
-            let message = "原应用没有传入选中文字。"
-            model.commandClient.rejectResearchSelection(message)
-            error.pointee = message as NSString
-            return
-        }
+        guard let request = command.beginResearchSelectionCapture() else { activateResearchComposer(); return }
         do {
-            let source = origin.map(ResearchSelectionCapture.sourceName) ?? (scope == "preview" ? "预览" : "浏览器")
-            let material = try ResearchMaterial.selection(text, source: source, title: "\(source)选区")
-            model.commandClient.acceptResearchServiceSelection(material, from: origin)
-            ResearchLaunchLog.write("selection-service-accepted")
-            showComposerFromGlobalHotKey()
-        } catch let failure {
-            ResearchLaunchLog.write("selection-service-invalid")
-            model.commandClient.rejectResearchSelection(failure.localizedDescription)
-            error.pointee = failure.localizedDescription as NSString
+            let text = try ResearchSelectionCapture.serviceSelectionText(from: pasteboard)
+            let selected = try ResearchSelectionCapture.exactSelection(text, source: ResearchMaterial.selectionServiceSource,
+                                                                        title: "正文已取得 · 出处未确认")
+            command.finishResearchSelectionCapture(request, result: .success(selected))
+        } catch let issue {
+            command.finishResearchSelectionCapture(request, result: .failure(issue))
+            error.pointee = issue.localizedDescription as NSString
         }
+        activateResearchComposer()
     }
 
     /// Official DeepSeek Harness FishLogo geometry (MIT); see ThirdPartyNotices.txt.
@@ -1467,32 +1538,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "关于科研助手", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(.separator())
-        appMenu.addItem(makeShortcutMenuItem(
-            action: .inputMessage,
+        appMenu.addItem(makeMenuItem(
             title: "输入消息",
-            selector: #selector(inputMessageFromMenu)
+            selector: #selector(showComposer)
         ))
-        appMenu.addItem(makeShortcutMenuItem(
-            action: .newSession,
+        appMenu.addItem(makeMenuItem(
             title: "新建会话",
             selector: #selector(newSessionFromMenu)
         ))
-        appMenu.addItem(makeShortcutMenuItem(
-            action: .selectWorkspace,
+        appMenu.addItem(makeMenuItem(
             title: "选择工作区",
             selector: #selector(selectWorkspaceFromMenu)
         ))
-        appMenu.addItem(makeShortcutMenuItem(
-            action: .openHarness,
+        appMenu.addItem(makeMenuItem(
             title: "打开 Harness",
             selector: #selector(openHarnessFromMenu)
         ))
         appMenu.addItem(.separator())
-        appMenu.addItem(makeShortcutMenuItem(
-            action: .openSettings,
-            title: "设置…",
-            selector: #selector(toggleSettingsPanel)
-        ))
+        appMenu.addItem(makeMenuItem(title: "设置…", selector: #selector(toggleSettingsPanel), keyEquivalent: ","))
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "隐藏科研助手", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         let hideOthers = appMenu.addItem(withTitle: "隐藏其他应用", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
@@ -1515,18 +1578,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         editMenuItem.submenu = editMenu
         mainMenu.addItem(editMenuItem)
 
-        let readingMenuItem = NSMenuItem()
-        let readingMenu = NSMenu(title: "科研")
-        for action in ResearchReadingAction.allCases {
-            let item = NSMenuItem(title: action.title, action: #selector(readingActionFromMenu(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = action.rawValue
-            readingMenuItems[action] = item
-            readingMenu.addItem(item)
-        }
-        readingMenuItem.submenu = readingMenu
-        mainMenu.addItem(readingMenuItem)
-
         let windowMenuItem = NSMenuItem()
         let windowMenu = NSMenu(title: "窗口")
         windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
@@ -1537,14 +1588,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         NSApp.mainMenu = mainMenu
         NSApp.windowsMenu = windowMenu
-        applyMenuShortcuts()
     }
 
     // MARK: - Harness 输入入口
-
-    @objc private func inputMessageFromMenu() {
-        showComposerFromGlobalHotKey()
-    }
 
     @objc private func newSessionFromMenu() {
         model.startNewSession()

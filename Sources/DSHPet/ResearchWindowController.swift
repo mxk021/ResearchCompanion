@@ -1,26 +1,9 @@
 import AppKit
 import SwiftUI
 
-enum ResearchReadingAction: String, CaseIterable {
-    case saveSelection, openSource
-
-    var title: String {
-        switch self {
-        case .saveSelection: "将选区或当前回答保存为笔记"
-        case .openSource: "打开当前回答的原文"
-        }
-    }
-
-    var shortcut: GlobalHotKeyConfiguration {
-        .init(isEnabled: true, keyCode: self == .saveSelection ? 1 : 31,
-              modifiers: [.command, .option]) // ⌥⌘S / ⌥⌘O
-    }
-}
-
 @MainActor
 final class ResearchWindowPresentation: ObservableObject {
     @Published private(set) var revision = 0
-    var performReadingAction: ((ResearchReadingAction) -> Void)?
     func didPresent() { revision &+= 1 }
 }
 
@@ -40,6 +23,7 @@ final class ResearchWindowController: NSObject, NSWindowDelegate {
     private let presentation = ResearchWindowPresentation()
     private var settingFrame = false
     private var frameSaveTask: Task<Void, Never>?
+    private(set) var isKeepingSelectionVisible = false
     var visibilityDidChange: (() -> Void)?
 
     init(model: DSHPetModel, command: DSHPetCommandClient) {
@@ -63,16 +47,6 @@ final class ResearchWindowController: NSObject, NSWindowDelegate {
 
     var window: NSWindow { chat }
 
-    var readingMenuAvailable: Bool {
-        NSApp.isActive && chat.isKeyWindow && chat.isVisible && chat.attachedSheet == nil
-    }
-
-    func performReadingAction(_ action: ResearchReadingAction) {
-        guard readingMenuAvailable else { return }
-        if let event = NSApp.currentEvent, event.type == .keyDown, event.isARepeat { return }
-        presentation.performReadingAction?(action)
-    }
-
     func present() {
         if chat.isMiniaturized {
             chat.deminiaturize(nil)
@@ -80,12 +54,42 @@ final class ResearchWindowController: NSObject, NSWindowDelegate {
             restoreFrame()
             presentation.didPresent()
         }
+        // A user action in the nonactivating pet panel can precede application activation.
+        if !NSApp.isActive { chat.orderFrontRegardless() }
         chat.makeKeyAndOrderFront(nil)
         visibilityDidChange?()
     }
 
+    @discardableResult
+    func focusAfterSelection(in original: NSWindow) -> Bool {
+        guard chat === original, chat.isVisible, !chat.isMiniaturized, chat.attachedSheet == nil,
+              NSApp.keyWindow == nil || NSApp.keyWindow === chat else { return false }
+        chat.makeKeyAndOrderFront(nil)
+        visibilityDidChange?()
+        return true
+    }
+
+    /// Keep precisely the visible chat above the reader during the short
+    /// native selection handoff. Do not introduce a second window or Space.
+    func keepSelectionVisible(in original: NSWindow) {
+        guard chat === original, chat.isKeyWindow, chat.isVisible, chat.isOnActiveSpace,
+              !chat.isMiniaturized, !chat.styleMask.contains(.fullScreen), chat.attachedSheet == nil,
+              chat.level == .normal else { return }
+        isKeepingSelectionVisible = true
+        chat.level = .floating
+    }
+
+    @discardableResult
+    func endSelectionVisibility() -> Bool {
+        guard isKeepingSelectionVisible else { return false }
+        isKeepingSelectionVisible = false
+        chat.level = .normal
+        return true
+    }
+
     func hide() {
         guard chat.isVisible || chat.isMiniaturized else { return }
+        endSelectionVisibility()
         persistFrame()
         chat.orderOut(nil)
         visibilityDidChange?()
@@ -119,7 +123,10 @@ final class ResearchWindowController: NSObject, NSWindowDelegate {
     func windowDidMove(_ notification: Notification) { scheduleFrameSave() }
     func windowDidResize(_ notification: Notification) { scheduleFrameSave() }
     func windowDidEndLiveResize(_ notification: Notification) { persistFrame() }
-    func windowWillMiniaturize(_ notification: Notification) { persistFrame() }
+    func windowWillMiniaturize(_ notification: Notification) {
+        endSelectionVisibility()
+        persistFrame()
+    }
     func windowDidMiniaturize(_ notification: Notification) { visibilityDidChange?() }
     func windowDidDeminiaturize(_ notification: Notification) {
         recoverVisibleFrame()
@@ -127,6 +134,7 @@ final class ResearchWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        endSelectionVisibility()
         persistFrame()
         close()
         visibilityDidChange?()

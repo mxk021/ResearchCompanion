@@ -5,7 +5,19 @@ import Foundation
 enum ResearchZoteroSelection {
     private struct Pairing: Decodable { let token: String; let endpoint: String? }
     private struct Reply: Decodable {
-        struct Selection: Decodable { let requestId: String; let text: String; let title: String }
+        struct Selection: Decodable {
+            struct Capture: Decodable {
+                let method: String
+                let tabID: String
+                let attachmentID: Int
+                let attachmentKey: String
+            }
+            let requestId: String
+            let text: String
+            let title: String
+            let capture: Capture?
+            let location: ResearchZoteroLocation?
+        }
         let ok: Bool
         let error: String?
         let liveSelection: Selection?
@@ -49,6 +61,7 @@ enum ResearchZoteroSelection {
         guard status == 200, reply.ok, let selection = reply.liveSelection else {
             switch reply.error {
             case "NO_SELECTION": throw SelectionCaptureError.empty
+            case "SELECTION_UNVERIFIED": throw SelectionCaptureError.zoteroUnverified
             case "NO_ACTIVE_PAPER", "SOURCE_CHANGED", "PAPER_CHANGED": throw SelectionCaptureError.sourceChanged
             case "SELECTION_TOO_LARGE": throw SelectionCaptureError.zoteroTooLarge
             case "UNSUPPORTED": throw SelectionCaptureError.unsupported
@@ -57,8 +70,24 @@ enum ResearchZoteroSelection {
             }
         }
         guard UUID(uuidString: selection.requestId) == requestID else { throw SelectionCaptureError.sourceChanged }
+        guard let capture = selection.capture else { throw SelectionCaptureError.zoteroBridge }
+        guard ["pdf-canvas", "pdf-native", "document-dom"].contains(capture.method),
+              !capture.tabID.isEmpty, capture.tabID.utf16.count <= 256, capture.attachmentID > 0,
+              capture.attachmentKey.range(of: "^[A-Z0-9]{8}$", options: .regularExpression) != nil else {
+            throw SelectionCaptureError.zoteroUnverified
+        }
+        guard selection.text.utf16.count <= ResearchMaterial.maximumLength else { throw SelectionCaptureError.zoteroTooLarge }
         let title = ResearchMaterial.bounded(selection.title, limit: 512)
-        return try ResearchSelectionCapture.exactSelection(selection.text, source: "Zotero", title: title.isEmpty ? "Zotero 选区" : title)
+        var material = try ResearchSelectionCapture.exactSelection(selection.text, source: "Zotero", title: title.isEmpty ? "Zotero 选区" : title)
+        if let location = selection.location, location.attachmentKey == capture.attachmentKey, location.url != nil {
+            let pageIndex = capture.method == "document-dom" ? nil : location.physicalPage.map { $0 - 1 }
+            let label = pageIndex == nil ? nil : location.pageLabel?.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            let verifiedLabel = label.flatMap { $0.isEmpty || $0.utf16.count > 128 ? nil : $0 }
+            material.zoteroLocation = .init(library: location.library, attachmentKey: location.attachmentKey,
+                                            pageIndex: pageIndex, pageLabel: verifiedLabel)
+            material.page = verifiedLabel
+        }
+        return material
     }
 
     static func read(requestID: UUID) async throws -> ResearchMaterial {

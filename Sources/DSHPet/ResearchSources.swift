@@ -1,5 +1,7 @@
 import AppKit
 import CryptoKit
+import Darwin
+import PDFKit
 
 struct ResearchReplyContext: Decodable, Equatable {
     let question: String
@@ -20,6 +22,42 @@ struct ResearchSourceMaterial: Decodable, Equatable {
     let pageIndex: Int?
 }
 
+/// A verified attachment identity from Zotero's authenticated local reader.
+/// Its destination stays in the existing local evidence snapshot.
+struct ResearchZoteroLocation: Codable, Equatable, Sendable {
+    let library: String
+    let attachmentKey: String
+    let pageIndex: Int?
+    let pageLabel: String?
+
+    var physicalPage: Int? { pageIndex.flatMap { (0..<1_000_000).contains($0) ? $0 + 1 : nil } }
+
+    var url: URL? {
+        let group = library.split(separator: "/", omittingEmptySubsequences: false)
+        guard library == "library" || (group.count == 2 && group[0] == "groups" &&
+                  Int(group[1]).map { $0 > 0 && String($0) == group[1] } == true),
+              attachmentKey.range(of: #"^[A-Z0-9]{8}$"#, options: .regularExpression) != nil else { return nil }
+        let page = physicalPage.map { "?page=\($0)" } ?? ""
+        return URL(string: "zotero://open-pdf/\(library)/items/\(attachmentKey)\(page)")
+    }
+}
+
+/// Coverage of what was asked for. Source coordinates and content coverage
+/// are separate, even when present in the same immutable material.
+struct ResearchPDFEvidenceCheck: Codable, Equatable, Sendable {
+    enum Kind: String, Codable, Sendable {
+        case target, content, caption, definition, continuousRange, visual, location, relationship
+    }
+
+    enum Status: String, Codable, Sendable {
+        case verified, missing, ambiguous
+    }
+
+    let kind: Kind
+    let target: String
+    let status: Status
+}
+
 /// One piece of the exact evidence sent. Page numbers are physical (one-based) and
 /// bounds use the PDF page's coordinate space, including a nonzero crop-box origin.
 struct ResearchPDFSourcePosition: Codable, Equatable, Sendable {
@@ -30,6 +68,25 @@ struct ResearchPDFSourcePosition: Codable, Equatable, Sendable {
     var blockRange: NSRange? = nil
     var sourceRange: NSRange? = nil
     var ocr: Bool = false
+    // Independent PDF glyphs use their own indices. Only their region is shared.
+    var verifiedGlyphEngine: String? = nil
+}
+
+/// A named destination in the existing verified position arrays. Indices are
+/// local to one immutable source snapshot and never enter provider requests.
+struct ResearchPDFSourceGroup: Codable, Equatable, Sendable {
+    enum Role: String, Codable, Sendable { case object, caption, context }
+
+    let role: Role
+    let title: String
+    let range: Range<Int>
+
+    func positions(in primary: [ResearchPDFSourcePosition],
+                   background: [ResearchPDFSourcePosition]) -> [ResearchPDFSourcePosition]? {
+        let entries = role == .context ? background : primary
+        guard !range.isEmpty, range.lowerBound >= 0, range.upperBound <= entries.count else { return nil }
+        return Array(entries[range])
+    }
 }
 
 struct ResearchFileReference: Codable, Equatable, Sendable {
@@ -40,14 +97,39 @@ struct ResearchFileReference: Codable, Equatable, Sendable {
     struct FileStamp: Equatable, Sendable {
         let inode: UInt64
         let size: Int64
-        let modified: Date?
+        let modifiedSeconds: Int
+        let modifiedNanos: Int
+        let changedSeconds: Int
+        let changedNanos: Int
+        let device: Int32
+    }
+
+    enum VerificationError: LocalizedError {
+        case changed, unavailable, unstable
+
+        var errorDescription: String? {
+            switch self {
+            case .changed: "原文件内容已更新，本次未发送。请在读取新版本后重试。"
+            case .unavailable: "原文件目前无法读取，本次未发送。恢复文件位置或访问权限后，可用原草稿重试。"
+            case .unstable: "核验期间原文件仍在变化，本次未发送。请在文件稳定后重试。"
+            }
+        }
     }
 
     static func fileStamp(_ url: URL) throws -> FileStamp {
-        let meta = try FileManager.default.attributesOfItem(atPath: url.path)
-        guard meta[.type] as? FileAttributeType == .typeRegular, let node = meta[.systemFileNumber] as? NSNumber,
-              let size = meta[.size] as? NSNumber else { throw ResearchMaterialError.message("无法读取普通本机文件。") }
-        return FileStamp(inode: node.uint64Value, size: size.int64Value, modified: meta[.modificationDate] as? Date)
+        var attributes = stat()
+        guard url.isFileURL, lstat(url.path, &attributes) == 0,
+              attributes.st_mode & S_IFMT == S_IFREG else {
+            throw ResearchMaterialError.message("无法读取普通本机文件。")
+        }
+        return stamp(attributes)
+    }
+
+    private static func stamp(_ attributes: stat) -> FileStamp {
+        return FileStamp(inode: attributes.st_ino, size: attributes.st_size,
+                         modifiedSeconds: attributes.st_mtimespec.tv_sec, modifiedNanos: attributes.st_mtimespec.tv_nsec,
+                         changedSeconds: attributes.st_ctimespec.tv_sec, changedNanos: attributes.st_ctimespec.tv_nsec,
+                         device: attributes.st_dev)
     }
 
     static func capture(_ url: URL) throws -> Self {
@@ -56,6 +138,22 @@ struct ResearchFileReference: Codable, Equatable, Sendable {
         }
         return .init(originalPath: url.path, bookmark: try? url.bookmarkData(options: .minimalBookmark),
                      fingerprint: try digest(url))
+    }
+
+    /// Bind the PDF position search to the same bytes as its file reference.
+    /// Larger files still receive a document reference without an eager PDF parse.
+    fileprivate static func snapshotSelectionPDF(_ url: URL) throws -> (Self, Data?) {
+        let original = try fileStamp(url)
+        guard original.size <= 16 * 1_048_576 else { return (try capture(url), nil) }
+        let bytes = try withStableFile(url, matching: original) { file in
+            guard let bytes = try file.read(upToCount: Int(original.size) + 1), bytes.count == original.size else {
+                throw VerificationError.unstable
+            }
+            return bytes
+        }
+        let hash = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let reference = Self(originalPath: url.path, bookmark: try? url.bookmarkData(options: .minimalBookmark), fingerprint: hash)
+        return (reference, bytes)
     }
 
     private static func supportedType(of url: URL) -> String? {
@@ -67,27 +165,65 @@ struct ResearchFileReference: Codable, Equatable, Sendable {
         }
     }
 
-    private static func digest(_ url: URL) throws -> String {
-        let stamp = try fileStamp(url)
-        guard url.isFileURL, url.pathExtension.lowercased() == "pdf" || stamp.size <= 64 * 1_048_576 else {
-            throw ResearchMaterialError.message("请选择普通本机文件。")
+    /// Metadata changes only invalidate the fast path. The saved byte digest
+    /// still determines whether the index describes the current material.
+    func verifiedStamp(at url: URL, previous: FileStamp) throws -> FileStamp {
+        try Task.checkCancellation()
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+        guard let current = try? Self.fileStamp(url) else { throw VerificationError.unavailable }
+        if current == previous {
+            // Metadata alone can still be visible after read access is revoked.
+            try Self.withStableFile(url, matching: current) { _ in }
+            return current
         }
-        let input = try FileHandle(forReadingFrom: url)
-        defer { try? input.close() }
-        var hash = SHA256()
-        var read: Int64 = 0
-        while let bytes = try input.read(upToCount: 512 * 1024), !bytes.isEmpty {
-            try Task.checkCancellation()
-            read += Int64(bytes.count)
-            guard read <= stamp.size else {
-                throw ResearchMaterialError.message("读取时文件大小发生变化。")
+        guard try Self.digest(url, expected: current) == fingerprint else { throw VerificationError.changed }
+        return current
+    }
+
+    private static func digest(_ url: URL, expected: FileStamp? = nil) throws -> String {
+        try Task.checkCancellation()
+        let original = try expected ?? fileStamp(url)
+        guard url.isFileURL, url.pathExtension.lowercased() == "pdf" || original.size <= 64 * 1_048_576 else {
+            throw VerificationError.unavailable
+        }
+        return try withStableFile(url, matching: original) { input in
+            var hash = SHA256()
+            var read: Int64 = 0
+            while true {
+                try Task.checkCancellation()
+                let bytes: Data?
+                do { bytes = try input.read(upToCount: 512 * 1024) }
+                catch { throw VerificationError.unavailable }
+                guard let bytes, !bytes.isEmpty else { break }
+                read += Int64(bytes.count)
+                guard read <= original.size else { throw VerificationError.unstable }
+                hash.update(data: bytes)
             }
-            hash.update(data: bytes)
+            guard read == original.size else { throw VerificationError.unstable }
+            return hash.finalize().map { String(format: "%02x", $0) }.joined()
         }
-        guard read == stamp.size, try fileStamp(url) == stamp else {
-            throw ResearchMaterialError.message("读取时文件已发生变化。")
+    }
+
+    private static func withStableFile<T>(_ url: URL, matching original: FileStamp,
+                                           read: (FileHandle) throws -> T) throws -> T {
+        try Task.checkCancellation()
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard descriptor >= 0 else { throw VerificationError.unavailable }
+        let input = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? input.close() }
+        var attributes = stat()
+        guard fstat(descriptor, &attributes) == 0 else { throw VerificationError.unavailable }
+        guard attributes.st_mode & S_IFMT == S_IFREG, stamp(attributes) == original else {
+            throw VerificationError.unstable
         }
-        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+        let result = try read(input)
+        try Task.checkCancellation()
+        guard fstat(descriptor, &attributes) == 0, let pathStamp = try? fileStamp(url) else {
+            throw VerificationError.unavailable
+        }
+        guard stamp(attributes) == original, pathStamp == original else { throw VerificationError.unstable }
+        return result
     }
 
     func matches(_ url: URL) -> Bool {
@@ -149,6 +285,53 @@ enum ResearchSourceLocation {
         return url
     }
 
+    /// Enrich an already authenticated selection with a local PDF position.
+    /// The caller supplies the active document URL from the reader, never a title match.
+    static func locatePDFSelection(_ material: ResearchMaterial, at url: URL) async throws -> ResearchMaterial {
+        guard url.isFileURL, url.pathExtension.lowercased() == "pdf", material.selectionIsComplete else { return material }
+        let worker = Task.detached(priority: .userInitiated) { () throws -> ResearchMaterial in
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+            var result = material
+            guard let (file, bytes) = try? ResearchFileReference.snapshotSelectionPDF(url) else {
+                try Task.checkCancellation()
+                return result
+            }
+            result.fileReference = file
+            let selection = material.text.utf16.count
+            guard (3...4_096).contains(selection), let bytes, let pdf = PDFDocument(data: bytes),
+                  !pdf.isLocked, (1...96).contains(pdf.pageCount) else { return result }
+            try Task.checkCancellation()
+            let exact = pdf.findString(material.text, withOptions: [.literal]).filter {
+                $0.string?.utf8.elementsEqual(material.text.utf8) == true
+            }
+            try Task.checkCancellation()
+            guard exact.count == 1 else { return result }
+            let lines = exact[0].selectionsByLine()
+            guard (1...64).contains(lines.count) else { return result }
+            let positions: [ResearchPDFSourcePosition] = lines.compactMap { line in
+                guard line.pages.count == 1, let page = line.pages.first else { return nil }
+                let index = pdf.index(for: page)
+                let bounds = line.bounds(for: page).intersection(page.bounds(for: .cropBox))
+                guard index != NSNotFound, index < pdf.pageCount, !bounds.isEmpty, !bounds.isInfinite else { return nil }
+                return .init(page: index + 1, bounds: bounds)
+            }
+            guard positions.count == lines.count else { return result }
+            let pages = positions.map(\.page)
+            result.pdfPositions = positions
+            result.pdfPages = ResearchPDFIndex.pageList(pages)
+            if Set(pages).count == 1, let page = pages.first {
+                result.verifiedExcerpts = result.verifiedExcerpts?.map { excerpt in
+                    var located = excerpt
+                    located.page = page
+                    return located
+                }
+            }
+            return result
+        }
+        return try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+    }
+
     static func zoteroURL(_ material: ResearchSourceMaterial) -> URL? {
         let key = material.key.split(separator: ":", omittingEmptySubsequences: false)
         guard key.count == 4, key[0].allSatisfy({ $0.isASCII && $0.isNumber }),
@@ -165,30 +348,97 @@ enum ResearchSourceLocation {
                   let group = Int(path[1]), group > 0 {
             scope = "groups/\(group)"
         } else { return nil }
-        let page = material.pageIndex.flatMap { (0..<1_000_000).contains($0) ? "?page=\($0 + 1)" : nil } ?? ""
-        return URL(string: "zotero://open-pdf/\(scope)/items/\(key[2])\(page)")
+        return ResearchZoteroLocation(library: scope, attachmentKey: String(key[2]),
+                                      pageIndex: material.pageIndex, pageLabel: material.pageLabel).url
     }
 }
 
 /// Only captures information that is unavailable in the saved bridge prompt.
 /// File paths and exact web URLs stay local, bound by session, request, and excerpt.
 struct ResearchProvenanceStore {
+    private struct PendingSelection: Codable {
+        let id: UUID
+        let source: String
+        let title: String
+        let text: String?
+        // Leave the legacy text field absent for an unverified copy. Older
+        // clients require that field and would promote its contents to a quote.
+        let unverifiedText: String?
+        let unverifiedScope: String?
+        let url: String?
+        let page: String?
+        let file: ResearchFileReference?
+        let web: String?
+        let zotero: ResearchZoteroLocation?
+        let pdfPages: String?
+        let pdfPositions: [ResearchPDFSourcePosition]?
+
+        init(_ material: ResearchMaterial) {
+            id = material.id
+            source = material.source
+            title = material.title
+            let verified = material.verifiedExcerpts?.isEmpty == false
+            text = verified ? material.text : nil
+            unverifiedText = verified ? nil : material.text
+            unverifiedScope = verified ? nil : material.scope
+            url = material.url
+            page = material.page
+            file = material.fileReference
+            web = material.localWebURL
+            zotero = material.zoteroLocation
+            pdfPages = material.pdfPages
+            pdfPositions = material.pdfPositions
+        }
+
+        func material() throws -> ResearchMaterial {
+            guard let body = text ?? unverifiedText, (text == nil) != (unverifiedText == nil) else {
+                throw ResearchMaterialError.message("本地选区记录无法读取。")
+            }
+            var value = try ResearchMaterial.selection(body, source: source, title: title, url: url)
+            value.id = id
+            value.page = page
+            value.fileReference = file
+            value.localWebURL = web
+            value.zoteroLocation = zotero
+            value.pdfPages = pdfPages
+            value.pdfPositions = pdfPositions
+            if unverifiedText != nil {
+                value.verifiedExcerpts = nil
+                value.scope = unverifiedScope ?? "选区 · 出处未独立核验"
+            } else if let pdfPages, let page = Int(pdfPages), page > 0, let range = value.verifiedExcerpts?.first?.range {
+                value.verifiedExcerpts = [.init(kind: .selection, range: range, title: title, page: page,
+                                                doi: ResearchVerifiedExcerpt.doi(from: url.flatMap(URL.init(string:))))]
+            }
+            return value
+        }
+    }
+
     struct LocalReference: Codable {
         let title: String
         let textFingerprint: String
-        let file: ResearchFileReference?
+        var file: ResearchFileReference?
         let web: String?
+        var zotero: ResearchZoteroLocation? = nil
         var pdfPages: String? = nil
         var backgroundFile: ResearchFileReference? = nil
         var backgroundPages: String? = nil
         var pdfPositions: [ResearchPDFSourcePosition]? = nil
         var backgroundPositions: [ResearchPDFSourcePosition]? = nil
         var positionDigest: String? = nil
+        var objectLabels: [String]? = nil
+        var imageFingerprints: [String]? = nil
+        var sourceGroups: [ResearchPDFSourceGroup]? = nil
+        var verifiedExcerpts: [ResearchVerifiedExcerpt]? = nil
+        var questionFingerprint: String? = nil
+        var hasPartialCaption: Bool? = nil
+        var evidenceChecks: [ResearchPDFEvidenceCheck]? = nil
     }
 
     private struct Positions: Codable {
         let primary: [ResearchPDFSourcePosition]?
         let background: [ResearchPDFSourcePosition]?
+        let groups: [ResearchPDFSourceGroup]?
+        let verifiedExcerpts: [ResearchVerifiedExcerpt]?
     }
 
     init(root: URL) { self.root = root }
@@ -227,22 +477,63 @@ struct ResearchProvenanceStore {
         return parent.appendingPathComponent(fingerprint(requestID) + ".json", isDirectory: false)
     }
 
-    func record(session: String, requestID: String, material: ResearchMaterial) throws {
+    // Reuse the same DSH/workspace/session identity as the file association.
+    // A capture remains local, separate from the immutable sources of sent turns.
+    private func pendingSelectionLocation(_ key: String, create: Bool) throws -> URL? {
+        guard try checkedDirectory(root, create: create) else { return nil }
+        return root.appendingPathComponent(fingerprint(key) + ".selection.json")
+    }
+
+    func pendingSelection(_ key: String) -> ResearchMaterial? {
+        guard let url = try? pendingSelectionLocation(key, create: false),
+              let meta = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]),
+              meta.isRegularFile == true, meta.isSymbolicLink != true,
+              (meta.fileSize ?? Int.max) <= 8 * ResearchMaterial.localSelectionLimit,
+              let data = try? Data(contentsOf: url),
+              let snapshot = try? JSONDecoder().decode(PendingSelection.self, from: data) else { return nil }
+        return try? snapshot.material()
+    }
+
+    func savePendingSelection(_ material: ResearchMaterial, for key: String) throws {
+        guard let url = try pendingSelectionLocation(key, create: true) else { return }
+        try JSONEncoder().encode(PendingSelection(material)).write(to: url, options: [.atomic])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    func removePendingSelection(_ key: String) throws {
+        guard let url = try pendingSelectionLocation(key, create: false),
+              FileManager.default.fileExists(atPath: url.path) else { return }
+        try FileManager.default.removeItem(at: url)
+    }
+
+    func record(session: String, requestID: String, material: ResearchMaterial, question: String? = nil) throws {
         let web = material.localWebURL == material.url ? nil : material.localWebURL
-        guard material.fileReference != nil || web != nil || material.backgroundFile != nil else { return }
+        let excerpts = material.verifiedExcerpts?.filter { $0.text(in: material.text) != nil }
+        guard material.fileReference != nil || web != nil || material.zoteroLocation?.url != nil || material.backgroundFile != nil ||
+              excerpts?.isEmpty == false else { return }
         guard let url = try location(session: session, requestID: requestID, create: true) else { return }
         guard !FileManager.default.fileExists(atPath: url.path) else { return } // Retry keeps its original capture.
+        let imageFingerprints = material.documentImages.map {
+            SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined()
+        }
+        let partialCaption = excerpts?.contains { $0.kind == .caption && $0.partial == true } == true
         let reference = LocalReference(title: material.title, textFingerprint: fingerprint(material.text),
-                                       file: material.fileReference, web: web, pdfPages: material.pdfPages,
+                                       file: material.fileReference, web: web, zotero: material.zoteroLocation, pdfPages: material.pdfPages,
                                        backgroundFile: material.backgroundFile, backgroundPages: material.backgroundPages,
-                                       pdfPositions: material.pdfPositions, backgroundPositions: material.backgroundPositions)
+                                       pdfPositions: material.pdfPositions, backgroundPositions: material.backgroundPositions,
+                                       objectLabels: material.objectLabels, imageFingerprints: imageFingerprints.isEmpty ? nil : imageFingerprints,
+                                       sourceGroups: material.sourceGroups, verifiedExcerpts: excerpts,
+                                       questionFingerprint: question.map { fingerprint($0.trimmingCharacters(in: .whitespacesAndNewlines)) },
+                                       hasPartialCaption: partialCaption ? true : nil,
+                                       evidenceChecks: material.evidenceChecks)
         try write(reference, to: url)
     }
 
     private func write(_ reference: LocalReference, to url: URL) throws {
         var header = reference
-        if reference.pdfPositions != nil || reference.backgroundPositions != nil {
-            let locations = Positions(primary: reference.pdfPositions, background: reference.backgroundPositions)
+        if reference.pdfPositions != nil || reference.backgroundPositions != nil || reference.verifiedExcerpts?.isEmpty == false {
+            let locations = Positions(primary: reference.pdfPositions, background: reference.backgroundPositions,
+                                      groups: reference.sourceGroups, verifiedExcerpts: reference.verifiedExcerpts)
             let data = try JSONEncoder().encode(locations)
             let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
             let sidecar = url.deletingLastPathComponent().appendingPathComponent(digest + ".positions")
@@ -250,6 +541,8 @@ struct ResearchProvenanceStore {
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: sidecar.path)
             header.pdfPositions = nil
             header.backgroundPositions = nil
+            header.sourceGroups = nil
+            header.verifiedExcerpts = nil
             header.positionDigest = digest
         }
         // Publish the small, backwards-readable header after its immutable position list.
@@ -274,9 +567,21 @@ struct ResearchProvenanceStore {
                let positions = try? JSONDecoder().decode(Positions.self, from: bytes) {
                 value.pdfPositions = positions.primary
                 value.backgroundPositions = positions.background
+                value.sourceGroups = positions.groups
+                value.verifiedExcerpts = positions.verifiedExcerpts
             }
         }
         return value
+    }
+
+    func originalQuestion(in reply: ResearchReplyContext, reference: LocalReference?) -> String? {
+        guard let digest = reference?.questionFingerprint else { return reply.question }
+        if fingerprint(reply.question) == digest { return reply.question }
+        // Existing bridges can prepend one instruction line for translate/explain.
+        // Remove an envelope prefix only if the remaining bytes match this turn.
+        guard let divider = reply.question.firstIndex(of: "\n") else { return nil }
+        let question = String(reply.question[reply.question.index(after: divider)...])
+        return fingerprint(question) == digest ? question : nil
     }
 
     func relink(session: String, reply: ResearchReplyContext, file: URL, background: Bool = false) throws {
@@ -290,10 +595,9 @@ struct ResearchProvenanceStore {
         guard replacement.fingerprint == previousFile.fingerprint else {
             throw ResearchMaterialError.message("重新定位时文件内容发生了变化。")
         }
-        let local = LocalReference(title: prior.title, textFingerprint: prior.textFingerprint,
-                                   file: background ? prior.file : replacement, web: prior.web, pdfPages: prior.pdfPages,
-                                   backgroundFile: background ? replacement : prior.backgroundFile, backgroundPages: prior.backgroundPages,
-                                   pdfPositions: prior.pdfPositions, backgroundPositions: prior.backgroundPositions, positionDigest: prior.positionDigest)
+        var local = prior
+        if background { local.backgroundFile = replacement }
+        else { local.file = replacement }
         try write(local, to: recordURL)
     }
 

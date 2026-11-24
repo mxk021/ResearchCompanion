@@ -1,6 +1,5 @@
 {
-  "version": "0.2.11",
-  "build": "23",
+  "version": "0.3.0",
   "bundleIdentifier": "com.local.research-companion",
   "minimumMacOS": "14.0"
 }

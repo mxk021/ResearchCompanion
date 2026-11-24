@@ -13,7 +13,8 @@ POLICY = {
 }
 DENY_PART = {".dsh", "PrivateProvenance", "node_modules", ".DS_Store", ".env",
              "Resources/Pet", "docs/local", "docs/assets", "experiments", "dist", ".build"}
-DENY_SUFFIX = {".dmg", ".zip", ".tgz", ".xpi", ".pdf", ".log", ".p12", ".key", ".p8", ".pem", ".sqlite", ".db", ".plist"}
+DENY_PATH = {"scripts/check-paper-sample.json", "scripts/install-retirement.py", "tests/retirement-install-finalize.py"}
+DENY_SUFFIX = {".dmg", ".zip", ".tgz", ".xpi", ".pdf", ".log", ".p12", ".pfx", ".key", ".p8", ".pem", ".sqlite", ".db", ".plist"}
 BINARY = {".woff", ".woff2", ".ttf", ".png"}
 
 def git(*args):
@@ -27,7 +28,7 @@ def inspect_tree(entries, seen):
         header, name = entry.split(b"\t", 1)
         mode, _, oid = header.decode().split()
         path = PurePosixPath(name.decode())
-        if mode not in ("100644", "100755") or path.suffix in DENY_SUFFIX or any(
+        if mode not in ("100644", "100755") or str(path) in DENY_PATH or path.suffix in DENY_SUFFIX or any(
             item in DENY_PART for item in (*path.parts, *(str(p) for p in path.parents))
         ):
             print(f"{path}: excluded path/type")

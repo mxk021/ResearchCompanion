@@ -32,6 +32,7 @@ import { ZoteroContextProvider, researchPrompt, DEFAULT_PERSONA, noMemory } from
 import {
   CommandBridge,
   type ImageAttachmentLimits,
+  type PromptImage,
   type DshPetTask,
   type DshPetWorkspace,
 } from './CommandBridge.js'
@@ -152,10 +153,26 @@ export function apply(ctx: Context): void {
   const sessionStates = new Map<string, SessionMoodState>()
   const unconfirmedSessions = new Set<string>()
   const sessionOperations = new Map<string, Promise<void>>()
-  const pendingModelRuns = new Map<string, { requestId: string; selection: ResearchSelection; turn?: number }>()
+  type VerifiedCrop = { attachmentId: string; source: string; normalized: string }
+  type ImageRef = { attachmentId: string }
+  type DocumentAttachmentStore = {
+    readImage(ref: unknown, signal: AbortSignal): Promise<{ data: Uint8Array }>
+  }
+  type ImageUploadRuntime = {
+    uploadImageStream(request: {sessionId: string; data: AsyncIterable<Uint8Array>; mediaType: string;
+      name?: string; signal: AbortSignal}): Promise<{receiptId: Extract<PromptContentPart,{type:'file'}>['receiptId']; image: ImageRef}>
+  }
+  const attachmentStore = ctx.attachments as unknown as DocumentAttachmentStore
+  type BridgeTiming = {
+    prepareMs: number; normalizeMs: number; scheduleMs: number; providerFirstTextMs?: number; providerFinishMs?: number
+  }
+  const pendingModelRuns = new Map<string, { requestId: string; selection: ResearchSelection; turn?: number; crops?: VerifiedCrop[]; verifiedText?: string;
+    requestedAt?: number; timing?: { prepareMs: number; normalizeMs: number; queueAt: number } }>()
   // One non-durable fingerprint per recent session, observable only by exact
   // request ID. This is the DSH adapter-entry request, not a server receipt.
-  const dispatchEvidence = new Map<string, {requestId: string; selection: ResearchSelection; sha256: string; utf16Length: number}>()
+  const dispatchEvidence = new Map<string, {requestId: string; selection: ResearchSelection; sha256: string; utf16Length: number;
+    images?: string[]; sourceImages?: string[]; requestedAt?: number; dispatchedAt?: number; firstTextAt?: number; finishedAt?: number;
+    timing?: BridgeTiming; dispatchTick?: number}>()
   const recentModelReceipts = new Map<string, { requestId: string; selection: ResearchSelection }>()
   const streams = new Map<string, { stream: ResearchStream; revision: number; publishTimer?: ReturnType<typeof setTimeout> }>()
   let streamRevision = 0
@@ -471,27 +488,58 @@ export function apply(ctx: Context): void {
     return next()
   })
 
-  ctx.on('llm/stream', (request, next) => {
+  ctx.on('llm/stream', async function* (request, next) {
     const sessionId = request.sessionId
     const pin = sessionId && pendingModelRuns.get(sessionId)
-    if (sessionId && pin && request.provider === pin.selection.provider && request.model === pin.selection.model) {
+    if (sessionId && pin) {
       const message = request.messages.find(message => message.role === 'user' &&
         message.source && 'rpcId' in message.source && message.source.rpcId === pin.requestId)
       const selection = decodeResearchSelection(request)
-      if (message && selection) {
+      if (message && pin.verifiedText && !sameResearchSelection(pin.selection, selection)) {
+        throw new Error('模型入口与本轮核对的模型及推理强度不一致。')
+      }
+      if (message && selection && sameResearchSelection(pin.selection, selection)) {
+        let matched = false
         for (const block of message.content) {
           if (block.type !== 'text') continue
           const evidence = researchPromptMetadata(block.text)?.material
           if (evidence) {
-            dispatchEvidence.set(sessionId, {requestId:pin.requestId, selection,
-              sha256:createHash('sha256').update(evidence.text).digest('hex'), utf16Length:evidence.text.length})
-            if (dispatchEvidence.size > 128) dispatchEvidence.delete(dispatchEvidence.keys().next().value!)
+            matched = true
+            const sha256 = createHash('sha256').update(evidence.text).digest('hex')
+            let images: string[] | undefined
+            if (pin.verifiedText && sha256 !== pin.verifiedText) throw new Error('模型入口的原文与本轮快照不一致。')
+            if (pin.crops?.length) {
+              const attached = message.content.filter(part => part.type === 'image' && !('offloaded' in part && part.offloaded))
+              if (attached.length !== pin.crops.length || typeof attachmentStore.readImage !== 'function') {
+                throw new Error('科研材料或实际裁图数量与本轮快照不一致。')
+              }
+              images = await Promise.all(attached.map(async (part, index) => {
+                if (!('attachment' in part) || (part.attachment as ImageRef).attachmentId !== pin.crops?.[index]?.attachmentId) {
+                  throw new Error('模型入口缺少本轮归一化后的裁图引用。')
+                }
+                const item = await attachmentStore.readImage(part.attachment, request.signal ?? AbortSignal.timeout(8_000))
+                return createHash('sha256').update(item.data).digest('hex')
+              }))
+              if (images.some((digest, index) => digest !== pin.crops?.[index]?.normalized)) {
+                throw new Error('模型入口的裁图与本轮核对的原页不同。')
+              }
+            }
+            if (dispatchEvidence.get(sessionId)?.requestId !== pin.requestId) {
+              const dispatchTick = performance.now()
+              dispatchEvidence.set(sessionId, {requestId:pin.requestId, selection, sha256, utf16Length:evidence.text.length,
+                ...(images ? {images, sourceImages: pin.crops?.map(crop => crop.source)} : {}),
+                ...(pin.timing ? {dispatchTick, timing: {prepareMs: pin.timing.prepareMs,
+                  normalizeMs: pin.timing.normalizeMs, scheduleMs: dispatchTick - pin.timing.queueAt}} : {}),
+                ...(pin.requestedAt ? {requestedAt: pin.requestedAt, dispatchedAt: Date.now()} : {})})
+              if (dispatchEvidence.size > 128) dispatchEvidence.delete(dispatchEvidence.keys().next().value!)
+            }
             break
           }
         }
+        if (!matched && pin.verifiedText) throw new Error('模型入口未找到本轮核对的文档原文。')
       }
     }
-    return next()
+    yield* next()
   })
   ctx.on('session/created', () => { scheduleTaskRefresh() })
   ctx.on('session/disposed', session => {
@@ -511,6 +559,23 @@ export function apply(ctx: Context): void {
   }) => {
     const sessionId = String(agent.session.id)
     if (!isResearchWorkspace(workspaceForSession(sessionId) ?? '')) return
+    const receipt = dispatchEvidence.get(sessionId)
+    if (receipt?.dispatchedAt && !receipt.finishedAt) {
+      const visible = frame.chunk?.type === 'text-delta' ? frame.chunk.text :
+        frame.chunk?.block?.type === 'text' ? frame.chunk.block.text : undefined
+      if (visible?.trim() && !receipt.firstTextAt) {
+        receipt.firstTextAt = Date.now()
+        if (receipt.timing && receipt.dispatchTick !== undefined) {
+          receipt.timing.providerFirstTextMs = performance.now() - receipt.dispatchTick
+        }
+      }
+      if (frame.type === 'end' && frame.outcome?.eventType === 'assistant/message') {
+        receipt.finishedAt = Date.now()
+        if (receipt.timing && receipt.dispatchTick !== undefined) {
+          receipt.timing.providerFinishMs = performance.now() - receipt.dispatchTick
+        }
+      }
+    }
     let active = streams.get(sessionId)
     if (frame.type === 'start') {
       if (active?.publishTimer) clearTimeout(active.publishTimer)
@@ -601,6 +666,10 @@ export function apply(ctx: Context): void {
     const value = (ctx.workspaceRegistry as unknown as { archivedSessionIds?: readonly string[] }).archivedSessionIds
     return Array.isArray(value) ? value : undefined
   }
+  const imageUploads = () => {
+    const runtime = optionalService('fileUploads') as ImageUploadRuntime | undefined
+    return typeof runtime?.uploadImageStream === 'function' && typeof attachmentStore.readImage === 'function' ? runtime : undefined
+  }
   const planningRuntime = () => optionalService('llm') as (ResearchModelRuntime & PlanningRuntime) | undefined
   const llm = (): ResearchModelRuntime | undefined => optionalService('llm') as ResearchModelRuntime | undefined
   const platformDefault = (): ResearchSelection | undefined => decodeResearchSelection(
@@ -653,7 +722,7 @@ export function apply(ctx: Context): void {
 
   const admitResearchPrompt = async (request: {
     sessionId: string; requestId: string; expectedSelection?: ResearchSelection
-  }, content: PromptContentPart[]) => {
+  }, content: PromptContentPart[], document?: {text: string; crops: readonly PromptImage[]}, receivedAt = performance.now()) => {
     const prior = recentModelReceipts.get(request.sessionId)
     if (prior?.requestId === request.requestId) {
       return { accepted: true as const, sessionId: request.sessionId, selection: prior.selection }
@@ -666,13 +735,50 @@ export function apply(ctx: Context): void {
     if (request.expectedSelection && !sameResearchSelection(original, request.expectedSelection)) {
       throw new Error('会话模型已变化，请核对右上方的模型及强度后重新发送。')
     }
+    const requestedAt = Date.now()
     const selection = await verifyResearchSelection(llm(), original)
+    if (document?.crops.length) {
+      const info = await llm()?.resolveModelInfo(selection.provider, selection.model)
+      if (info?.inputModalities?.includes('image') !== true) {
+        throw new Error('当前会话模型没有声明支持图片。科研助手没有换模型或发送裁图。')
+      }
+    }
     await requireIdle(request.sessionId)
     if (!sameResearchSelection(original, decodeResearchSelection(agent.model?.current?.()))) {
       throw new Error('会话模型已变化，请刷新后重新发送。')
     }
+    // The native, session-scoped upload receipt names the crop after DSH's
+    // normalization. The prompt consumes that receipt without re-encoding it.
+    const crops: VerifiedCrop[] = []
+    const normalizeStart = performance.now()
+    let normalizeMs = 0
+    if (document?.crops.length) {
+      const uploader = imageUploads()
+      if (!uploader) throw new Error('当前 DSH 未提供可校验的原页裁图上传。')
+      const signal = AbortSignal.timeout(12_000)
+      for (const image of document.crops) {
+        const bytes = Buffer.from(image.data,'base64')
+        const {receiptId, image: ref} = await uploader.uploadImageStream({
+          sessionId: request.sessionId, mediaType: image.mediaType, name: image.name, signal,
+          data: (async function* () { yield bytes })(),
+        })
+        const normalized = await attachmentStore.readImage(ref, signal)
+        crops.push({attachmentId: ref.attachmentId, source:createHash('sha256').update(bytes).digest('hex'),
+          normalized:createHash('sha256').update(normalized.data).digest('hex')})
+        content.push({type:'file', receiptId})
+      }
+      normalizeMs = performance.now() - normalizeStart
+      await requireIdle(request.sessionId)
+      if (!sameResearchSelection(original, decodeResearchSelection(agent.model?.current?.()))) {
+        throw new Error('核对原页裁图期间模型已变化，请重新发送。')
+      }
+    }
     if (!sameResearchSelection(original, selection)) installSessionSelection(agent, selection)
-    const pin = { requestId: request.requestId, selection }
+    const verifiedText = document ? createHash('sha256').update(document.text).digest('hex') : undefined
+    const queueAt = performance.now()
+    const pin = { requestId: request.requestId, selection, requestedAt,
+      timing: {prepareMs: Math.max(0, queueAt - receivedAt - normalizeMs), normalizeMs, queueAt},
+      ...(document ? {verifiedText, crops} : {}) }
     pendingModelRuns.set(request.sessionId, pin)
     try {
       await ctx.sessionController.prompt({ requestId: request.requestId as never, sessionId: request.sessionId as never,
@@ -706,6 +812,7 @@ export function apply(ctx: Context): void {
       ...(resolveAvailable && typeof skills?.list === 'function' && typeof commands?.list === 'function' ? ['skillCandidates'] : []),
       ...(typeof (ctx.sessionController as unknown as { projections?: unknown }).projections === 'function' ? ['taskPreview'] : []),
       'researchContext', 'researchPrompt', 'conversation', 'researchStream', 'researchMaterial',
+      ...(imageUploads() ? ['researchDocumentImages'] : []),
       ...(researchSessionQuery() !== undefined && archiveSessionIDs() !== undefined ? ['researchHistory'] : []),
       ...(retirement.available(optionalService) ? ['researchSafeDelete','research.retirement.offline.v1'] : []),
       ...(retirement.onlineAvailable(optionalService) ? ['research.retirement.online.v1'] : []),
@@ -843,9 +950,10 @@ export function apply(ctx: Context): void {
       const selection = decodeResearchSelection(projection.values?.modelSelection?.next) ?? lastUsed ?? platformDefault()
       const lastEnd = (result.records ?? []).slice().sort((a: any, b: any) => ((b.event ?? b).seq ?? -1) - ((a.event ?? a).seq ?? -1)).find((r: any) => (r.event ?? r).type === 'turn/end')
       const reason = (lastEnd?.event ?? lastEnd)?.data?.reason
+      const proof = verifyRequestId ? dispatchEvidence.get(sessionId) : undefined
+      const publicProof = proof?.requestId === verifyRequestId && proof ? { ...proof, dispatchTick: undefined } : null
       return { ...(knownHistory === historyRevision ? { historyUnchanged: true } : { messages }),
-        ...(verifyRequestId ? {dispatchEvidence: dispatchEvidence.get(sessionId)?.requestId === verifyRequestId
-          ? dispatchEvidence.get(sessionId) : null} : {}),
+        ...(verifyRequestId ? {dispatchEvidence: publicProof} : {}),
         historyRevision, hasMore: result.hasMore === true, cursor: result.cursor,
         running: state.running === true || (typeof state.running === 'object' && state.running?.active === true)
           || (state.queue?.length ?? 0) > 0,
@@ -853,16 +961,22 @@ export function apply(ctx: Context): void {
         selection, lastUsed, stream: visibleStream(sessionId, result.cursor),
         ...(reason?.kind === 'error' ? { error: JSON.stringify(reason) } : {}) }
     },
-    researchPrompt: request => serializeSession(request.sessionId, async () => {
-      requireWorkspaceSession(request.workspaceId, request.sessionId)
-      if (request.includeContext && !request.contextKey && !request.material) throw new Error('请先预览所选材料，再选择带入原文。普通聊天可关闭带入材料。')
-      const context = request.includeContext ? request.material ?? await contextProvider.current() : null
-      if (request.contextKey && context?.key !== request.contextKey) throw new Error('当前 Zotero 原文或选区已变化，请核对预览再发。')
-      // The memory seam is disabled; no invisible retention or autonomous actions.
-      await noMemory.recall(request.text)
-      const text = researchPrompt(request.text, request.mode, context, await persona())
-      return admitResearchPrompt(request, [{ type: 'text', text }])
-    }),
+    researchPrompt: request => {
+      const receivedAt = performance.now()
+      return serializeSession(request.sessionId, async () => {
+        requireWorkspaceSession(request.workspaceId, request.sessionId)
+        if (request.includeContext && !request.contextKey && !request.material) throw new Error('请先预览所选材料，再选择带入原文。普通聊天可关闭带入材料。')
+        const context = request.includeContext ? request.material ?? await contextProvider.current() : null
+        if (request.contextKey && context?.key !== request.contextKey) throw new Error('当前 Zotero 原文或选区已变化，请核对预览再发。')
+        // The memory seam is disabled; no invisible retention or autonomous actions.
+        await noMemory.recall(request.text)
+        const text = researchPrompt(request.text, request.mode, context, await persona())
+        const crops = request.documentImages
+        return admitResearchPrompt(request, [{ type: 'text', text }],
+          context && (crops.length || context.scope?.startsWith('文档对象')) ? {text: context.text, crops} : undefined,
+          receivedAt)
+      })
+    },
     capabilities: optionalCapabilities,
     fileCandidates: async ({ workspaceId, sessionId, query }) => {
       requireWorkspaceSession(workspaceId, sessionId)

@@ -1,7 +1,7 @@
 /* Zotero 10 privileged bootstrap; no outbound network, database writes, or model access. */
 if (typeof Zotero === "undefined") { var Zotero; }
 const MAX_FULLTEXT_BYTES = 512000;
-const BRIDGE_VERSION = "0.1.4";
+const BRIDGE_VERSION = "0.1.6";
 let bridgeCore;
 let installedEndpoint;
 let pairingToken;

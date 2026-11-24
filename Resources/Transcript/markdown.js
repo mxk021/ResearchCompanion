@@ -88,10 +88,46 @@
     return false;
   }
 
+  // CommonMark does not close ** after punctuation when a letter follows it
+  // immediately. Match the remaining double stars in compact prose labels
+  // such as **原文：**正文. Standard pairs, code, and escaped stars stay intact.
+  function tightStrongLabels(state) {
+    if (!/[:：]\*\*[\p{L}\p{N}]/u.test(state.src)) return;
+    function pair(delimiters) {
+      if (!delimiters || delimiters.length < 4) return;
+      const matched = new Set();
+      for (let index = 0; index < delimiters.length; index++) {
+        const end = delimiters[index].end;
+        if (end >= 0) { matched.add(index); matched.add(end); }
+      }
+      for (let index = 0; index + 3 < delimiters.length; index++) {
+        const [open, inner, close, outer] = delimiters.slice(index, index + 4);
+        if (!open.open || !inner.open || close.close || outer.close ||
+            inner.token !== open.token + 1 || outer.token !== close.token + 1 ||
+            close.token <= inner.token + 1) continue;
+        const before = state.tokens[close.token - 1];
+        const after = state.tokens[outer.token + 1];
+        if (before?.type !== 'text' || !/[:：]$/u.test(before.content) ||
+            after?.type !== 'text' || !/^[\p{L}\p{N}]/u.test(after.content) ||
+            [open, inner, close, outer].some((item, offset) =>
+              item.marker !== 42 || item.length !== 2 || matched.has(index + offset))) continue;
+        open.end = index + 3;
+        inner.end = index + 2;
+        index += 3;
+      }
+    }
+    pair(state.delimiters);
+    for (const token of state.tokens_meta) pair(token?.delimiters);
+  }
+
   function create(markdownIt, katex) {
     const md = markdownIt({ html: false, linkify: false });
     const escape = md.utils.escapeHtml;
+    // History and stream deltas often repeat the same small expressions.
+    // Cache only successful, bounded output, leaving source delimiters on the token.
+    const mathCache = new Map();
     md.inline.ruler.before('escape', 'research_math', inlineMath);
+    md.inline.ruler2.before('emphasis', 'research_tight_strong_labels', tightStrongLabels);
     md.block.ruler.before('fence', 'research_math', blockMath, { alt: ['paragraph', 'blockquote', 'list'] });
     // Output stays text even for explicitly linked images, including remote
     // tracking images in model output.
@@ -102,13 +138,20 @@
     function renderMath(tokens, index) {
       const { content, meta } = tokens[index];
       const escapedText = escape(content);
-      let rendered;
+      const key = (meta.display ? 'd' : 'i') + content;
+      let rendered = mathCache.get(key);
       try {
-        if (content.length > 8000) throw new RangeError();
-        rendered = katex.renderToString(content, {
-          displayMode: meta.display, output: 'htmlAndMathml', throwOnError: true,
-          trust: false, strict: 'warn', maxExpand: 200, maxSize: 12
-        });
+        if (rendered === undefined) {
+          if (content.length > 8000) throw new RangeError();
+          rendered = katex.renderToString(content, {
+            displayMode: meta.display, output: 'htmlAndMathml', throwOnError: true,
+            trust: false, strict: 'warn', maxExpand: 200, maxSize: 12
+          });
+          if (content.length <= 512 && rendered.length <= 8192) {
+            if (mathCache.size === 64) mathCache.delete(mathCache.keys().next().value);
+            mathCache.set(key, rendered);
+          }
+        }
       } catch (_) {
         rendered = `<code class="math-fallback">${escape(meta.raw)}</code>`;
       }

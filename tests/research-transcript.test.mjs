@@ -10,6 +10,28 @@ for (const relative of ['vendor/katex/katex.min.js', 'vendor/markdown-it/browser
 }
 const markdown = context.createResearchMarkdown(context.markdownit, context.katex);
 
+test('tight bold labels render after a CJK or ASCII colon without altering original Markdown', () => {
+    const incomplete = '**原文的论点：';
+    const complete = '**原文的论点：**梯度下降等一阶方法只利用梯度信息。';
+    assert.equal(markdown.render(incomplete).trim(), '<p>**原文的论点：</p>');
+    assert.equal(markdown.render(complete).trim(), '<p><strong>原文的论点：</strong>梯度下降等一阶方法只利用梯度信息。</p>');
+    assert.match(markdown.render('**Proof:**见下文 *推导*。'), /<strong>Proof:<\/strong>见下文 <em>推导<\/em>/);
+    assert.match(markdown.render('[**注意：**正文](https://example.net/)'), /<a href="https:\/\/example.net\/".*><strong>注意：<\/strong>正文<\/a>/);
+    assert.match(markdown.render('**例：**直接使用 $x_i^2$。'), /<strong>例：<\/strong>直接使用 <span class="math math-inline"/);
+    assert.equal(markdown.render(String.raw`\*\*例：\*\*正文`).trim(), '<p>**例：**正文</p>');
+    assert.equal(markdown.render('`**例：**正文`').trim(), '<p><code>**例：**正文</code></p>');
+    assert.match(markdown.render('```md\n**例：**正文\n```'), /<code class="language-md">\*\*例：\*\*正文/);
+    assert.equal(markdown.render('**头**：**后文**').trim(), '<p><strong>头</strong>：<strong>后文</strong></p>');
+    assert.equal(markdown.render('**Reason:**Details**').trim(), '<p>**Reason:<strong>Details</strong></p>');
+});
+
+test('standard headings, numbered lists and tables remain Markdown', () => {
+    const html = markdown.render('# 试验\n\n1. 原文\n2. *proof*\n\n| 量 | 值 |\n| --- | --- |\n| $x_i$ | 2 |');
+    assert.match(html, /<h1>试验<\/h1>/);
+    assert.match(html, /<ol>\s*<li>原文<\/li>\s*<li><em>proof<\/em><\/li>/);
+    assert.match(html, /<table>[\s\S]*<td><span class="math math-inline"[\s\S]*<td>2<\/td>/);
+});
+
 test('KaTeX handles four delimiters, CJK Markdown, matrix and alignment', () => {
     const source = [
         String.raw`中文 **求和** $x_i^2$，以及 \(\frac{\alpha}{\sqrt{x}}\)。`,
@@ -28,6 +50,19 @@ test('KaTeX handles four delimiters, CJK Markdown, matrix and alignment', () => 
     assert.match(html, /中文 <strong>求和<\/strong>/);
     assert.match(html, /<li>列表<\/li>/);
     assert.doesNotMatch(html, /math-fallback/);
+});
+
+test('repeated formulas reuse rendering while preserving their own delimiters and mode', () => {
+    let renders = 0;
+    const cached = context.createResearchMarkdown(context.markdownit, {
+        renderToString(...args) { renders++; return context.katex.renderToString(...args); },
+    });
+    const inline = cached.render(String.raw`$x^2$ and \(x^2\)`);
+    assert.equal(renders, 1);
+    assert.match(inline, /data-markdown="\$x\^2\$"/);
+    assert.match(inline, /data-markdown="\\\(x\^2\\\)"/);
+    assert.match(cached.render('$$\nx^2\n$$'), /class="math math-display"/);
+    assert.equal(renders, 2);
 });
 
 test('plain money, code, incomplete and invalid formulas retain their meaning', () => {

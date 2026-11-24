@@ -2,7 +2,7 @@ import Foundation
 
 /// The bridge only selects a read. Text, file identity and coordinates are supplied by the local index.
 struct ResearchDocumentPlan: Decodable {
-    enum Action: String, Decodable { case range, pages, search, selection, combined, whole, clarify, useEvidence }
+    enum Action: String, Decodable { case range, pages, search, selection, combined, whole, clarify, useEvidence, object }
     let action: Action
     var start: String?
     var end: String?
@@ -11,6 +11,8 @@ struct ResearchDocumentPlan: Decodable {
     var excludeStart: Bool?
     var excludeEnd: Bool?
     var query: String?
+    var reference: String?
+    var needsMore: Bool?
     var question: String?
 
     private static func quotedLiterals(in input: String) -> [String] {
@@ -31,7 +33,7 @@ struct ResearchDocumentPlan: Decodable {
     }
 
     func read(index: ResearchPDFIndex, question input: String, selection: ResearchMaterial?,
-              requireSelection: Bool, verifiedFeedback: String? = nil) throws -> [ResearchMaterial] {
+              requireSelection: Bool, verifiedFeedback: String? = nil, chosenRangeID: String? = nil) throws -> [ResearchMaterial] {
         try Task.checkCancellation()
         switch action {
         case .range:
@@ -50,7 +52,8 @@ struct ResearchDocumentPlan: Decodable {
                 throw ResearchMaterialError.message("无法把两个端点与问题或本次选区中的原句核对。")
             }
             return try index.readRange(start: a, end: b, withinPages: pageRange(in: index),
-                                       includeStart: excludeStart != true, includeEnd: excludeEnd != true)
+                                       includeStart: excludeStart != true, includeEnd: excludeEnd != true,
+                                       selectionHint: selection?.text, chosenRangeID: chosenRangeID)
         case .pages:
             guard let pages = try pageRange(in: index) else { throw ResearchMaterialError.message("缺少所请求的文件页序。") }
             let result = try index.readPages(pages)
@@ -71,6 +74,8 @@ struct ResearchDocumentPlan: Decodable {
                 return [try selection.withBackgroundEvidence(evidence)]
             }
             return [evidence]
+        case .object:
+            throw ResearchMaterialError.message("未通过本机文档对象核验。")
         case .selection:
             guard !requireSelection, let selection else { throw ResearchMaterialError.message("只读取选区无法满足本次请求。") }
             guard selection.text.utf16.count <= ResearchMaterial.maximumLength else { throw ResearchMaterialError.message(ResearchMaterial.oversizeMessage) }
@@ -84,15 +89,18 @@ struct ResearchDocumentPlan: Decodable {
     static func accumulated(_ prior: ResearchMaterial?, _ next: ResearchMaterial) throws -> ResearchMaterial {
         guard let prior, prior.text != next.text, prior.source == "PDF 文件", next.source == prior.source,
               prior.fileReference == next.fileReference else { return next }
-        let text = prior.text + "\n\n【追加查阅】\n" + next.text
+        let prefix = prior.text + "\n\n【追加查阅】\n"
+        let text = prefix + next.text
         guard text.utf16.count <= ResearchMaterial.maximumLength else {
             throw ResearchMaterialError.message("两轮查询的证据超过单次材料上限，请分开询问这些位置。")
         }
         let positions = (prior.pdfPositions ?? []) + (next.pdfPositions ?? [])
         let pages = ResearchPDFIndex.pageList(positions.map(\.page))
+        let excerpts = (prior.verifiedExcerpts ?? []) + (next.verifiedExcerpts ?? []).map { $0.shifted(by: prefix.utf16.count) }
         return ResearchMaterial(source: next.source, title: next.title, text: text,
                                 scope: "两次检索所得的独立摘录 · 文件页 " + pages,
-                                fileReference: next.fileReference, pdfPages: pages, pdfPositions: positions)
+                                fileReference: next.fileReference, pdfPages: pages, pdfPositions: positions,
+                                verifiedExcerpts: excerpts.isEmpty ? nil : excerpts)
     }
 }
 

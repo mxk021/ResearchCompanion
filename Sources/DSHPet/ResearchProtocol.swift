@@ -51,6 +51,7 @@ struct ResearchModelCatalog: Equatable, Decodable {
         let id: String
         let name: String
         let reasoning: Reasoning?
+        var inputModalities: [String]? = nil
     }
     let groups: [Provider]
     let defaultSelection: ResearchModelSelection?
@@ -91,19 +92,6 @@ struct ResearchModelCatalog: Equatable, Decodable {
 
 }
 
-struct ResearchPaperContext: Equatable {
-    let available: Bool
-    let key: String?
-    let title: String
-    let text: String
-    let pageLabel: String?
-    let source: String?
-    let error: String?
-    let scope: String?
-
-    var hasText: Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-}
-
 struct ResearchChatMessage: Identifiable, Equatable {
     let id: String
     let role: String
@@ -125,22 +113,6 @@ enum ResearchProtocol {
         guard let row = value as? [String: Any], let id = row["id"] as? String,
               row["role"] as? String == "assistant", let text = row["text"] as? String else { return nil }
         return .init(id: id, role: "assistant", text: text, originalPrompt: nil)
-    }
-
-    static func decodeContext(_ value: Any?) throws -> ResearchPaperContext? {
-        guard let value, !(value is NSNull) else { return nil }
-        guard let row = value as? [String: Any] else { throw ResearchProtocolError.malformed }
-        let text = row["text"] as? String ?? row["selection"] as? String ?? ""
-        return ResearchPaperContext(
-            available: row["available"] as? Bool ?? false,
-            key: row["key"] as? String,
-            title: row["title"] as? String ?? "当前论文",
-            text: text,
-            pageLabel: (row["pageLabel"] as? String) ?? (row["pageLabel"] as? NSNumber)?.stringValue,
-            source: row["source"] as? String,
-            error: row["error"] as? String,
-            scope: row["scope"] as? String
-        )
     }
 
     static func decodeMessages(_ value: Any?) throws -> [ResearchChatMessage] {

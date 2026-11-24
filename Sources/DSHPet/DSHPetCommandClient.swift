@@ -151,20 +151,34 @@ final class DSHPetCommandClient: ObservableObject {
         defaults.data(forKey: retirementTicketKey).flatMap { try? JSONDecoder().decode(ResearchRemovalPlan.self, from: $0) }
     }
     @Published private(set) var researchHistoryAvailable = false
-    @Published private(set) var paperContext: ResearchPaperContext?
-    @Published private(set) var contextError: String?
-    @Published private(set) var materialSource: ResearchMaterialSource = .none
+    @Published private(set) var hasAssociatedFile = false
     @Published private(set) var materialError: String?
     @Published private(set) var fixedMaterial: ResearchMaterial?
     @Published private(set) var appMaterial: ResearchMaterial?
     private var documentPlanningAvailable = false
+    private var documentImageTransportAvailable = false
     @Published private(set) var materialTransportAvailable = false
     @Published private(set) var choosingResearchFile = false
     @Published private(set) var loadingResearchFile = false
-    @Published private(set) var selectionError: String?
+    private enum SelectionFeedback {
+        case failure(String)
+        case advisory(String)
+
+        var message: String {
+            switch self {
+            case .failure(let message), .advisory(let message): message
+            }
+        }
+    }
+    @Published private var selectionFeedback: SelectionFeedback?
+    var selectionError: String? { selectionFeedback?.message }
+    var hasSelectionFailure: Bool {
+        if case .failure = selectionFeedback { return true }
+        return false
+    }
+    @Published private(set) var clipboardCopyRevision: Int?
     @Published private(set) var capturingSelection = false
     private var captureRevision = 0
-    private var selectionReadTask: Task<Void, Never>?
     private var materialRevision = 0
     @Published private(set) var pdfRequestRunning = false
     @Published private(set) var pdfRequestStatus: String?
@@ -176,13 +190,37 @@ final class DSHPetCommandClient: ObservableObject {
         let description: String
     }
     @Published private(set) var pdfBatchApproval: PDFBatchApproval?
+    struct PDFLayoutReview: Identifiable {
+        let id = UUID()
+        let evidence: ResearchPDFReviewRequired
+        let reference: ResearchFileReference
+    }
+    @Published private(set) var pdfLayoutReview: PDFLayoutReview?
+    private var layoutContinuation: CheckedContinuation<Bool, Never>?
+    struct PDFRangeReview: Identifiable {
+        let id = UUID()
+        let candidates: [ResearchPDFRangeCandidate]
+        let truncated: Bool
+        let anchors: ResearchPDFAnchors?
+        let reason: String
+    }
+    enum PDFRangeChoice: Sendable {
+        case candidate(String)
+        case edit(ResearchPDFAnchors)
+    }
+    @Published private(set) var pdfRangeReview: PDFRangeReview?
+    private var rangeContinuation: CheckedContinuation<PDFRangeChoice?, Never>?
     private var pdfApprovalContinuation: CheckedContinuation<Bool, Never>?
     private var fixedMaterialURL: URL?
     private var attachment: ResearchFileAttachment?
     private var fixedStamp: ResearchFileReference.FileStamp?
+    private var fileVerificationWorker: (id: UUID, task: Task<VerifiedFile, Error>)?
     private var fileChoiceBinding: Int?
     private var restoredAttachmentKey: String?
     private var materialReadTask: Task<Void, Never>?
+    private let documentCache = ResearchPDFLoadCache()
+    private var indexPreparation: (duration: TimeInterval, reused: Bool)?
+    private var activeTiming: (value: ResearchTurnTiming, session: String, request: String, priorStream: String?)?
     @Published private(set) var conversationMessages: [ResearchChatMessage] = [] {
         didSet { conversationHistoryRevision &+= 1 }
     }
@@ -204,18 +242,10 @@ final class DSHPetCommandClient: ObservableObject {
     @Published var includePaperContext = true
     private var researchPollingTask: Task<Void, Never>?
     private var researchRefreshInFlight = false
-    private var researchRefreshQueued: ResearchRefresh = []
+    private var researchRefreshQueued = false
     private var researchWindowForeground = false
     private var lastConversationRead: TimeInterval = -.infinity
     private var lastStreamUpdate: TimeInterval = -.infinity
-    private var submissionResearchMode = ResearchPromptMode.ask
-
-    private struct ResearchRefresh: OptionSet {
-        let rawValue: Int
-        static let conversation = Self(rawValue: 1 << 0)
-        static let material = Self(rawValue: 1 << 1)
-        static let all: Self = [.conversation, .material]
-    }
 
     var selectedResearchModel: ResearchModelSelection? {
         if sessionID != nil { return conversationSelection }
@@ -384,6 +414,7 @@ final class DSHPetCommandClient: ObservableObject {
            let markers = try? JSONDecoder().decode([String: TaskReadMarker].self, from: data) {
             readMarkers = markers
         }
+        restoreResearchSelection()
     }
 
     var selectedWorkspace: DSHPetWorkspace? {
@@ -575,8 +606,9 @@ final class DSHPetCommandClient: ObservableObject {
 
     func stop() {
         flushDraftPersistence()
-        removeResearchSelection()
+        cancelResearchSelectionCapture()
         materialReadTask?.cancel()
+        fileVerificationWorker?.task.cancel()
         pdfTask?.cancel()
         stopResearchPolling()
         started = false
@@ -761,7 +793,11 @@ final class DSHPetCommandClient: ObservableObject {
             continuationWarning = "请先等本轮操作完成，再新建会话"
             return
         }
-        if let key = attachmentKey(session: nil) { defaults.removeObject(forKey: key) }
+        if let key = attachmentKey(session: nil) {
+            defaults.removeObject(forKey: key)
+            do { try provenanceStore.removePendingSelection(key) }
+            catch { lastError = "无法清除未发送会话的选区。"; return }
+        }
         clearSessionBinding()
         clearFocusedTask()
         submissionStatus = .idle
@@ -865,6 +901,7 @@ final class DSHPetCommandClient: ObservableObject {
         sessionID = target
         resetCurrentFile()
         restoreCurrentFileIfNeeded()
+        restoreResearchSelection()
         defaults.set(target, forKey: Keys.sessionID)
         resetResearchConversation()
         // Task summaries retain terminal results for card history. The pet must
@@ -986,7 +1023,9 @@ final class DSHPetCommandClient: ObservableObject {
                 }
                 if let key = modelKey(target: binding, workspace: workspace, session: id) { defaults.removeObject(forKey: key) }
                 try provenanceStore.remove(session: id)
-                defaults.removeObject(forKey: ResearchFileAttachment.key(host: binding ?? "", workspace: workspace, session: id))
+                let materialKey = ResearchFileAttachment.key(host: binding ?? "", workspace: workspace, session: id)
+                defaults.removeObject(forKey: materialKey)
+                try provenanceStore.removePendingSelection(materialKey)
                 defaults.removeObject(forKey: "research.pdf.resume." + Self.documentDigest([workspace, id]))
                 if targetBindingKey == binding {
                     if readMarkers.removeValue(forKey: id) != nil { persistReadMarkers() }
@@ -1236,10 +1275,14 @@ final class DSHPetCommandClient: ObservableObject {
         }
     }
 
-    func submitDraft() { submitPreparedDraft(selection: nil) }
+    func submitDraft() { submitPreparedDraft() }
 
-    /// A keyboard/service translation owns its source, question and attachments independently of the draft.
-    private func submitPreparedDraft(selection: (id: UUID, material: ResearchMaterial)?, prepared: ResearchMaterial? = nil, questionOverride: String? = nil, pinned: ResearchModelSelection? = nil) {
+    private func submitPreparedDraft(prepared: ResearchMaterial? = nil,
+                                     questionOverride: String? = nil, pinned: ResearchModelSelection? = nil,
+                                     mode: ResearchPromptMode = .ask,
+                                     timing existingTiming: ResearchTurnTiming? = nil) {
+        let timing = existingTiming ?? ResearchTurnTiming()
+        timing.mark(.begin)
         guard !retirementInProgress else { lastError = "请等待 DSH 完成会话删除并重连。"; return }
         guard !pdfRequestRunning else {
             lastError = "当前 PDF 任务正在运行，请稍候。"
@@ -1251,11 +1294,13 @@ final class DSHPetCommandClient: ObservableObject {
             return
         }
         let originalDraft = draft
-        let sourceURL = prepared == nil ? nil : fixedMaterialURL
-        let sourceStamp = prepared == nil ? nil : fixedStamp
-        let sourceRevision = materialRevision
-        let text = selection == nil ? (questionOverride ?? draft.trimmingCharacters(in: .whitespacesAndNewlines)) : "请将本次选中的原文翻译成中文。"
-        let submittedImages = selection == nil ? draftImages : []
+        let sourceFile = prepared == nil ? nil : attachedFileForSubmission()
+        if prepared != nil && sourceFile == nil {
+            lastError = "尚未取得当前文件的可核验版本，本次未发送。"
+            return
+        }
+        let text = questionOverride ?? draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let submittedImages = draftImages
         guard !text.isEmpty || !submittedImages.isEmpty else { return }
         guard selectedWorkspace != nil else {
             submissionStatus = .failed("请先选择工作区")
@@ -1266,8 +1311,7 @@ final class DSHPetCommandClient: ObservableObject {
             return
         }
 
-        let researchMode: ResearchPromptMode = selection == nil ? submissionResearchMode : .translate
-        let isTranslation = researchMode == .translate
+        let isTranslation = mode == .translate
         let guardedModel = isTranslation || researchAvailable
         let capturedModel: ResearchModelSelection?
         do { capturedModel = try pinned ?? modelForTurn(translation: guardedModel) }
@@ -1277,20 +1321,17 @@ final class DSHPetCommandClient: ObservableObject {
             return
         }
         let useResearch = researchAvailable && submittedImages.isEmpty
-        let supplied = selection?.material ?? prepared
-        let chosen = supplied ?? (includePaperContext ? displayedResearchMaterial : nil)
-        let legacyZotero = supplied == nil && appMaterial == nil && !hasAssociatedFile && materialSource == .zotero && paperContext?.key != nil
-        if let chosen, !useResearch || (!legacyZotero && !materialTransportAvailable) || chosen.text.isEmpty
-                || chosen.text.utf16.count > ResearchMaterial.maximumLength {
+        let inline = prepared ?? (includePaperContext ? displayedResearchMaterial : nil)
+        let activeSelection = availableResearchSelection
+        let usesSelection = inline?.id == activeSelection?.id && activeSelection != nil
+        if let inline, !useResearch || !materialTransportAvailable || inline.text.isEmpty
+                || inline.text.utf16.count > ResearchMaterial.maximumLength {
             lastError = "本次材料未准备好或超出科研桥的单次上限，消息未发送。"
             return
         }
-        let includeContext = useResearch && chosen != nil
-        let contextKey = supplied == nil && appMaterial == nil && !hasAssociatedFile
-            && includeContext && materialSource == .zotero ? paperContext?.key : nil
-        let inline = contextKey == nil ? chosen : nil
-        let materialID = (contextKey ?? inline?.id.uuidString ?? "") + (prepared != nil ? (fixedMaterial?.id.uuidString ?? "") : "")
-        let legacySignature = (selection == nil ? submissionSignature(text: text) : text) + (useResearch ? "|research:\(researchMode.rawValue):\(includeContext):\(materialID)" : "")
+        let includeContext = inline != nil
+        let materialID = (inline?.id.uuidString ?? "") + (prepared != nil ? (fixedMaterial?.id.uuidString ?? "") : "")
+        let legacySignature = submissionSignature(text: text) + (useResearch ? "|research:\(mode.rawValue):\(includeContext):\(materialID)" : "")
         let signature = legacySignature + (capturedModel.map { "|model:" + $0.signature } ?? "")
         let matchingPending = pendingRequestSignature == signature || pendingRequestSignature == legacySignature
         if pendingRequestID != nil, !matchingPending {
@@ -1302,14 +1343,8 @@ final class DSHPetCommandClient: ObservableObject {
         if matchingPending, let pendingRequestID {
             requestID = pendingRequestID
         } else {
-            requestID = "dsh-pet-\((selection?.id ?? UUID()).uuidString.lowercased())"
-            pendingRequestID = requestID
-            pendingRequestText = text
-            pendingRequestSignature = signature
-            promptMayHaveBeenSent = false
-            defaults.set(requestID, forKey: Keys.requestID)
-            defaults.set(text, forKey: Keys.requestText)
-            defaults.set(signature, forKey: Keys.requestSignature)
+            requestID = "dsh-pet-\(UUID().uuidString.lowercased())"
+            rememberPendingSubmission(id: requestID, text: text, signature: signature, mayHaveBeenSent: false)
         }
 
         submissionStatus = .submitting
@@ -1322,13 +1357,36 @@ final class DSHPetCommandClient: ObservableObject {
             var promptAttempted = false
             do {
                 guard self.connectionGeneration == generation else { throw DSHPetCommandError.unavailable }
-                let encodedImages = try encodedDraftImages(submittedImages)
+                if let sourceFile {
+                    try await validateAttachedFile(sourceFile)
+                    timing.mark(.fileChecked)
+                }
+                timing.mark(.encodeStarted)
+                var encodedImages = try encodedDraftImages(submittedImages)
+                if let images = prepared?.documentImages, !images.isEmpty {
+                    guard documentImageTransportAvailable, useResearch, let capturedModel,
+                          modelCatalog?.model(for: capturedModel)?.inputModalities?.contains("image") == true,
+                          let limits = imageLimits,
+                          images.count <= min(4, limits.maxImagesPerMessage),
+                          images.allSatisfy({ $0.count <= limits.maxImageBytes }),
+                          images.reduce(0, { $0 + $1.count }) <= limits.maxMessageImageBytes else {
+                        throw ResearchMaterialError.message("当前模型或科研桥不能接收这些原页裁图。未发送或切换模型。")
+                    }
+                    let worker = Task.detached(priority: .userInitiated) {
+                        images.enumerated().map { index, item in
+                            ["mediaType": "image/jpeg", "data": item.base64EncodedString(), "name": "PDF-region-\(index + 1).jpg"]
+                        }
+                    }
+                    encodedImages = await worker.value
+                }
                 guard self.connectionGeneration == generation else { throw DSHPetCommandError.unavailable }
+                timing.mark(.encodeCompleted)
                 let sessionID = try await ensureSession(expectedGeneration: generation)
                 guard self.connectionGeneration == generation else { throw DSHPetCommandError.unavailable }
-                if selection != nil, captureRevision != selectionRevision {
+                if usesSelection, captureRevision != selectionRevision {
                     if pendingRequestID == requestID { invalidatePendingSubmission() }
-                    submissionStatus = .failed("取词请求已取消，本次翻译未发送。")
+                    submissionStatus = .failed("选区操作已变更，本次消息未发送。")
+                    timing.finish("cancelled")
                     return
                 }
                 let workspaceID = try requireWorkspaceID()
@@ -1337,22 +1395,22 @@ final class DSHPetCommandClient: ObservableObject {
                     guard binding == sessionBindingGeneration, self.sessionID == sessionID else { throw CancellationError() }
                     admittedModel = try await bindTranslation(capturedModel, session: sessionID, workspace: workspaceID, generation: generation)
                     guard binding == sessionBindingGeneration, self.sessionID == sessionID,
-                          selectedWorkspaceID == workspaceID, selection == nil || selectionRevision == captureRevision else { throw CancellationError() }
+                          selectedWorkspaceID == workspaceID, !usesSelection || selectionRevision == captureRevision else { throw CancellationError() }
                 }
+                timing.mark(.sessionReady)
                 if let inline {
                     let store = provenanceStore
                     try await Task.detached(priority: .userInitiated) {
-                        try store.record(session: sessionID, requestID: requestID, material: inline)
+                        try store.record(session: sessionID, requestID: requestID, material: inline, question: text)
                     }.value
                     guard generation == connectionGeneration, binding == sessionBindingGeneration, self.sessionID == sessionID,
-                          workspaceID == selectedWorkspaceID, selection == nil || selectionRevision == captureRevision else { throw CancellationError() }
+                          workspaceID == selectedWorkspaceID, !usesSelection || selectionRevision == captureRevision else { throw CancellationError() }
                 }
-                if prepared != nil {
-                    guard let sourceURL, let sourceStamp, materialRevision == sourceRevision,
-                          fixedMaterialURL == sourceURL, (try? ResearchFileReference.fileStamp(sourceURL)) == sourceStamp else {
-                        throw ResearchMaterialError.message("发送前材料已变更，未发送旧版本。请重新读取后再提问。")
-                    }
-                }
+                if let sourceFile { try await validateAttachedFile(sourceFile) }
+                guard !usesSelection || selectionRevision == captureRevision else { throw CancellationError() }
+                timing.mark(.provenanceReady)
+                activeTiming?.value.finish("replaced")
+                activeTiming = (timing, sessionID, requestID, conversationStream?.id)
                 promptAttempted = promptMayHaveBeenSent || (connection == .connected && capabilitiesValidated && connectionHandle != nil)
                 promptMayHaveBeenSent = promptAttempted
                 var fields: [String: Any] = [
@@ -1361,11 +1419,11 @@ final class DSHPetCommandClient: ObservableObject {
                 ]
                 if let admittedModel { fields["selection"] = admittedModel.wire }
                 if useResearch {
-                    fields["mode"] = researchMode.rawValue
+                    fields["mode"] = mode.rawValue
                     fields["includeContext"] = includeContext
-                    if let contextKey { fields["contextKey"] = contextKey }
                     if let inline { fields["material"] = inline.fields }
                 }
+                timing.mark(.bridgeSent)
                 let response = try await request(
                     action: useResearch ? "researchPrompt" : "prompt",
                     fields: fields,
@@ -1377,32 +1435,29 @@ final class DSHPetCommandClient: ObservableObject {
                       response["accepted"] as? Bool == true else {
                     throw DSHPetCommandError.malformed
                 }
+                timing.mark(.bridgeAccepted)
                 if modelSelectionAvailable,
                    let actual = ResearchProtocol.decode(ResearchModelSelection.self, from: response["selection"]),
                    self.sessionID == sessionID {
                     modelSelectionRevision &+= 1
                     conversationSelection = actual
                 }
-                if selection == nil && draft == originalDraft { draft = "" }
+                if draft == originalDraft { draft = "" }
                 if !submittedImageIDs.isEmpty { clearDraftImages(ids: submittedImageIDs) }
-                pendingRequestID = nil
-                pendingRequestText = nil
-                pendingRequestSignature = nil
-                promptMayHaveBeenSent = false
-                defaults.removeObject(forKey: Keys.requestID)
-                defaults.removeObject(forKey: Keys.requestText)
-                defaults.removeObject(forKey: Keys.requestSignature)
+                invalidatePendingSubmission()
                 submissionStatus = .submitted
                 await refreshResearchState()
                 if let task = tasks.first(where: { $0.id == sessionID }) { markTaskRead(task) }
-                if selection == nil, draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && draftImages.isEmpty {
+                if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && draftImages.isEmpty {
                     onAccepted?()
                 }
                 try? await Task.sleep(nanoseconds: 1_600_000_000)
                 guard self.connectionGeneration == generation else { return }
                 if submissionStatus == .submitted { submissionStatus = .idle }
             } catch {
-                guard self.connectionGeneration == generation else { return }
+                timing.finish(error is CancellationError ? "cancelled" : "submissionFailed")
+                if self.activeTiming?.request == requestID { self.activeTiming = nil }
+                guard self.connectionGeneration == generation, binding == sessionBindingGeneration else { return }
                 if !promptAttempted && !promptMayHaveBeenSent && pendingRequestID == requestID {
                     invalidatePendingSubmission()
                 }
@@ -1410,6 +1465,8 @@ final class DSHPetCommandClient: ObservableObject {
                 case DSHPetCommandError.timedOut, DSHPetCommandError.unavailable:
                     submissionStatus = promptAttempted || promptMayHaveBeenSent
                         ? .unconfirmed : .failed("消息尚未发送，请在连接恢复后重试")
+                case is CancellationError where !promptAttempted && !promptMayHaveBeenSent:
+                    submissionStatus = .failed("材料或会话已切换，或本次操作已取消。消息尚未发送。")
                 case DSHPetCommandError.server:
                     // An explicit server rejection is definitive: do not keep
                     // the pending request ID guarding target/workspace changes.
@@ -1430,43 +1487,102 @@ final class DSHPetCommandClient: ObservableObject {
         }
     }
 
-    private func checkAttachedFileVersion() -> Bool {
-        guard let url = fixedMaterialURL, let stamp = fixedStamp, let saved = attachment else { return true }
-        guard (try? ResearchFileReference.fileStamp(url)) != stamp else { return true }
-        loadSessionFile(url, recognizeScans: saved.recognizeScans, restoring: saved)
-        lastError = "文件已变更或无法访问，本次未发送。请核对更新后的材料再提问。"
-        return false
+    private struct AttachedFileSubmission {
+        let url: URL
+        let saved: ResearchFileAttachment
+        let materialRevision: Int
+        let sessionBinding: Int
+        let connectionGeneration: Int
+    }
+
+    private enum VerifiedFile: Sendable {
+        case current(ResearchFileReference.FileStamp)
+        case relocated(URL)
+    }
+
+    private func attachedFileForSubmission() -> AttachedFileSubmission? {
+        guard let url = fixedMaterialURL, let saved = attachment, fixedStamp != nil else { return nil }
+        return .init(url: url, saved: saved, materialRevision: materialRevision,
+                     sessionBinding: sessionBindingGeneration, connectionGeneration: connectionGeneration)
+    }
+
+    private func validateAttachedFile(_ expected: AttachedFileSubmission) async throws {
+        func checkBinding() throws {
+            try Task.checkCancellation()
+            guard expected.materialRevision == materialRevision, expected.sessionBinding == sessionBindingGeneration,
+                  expected.connectionGeneration == connectionGeneration, fixedMaterialURL == expected.url,
+                  includePaperContext else { throw CancellationError() }
+        }
+        try checkBinding()
+        guard let stamp = fixedStamp else { throw CancellationError() }
+        let id = UUID()
+        let worker = Task.detached(priority: .userInitiated) { () throws -> VerifiedFile in
+            do { return .current(try expected.saved.file.verifiedStamp(at: expected.url, previous: stamp)) }
+            catch ResearchFileReference.VerificationError.unavailable {
+                try Task.checkCancellation()
+                guard let relocated = expected.saved.file.resolve(), relocated.path != expected.url.path else {
+                    throw ResearchFileReference.VerificationError.unavailable
+                }
+                return .relocated(relocated)
+            }
+        }
+        fileVerificationWorker?.task.cancel()
+        fileVerificationWorker = (id, worker)
+        defer { if fileVerificationWorker?.id == id { fileVerificationWorker = nil } }
+        let result = await withTaskCancellationHandler { await worker.result } onCancel: { worker.cancel() }
+        try checkBinding()
+        guard fileVerificationWorker?.id == id else { throw CancellationError() }
+        switch result {
+        case .success(.current(let verified)):
+            fixedStamp = verified
+            if materialError != nil { materialError = nil }
+        case .success(.relocated(let url)):
+            let message = "原文件已移动，正在恢复材料关联；本次未发送。请在读取完成后重试。"
+            lastError = message
+            loadSessionFile(url, recognizeScans: expected.saved.recognizeScans, restoring: expected.saved)
+            throw ResearchMaterialError.message(message)
+        case .failure(let error):
+            if let failure = error as? ResearchFileReference.VerificationError {
+                switch failure {
+                case .changed:
+                    lastError = failure.localizedDescription
+                    loadSessionFile(expected.url, recognizeScans: expected.saved.recognizeScans, restoring: expected.saved)
+                case .unavailable, .unstable:
+                    materialError = failure.localizedDescription
+                }
+            }
+            throw error
+        }
     }
 
     func submitResearch(_ mode: ResearchPromptMode = .ask) {
+        let timing = ResearchTurnTiming(indexPreparation: indexPreparation?.duration, reusedIndex: indexPreparation?.reused ?? false)
+        timing.mark(.begin)
         guard !retirementInProgress else { lastError = "会话删除正在进行。"; return }
         guard researchAvailable else {
             lastError = "科研桥接尚未就绪，未发送消息"
             return
         }
         guard !pdfRequestRunning else { return }
-        if includePaperContext, capturingSelection, !hasAssociatedFile {
-            lastError = "正在读取本次选区，请等原文出现后再发送。"
-            return
-        }
         guard !conversationRunning else {
             lastError = "当前会话正在执行，请稍候。"
             return
         }
         let scope: ResearchDocumentScope
-        do {
-            scope = includePaperContext ? try ResearchDocumentScope.resolve(question: draft, mode: mode,
-                selection: appMaterial, hasFile: hasAssociatedFile, filename: associatedPDFName ?? fixedMaterial?.title,
-                captureFailed: selectionError != nil) : .general
-        } catch { lastError = error.localizedDescription; return }
-        if scope == .selection || scope == .combined, let material = appMaterial,
+        do { scope = try researchDocumentScope(mode) }
+        catch { lastError = error.localizedDescription; return }
+        if includePaperContext, capturingSelection, scope != .file {
+            lastError = "正在读取本次选区，请等取词结束后再发送。"
+            return
+        }
+        let activeSelection = availableResearchSelection
+        if scope == .selection || scope == .combined, let material = activeSelection,
            material.text.utf16.count > ResearchMaterial.maximumLength {
             lastError = ResearchMaterial.oversizeMessage
             return
         }
-        if scope == .file || scope == .combined || scope == .automatic {
+        if scope.usesFile {
             guard !hasPendingSubmission else { lastError = "请先核对或丢弃未确认的文档请求。"; return }
-            guard checkAttachedFileVersion() else { return }
             guard let file = fixedMaterial else {
                 lastError = materialError ?? "请等文件读取完成，或重新选择可用的文件。"
                 return
@@ -1476,8 +1592,9 @@ final class DSHPetCommandClient: ObservableObject {
                 lastError = "当前 PDF 尚无可发送的正文。" + index.status
                 return
             }
-            if scope == .combined, let selection = appMaterial, file.pdfIndex == nil || ResearchPDFIndex.requestsLocation(draft) {
-                submitSelectionWithBackground(selection, file: file, mode: mode)
+            if scope == .combined, let selection = activeSelection,
+               file.pdfIndex == nil || (ResearchPDFObjectID.addresses(in: draft).isEmpty && ResearchPDFIndex.requestsLocation(draft)) {
+                submitSelectionWithBackground(selection, file: file, mode: mode, timing: timing)
                 return
             }
             let typed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1488,14 +1605,15 @@ final class DSHPetCommandClient: ObservableObject {
                     : typed
                 let action = ResearchPDFIndex.requestsLocation(question) ? nil : ResearchPDFIndex.wholeTask(question, mode: mode)
                 startPDFRequest(index, question: question, mode: mode, whole: action, capturedDraft: draft,
-                                selection: scope == .automatic || scope == .combined ? appMaterial : nil,
-                                requireSelection: scope == .combined)
+                                selection: scope == .automatic || scope == .combined ? activeSelection : nil,
+                                requireSelection: scope == .combined, rangeHint: activeSelection?.text, timing: timing)
                 return
             }
             guard !typed.isEmpty || mode != .ask else { return }
             do {
                 let model = try modelForDocument()
-                submitPreparedDraft(selection: nil, prepared: file, questionOverride: documentInstruction(typed, mode: mode), pinned: model)
+                submitPreparedDraft(prepared: file, questionOverride: documentQuestion(typed, mode: mode),
+                                    pinned: model, mode: mode, timing: timing)
             } catch { lastError = error.localizedDescription }
             return
         }
@@ -1507,9 +1625,7 @@ final class DSHPetCommandClient: ObservableObject {
             if mode == .translate { draft = "请将当前材料中的原文翻译成中文。" }
             else if mode == .explain { draft = "请解释当前原文的概念、论证和必要背景，并区分原文与推断。" }
         }
-        submissionResearchMode = mode
-        submitDraft()
-        submissionResearchMode = .ask
+        submitPreparedDraft(mode: mode, timing: timing)
     }
 
     /// A document turn belongs to the selection displayed for this session,
@@ -1529,15 +1645,17 @@ final class DSHPetCommandClient: ObservableObject {
         return model
     }
 
-    private func documentInstruction(_ question: String, mode: ResearchPromptMode) -> String {
+    private func documentQuestion(_ question: String, mode: ResearchPromptMode) -> String {
+        guard question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return question }
         switch mode {
         case .ask: return question
-        case .translate: return "请将所给原文翻译为中文。" + question
-        case .explain: return "请解释所给原文。" + question
+        case .translate: return "请将所给原文翻译为中文。"
+        case .explain: return "请解释所给原文。"
         }
     }
 
-    private func submitSelectionWithBackground(_ selection: ResearchMaterial, file: ResearchMaterial, mode: ResearchPromptMode) {
+    private func submitSelectionWithBackground(_ selection: ResearchMaterial, file: ResearchMaterial, mode: ResearchPromptMode,
+                                               timing: ResearchTurnTiming) {
         let question = draft
         let binding = sessionBindingGeneration
         let revision = materialRevision
@@ -1545,30 +1663,146 @@ final class DSHPetCommandClient: ObservableObject {
         let model: ResearchModelSelection?
         do { model = try modelForDocument() }
         catch { lastError = error.localizedDescription; return }
-        let capturedFile = fixedMaterialURL
-        let stamp = fixedStamp
+        guard let sourceFile = attachedFileForSubmission() else {
+            lastError = "尚未取得当前文件的可核验版本，本次未发送。"
+            return
+        }
         pdfRequestRunning = true
-        pdfRequestStatus = "正在查找相关文件段落…"
+        pdfRequestStatus = "正在核验并查找相关文件段落…"
         pdfTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { pdfRequestRunning = false; pdfTask = nil }
-            let retrieval = Task.detached(priority: .userInitiated) { try selection.addingBackground(file, question: question) }
             do {
-                let combined = try await withTaskCancellationHandler { try await retrieval.value } onCancel: { retrieval.cancel() }
-                try Task.checkCancellation()
+                try await validateAttachedFile(sourceFile)
+                timing.mark(.fileChecked)
+                timing.mark(.evidenceStarted)
+                let retrieval = Task.detached(priority: .userInitiated) { [try selection.addingBackground(file, question: question)] }
+                guard let combined = try await documentRead(retrieval, selection: selection).first else {
+                    throw ResearchMaterialError.message("未取得可对照的材料。")
+                }
+                try await validateAttachedFile(sourceFile)
                 guard binding == sessionBindingGeneration, revision == materialRevision, selectedRevision == captureRevision,
                       draft == question, includePaperContext else { throw CancellationError() }
-                guard let capturedFile, let stamp, (try? ResearchFileReference.fileStamp(capturedFile)) == stamp else {
-                    throw ResearchMaterialError.message("会话文件发生变化。请重新读取后再发送。")
-                }
                 pdfRequestRunning = false
                 pdfRequestStatus = nil
-                submitPreparedDraft(selection: nil, prepared: combined, questionOverride: documentInstruction(question, mode: mode), pinned: model)
+                timing.mark(.evidenceReady)
+                submitPreparedDraft(prepared: combined, questionOverride: documentQuestion(question, mode: mode),
+                                    pinned: model, mode: mode, timing: timing)
             } catch {
+                timing.finish(error is CancellationError ? "cancelled" : "evidenceFailed")
                 if binding == sessionBindingGeneration, revision == materialRevision {
                     let message = error is CancellationError ? "材料或问题已变更或已取消，本次未发送。" : error.localizedDescription
                     pdfRequestStatus = message
                     lastError = message
+                }
+            }
+        }
+    }
+
+    func resolveLayoutReview(_ id: UUID, accept: Bool) {
+        guard pdfLayoutReview?.id == id else { return }
+        let continuation = layoutContinuation
+        layoutContinuation = nil
+        pdfLayoutReview = nil
+        continuation?.resume(returning: accept)
+    }
+
+    /// Review only a complete, locally mapped candidate. Missing source text never reaches this gate.
+    private func documentRead(_ worker: Task<[ResearchMaterial], Error>, selection: ResearchMaterial? = nil)
+        async throws -> [ResearchMaterial] {
+        do {
+            return try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+        } catch let candidate as ResearchPDFReviewRequired {
+            try Task.checkCancellation()
+            guard let reference = candidate.materials.first?.fileReference, !candidate.pages.isEmpty,
+                  candidate.materials.allSatisfy({ $0.fileReference == reference && !$0.text.isEmpty && $0.pdfPositions?.isEmpty == false }) else {
+                throw ResearchMaterialError.message("缺少与原件对应的位置，未发送候选文字。")
+            }
+            let review = PDFLayoutReview(evidence: candidate, reference: reference)
+            pdfRequestStatus = "请对照原页确认候选文字顺序。"
+            let allowed = await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    layoutContinuation = continuation
+                    pdfLayoutReview = review
+                }
+            } onCancel: {
+                Task { @MainActor [weak self] in self?.resolveLayoutReview(review.id, accept: false) }
+            }
+            try Task.checkCancellation()
+            guard allowed else { throw CancellationError() }
+            if let selection {
+                guard candidate.materials.count == 1 else {
+                    throw ResearchMaterialError.message("选区与候选页段合计过长，请缩小对照范围。")
+                }
+                return [try selection.withBackgroundEvidence(candidate.materials[0], reviewedOrder: true)]
+            }
+            return candidate.materials
+        }
+    }
+
+    func resolveRangeReview(_ id: UUID, choice: PDFRangeChoice?) {
+        guard let review = pdfRangeReview, review.id == id else { return }
+        switch choice {
+        case .candidate(let candidate):
+            guard review.candidates.contains(where: { $0.id == candidate }) else { return }
+        case .edit(let anchors):
+            guard review.anchors != nil, anchors.complete,
+                  anchors.start.utf16.count <= ResearchMaterial.maximumLength,
+                  anchors.end.utf16.count <= ResearchMaterial.maximumLength else { return }
+        case nil: break
+        }
+        let continuation = rangeContinuation
+        rangeContinuation = nil
+        pdfRangeReview = nil
+        continuation?.resume(returning: choice)
+    }
+
+    private func documentRangeRead(_ read: @escaping @Sendable (String?) throws -> [ResearchMaterial],
+                                   selection: ResearchMaterial? = nil,
+                                   correct: (@Sendable (ResearchPDFAnchors, String?) throws -> [ResearchMaterial])? = nil,
+                                   check: @MainActor () async throws -> Void)
+        async throws -> (materials: [ResearchMaterial], correction: (original: ResearchPDFAnchors, edited: ResearchPDFAnchors)?) {
+        var original: ResearchPDFAnchors?
+        var edited: ResearchPDFAnchors?
+        var choiceID: String?
+        while true {
+            try await check()
+            let anchors = edited
+            let candidate = choiceID
+            let worker = Task.detached(priority: .userInitiated) {
+                if let anchors, let correct { return try correct(anchors, candidate) }
+                return try read(candidate)
+            }
+            do {
+                let materials = try await documentRead(worker, selection: selection)
+                guard let original, let anchors else { return (materials, nil) }
+                let correctedMaterials = materials.map { item in
+                    var corrected = item
+                    corrected.scope += " · 起止以用户修正并核验的原文为准"
+                    return corrected
+                }
+                return (correctedMaterials, (original, anchors))
+            } catch let issue as ResearchPDFRangeAmbiguity {
+                try await check()
+                guard !issue.candidates.isEmpty || correct != nil else { throw issue }
+                let review = PDFRangeReview(candidates: issue.candidates, truncated: issue.truncated,
+                                            anchors: correct == nil ? nil : issue.anchors, reason: issue.localizedDescription)
+                pdfRequestStatus = "请核对原文起止位置。"
+                let choice = await withTaskCancellationHandler {
+                    await withCheckedContinuation { continuation in
+                        rangeContinuation = continuation
+                        pdfRangeReview = review
+                    }
+                } onCancel: {
+                    Task { @MainActor [weak self] in self?.resolveRangeReview(review.id, choice: nil) }
+                }
+                guard let choice else { throw CancellationError() }
+                switch choice {
+                case .candidate(let id): choiceID = id
+                case .edit(let correction):
+                    if original == nil { original = issue.anchors }
+                    edited = correction
+                    choiceID = nil
                 }
             }
         }
@@ -1614,7 +1848,7 @@ final class DSHPetCommandClient: ObservableObject {
     }
 
     func submitWholePDF(_ task: ResearchPDFIndex.WholeTask) {
-        guard canUseAssociatedFile, checkAttachedFileVersion(), let index = fixedMaterial?.pdfIndex else { return }
+        guard canUseAssociatedFile, let index = fixedMaterial?.pdfIndex else { return }
         let instruction = task == .translation ? "请将整篇 PDF 翻译为中文。" : "请分析整篇 PDF 的主要论证、证据和限制。"
         let typed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         startPDFRequest(index, question: typed.isEmpty ? instruction : instruction + "\n" + typed,
@@ -1623,7 +1857,11 @@ final class DSHPetCommandClient: ObservableObject {
 
     private func startPDFRequest(_ index: ResearchPDFIndex, question: String, mode: ResearchPromptMode,
                                  whole: ResearchPDFIndex.WholeTask?, capturedDraft: String,
-                                 selection: ResearchMaterial? = nil, requireSelection: Bool = false) {
+                                 selection: ResearchMaterial? = nil, requireSelection: Bool = false,
+                                 rangeHint: String? = nil, timing existingTiming: ResearchTurnTiming? = nil) {
+        let timing = existingTiming ?? ResearchTurnTiming(indexPreparation: indexPreparation?.duration,
+                                                          reusedIndex: indexPreparation?.reused ?? false)
+        timing.mark(.begin)
         guard !retirementInProgress, canUseAssociatedFile, draftImages.isEmpty, selectedWorkspace != nil,
               !modelSelectionAvailable || selectedResearchModel != nil else {
             lastError = "请确认当前模型、会话及附件状态，等待上一轮处理完成。"
@@ -1637,6 +1875,14 @@ final class DSHPetCommandClient: ObservableObject {
         do { model = try modelForDocument() }
         catch { lastError = error.localizedDescription; return }
         let history = conversationMessages.suffix(4).map { $0.role + ": " + ResearchMaterial.bounded($0.text, limit: 480) }
+        let lastObjectReply = conversationMessages.last(where: { $0.role == "assistant" })?.reply
+        guard let sourceFile = attachedFileForSubmission() else {
+            lastError = "尚未取得当前文件的可核验版本，本次未发送。"
+            return
+        }
+        let canSendRegions = documentImageTransportAvailable && imageAttachmentsAvailable &&
+            imageLimits?.mediaTypes.contains("image/jpeg") == true &&
+            modelCatalog?.model(for: model)?.inputModalities?.contains("image") == true
         pdfRequestRunning = true
         pdfRequestStatus = "正在核验原 PDF 并从全部 \(index.pages.count) 页准备材料…"
         lastError = nil
@@ -1649,59 +1895,101 @@ final class DSHPetCommandClient: ObservableObject {
                 try Task.checkCancellation()
                 guard connectionGeneration == generation, sessionBindingGeneration == binding,
                       materialRevision == revision, includePaperContext,
-                      selection == nil || captureRevision == selectedRevision else { throw CancellationError() }
+                      (selection == nil && rangeHint == nil) || captureRevision == selectedRevision else { throw CancellationError() }
             }
             do {
-                let verification = Task.detached(priority: .userInitiated) {
-                    guard let url = index.reference.resolve() else {
-                        throw ResearchMaterialError.message("原 PDF 已变更、移走或不可读，请重新选择文件。")
-                    }
-                    return (url, try ResearchFileReference.fileStamp(url))
-                }
-                let (url, stamp) = try await withTaskCancellationHandler { try await verification.value }
-                    onCancel: { verification.cancel() }
-                @MainActor func checkFile() throws {
+                @MainActor func checkFile() async throws {
                     try check()
-                    guard (try? ResearchFileReference.fileStamp(url)) == stamp else {
-                        throw ResearchMaterialError.message("处理时原 PDF 已变化或无法访问，已停止。请刷新文件。")
-                    }
+                    try await validateAttachedFile(sourceFile)
+                    try check()
                 }
-                try checkFile()
+                try await checkFile()
+                timing.mark(.fileChecked)
+                timing.mark(.evidenceStarted)
                 guard draft == capturedDraft, draftImages.isEmpty else { throw CancellationError() }
                 var turnModel = model
-                let chunks: [ResearchMaterial]
-                if whole == nil, !ResearchPDFIndex.requestsLocation(question), documentPlanningAvailable {
+                var submittedQuestion = question
+                var chunks: [ResearchMaterial]
+                let request = ResearchPDFRequest(question)
+                let address = request.address
+                let scopeIsPassage = address.addressesPassage
+                let explicitObjects = index.addressedObjects(for: request)
+                let isFollowUp = Self.objectFollowUp(question)
+                var objectIDs = explicitObjects
+                if whole == nil, !scopeIsPassage, objectIDs.isEmpty, isFollowUp,
+                   let lastObjectReply, let session = sessionID,
+                   let old = provenanceStore.read(session: session, reply: lastObjectReply, includePositions: false),
+                   old.file?.fingerprint == index.reference.fingerprint,
+                   let labels = old.objectLabels {
+                    objectIDs = labels.flatMap { ResearchPDFObjectID.addresses(in: $0) }
+                }
+                let comparative = question.range(of: #"比较|区别|区别于|关系|compare|difference|related to"#,
+                    options: [.regularExpression, .caseInsensitive]) != nil
+                let asksPrevious = question.range(of: #"前(?:一|一个|一个的)?(?:式子|公式|方程)|上(?:一|一个)?(?:式|公式)|previous (?:equation|formula)"#,
+                    options: [.regularExpression, .caseInsensitive]) != nil
+                if asksPrevious, let focus = objectIDs.first, objectIDs.count == 1,
+                   let previous = index.previousEquation(before: focus) {
+                    objectIDs.append(previous)
+                }
+                let asksMentions = question.range(of: #"提及.{0,18}(?:段落|正文|位置)|引用.{0,18}(?:段落|位置)|(?:mentions? of|passages? mentioning)"#,
+                    options: [.regularExpression, .caseInsensitive]) != nil
+                if whole == nil, !scopeIsPassage, !asksMentions, !objectIDs.isEmpty,
+                   !comparative || objectIDs.count > 1 || !documentPlanningAvailable {
+                    let targets = objectIDs
+                    let worker = Task.detached(priority: .userInitiated) {
+                        [try Self.readPDFObjects(index, ids: targets, question: question, allowImages: canSendRegions,
+                                                 selection: requireSelection ? selection : nil, timing: timing, parsed: request)]
+                    }
+                    chunks = try await documentRead(worker)
+                } else if whole == nil, !scopeIsPassage,
+                          (!ResearchPDFIndex.requestsLocation(question) || !objectIDs.isEmpty), documentPlanningAvailable {
                     let session = try await ensureSession(expectedGeneration: generation)
                     let workspace = try requireWorkspaceID()
                     let pinned = try await bindTranslation(model, session: session, workspace: workspace, generation: generation)
                     turnModel = pinned
-                    try checkFile()
-                    chunks = try await planDocumentRead(index, question: documentInstruction(question, mode: mode), selection: selection,
+                    try await checkFile()
+                    chunks = try await planDocumentRead(index, question: documentQuestion(question, mode: mode), selection: selection,
                         requireSelection: requireSelection, model: pinned, session: session, workspace: workspace,
-                        generation: generation, history: history, check: {
-                            try checkFile()
+                        generation: generation, history: history, allowImages: canSendRegions, check: {
+                            try await checkFile()
                             guard self.draft == capturedDraft, self.sessionID == session else { throw CancellationError() }
                         })
                 } else {
-                    let worker = Task.detached(priority: .userInitiated) {
+                    let correction: (@Sendable (ResearchPDFAnchors, String?) throws -> [ResearchMaterial])?
+                    if case .anchors = address, !requireSelection {
+                        correction = { anchors, choice in
+                            try index.prepare(request, selectionHint: rangeHint, chosenRangeID: choice, correctedAnchors: anchors)
+                        }
+                    } else { correction = nil }
+                    let resolved = try await documentRangeRead({ choice in
                         if whole != nil { return try index.segments() }
                         if requireSelection, let selection {
                             return [try selection.addingBackground(index.preview, question: question)]
                         }
-                        return try index.prepare(question)
+                        return try index.prepare(request, selectionHint: rangeHint, chosenRangeID: choice)
+                    }, selection: requireSelection ? selection : nil, correct: correction, check: {
+                        try await checkFile()
+                        guard self.draft == capturedDraft else { throw CancellationError() }
+                    })
+                    chunks = resolved.materials
+                    if let correction = resolved.correction {
+                        submittedQuestion = correction.edited.updatingQuestion(question, from: correction.original)
                     }
-                    chunks = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
                 }
-                try checkFile()
+                chunks = chunks.map(request.requiringDefinitions)
+                try await checkFile()
                 guard draft == capturedDraft, draftImages.isEmpty else { throw CancellationError() }
                 guard !chunks.isEmpty else { throw ResearchMaterialError.message("未取得可核验的 PDF 原文。") }
+                timing.mark(.evidenceReady)
                 if chunks.count == 1 {
                     pdfRequestRunning = false
-                    pdfRequestStatus = chunks[0].scope
-                    // The packet belongs to this question. Never send or overwrite the presentation card.
-                    submitPreparedDraft(selection: nil, prepared: chunks[0], questionOverride: documentInstruction(question, mode: mode), pinned: turnModel)
+                    pdfRequestStatus = nil
+                    // The evidence scope lives with the submitted answer.
+                    submitPreparedDraft(prepared: chunks[0], questionOverride: documentQuestion(submittedQuestion, mode: mode),
+                                        pinned: turnModel, mode: mode, timing: timing)
                     return
                 }
+                timing.finish("splitIntoSegments")
                 let translate = mode == .translate || question.range(of: #"翻译|译成|译为|translate|translation"#,
                     options: [.regularExpression, .caseInsensitive]) != nil
                 let operation = whole ?? (translate ? .translation : .analysis)
@@ -1710,15 +1998,15 @@ final class DSHPetCommandClient: ObservableObject {
                 let extra = synthesizes ? 1 : 0
                 let coverage = ResearchPDFIndex.pageList(chunks.flatMap { ($0.pdfPositions ?? []).map { $0.page } })
                 try await approvePDFBatch(count: chunks.count + extra, scope: scopeName + (coverage.isEmpty ? "" : " · 文件页 " + coverage), model: turnModel)
-                try checkFile()
+                try await checkFile()
                 guard draft == capturedDraft else { throw CancellationError() }
                 let session = try await ensureSession(expectedGeneration: generation)
-                try checkFile()
+                try await checkFile()
                 let workspace = try requireWorkspaceID()
                 let pinnedModel = try await bindTranslation(turnModel, session: session, workspace: workspace, generation: generation)
-                try checkFile()
+                try await checkFile()
                 let resumeKey = "research.pdf.resume." + Self.documentDigest([workspace, session])
-                let job = Self.documentDigest([index.reference.fingerprint, pinnedModel.signature, question,
+                let job = Self.documentDigest([index.reference.fingerprint, pinnedModel.signature, submittedQuestion,
                                                operation == .translation ? "translation" : "analysis"] + chunks.map(\.text))
                 if defaults.dictionary(forKey: resumeKey)?["job"] as? String != job {
                     defaults.set(["job": job], forKey: resumeKey)
@@ -1726,14 +2014,14 @@ final class DSHPetCommandClient: ObservableObject {
                 var notes: [String] = []
                 total = chunks.count
                 for (i, chunk) in chunks.enumerated() {
-                    try checkFile()
+                    try await checkFile()
                     let label = "第 \(i + 1)/\(total) 段 · PDF 文件第 \(chunk.pdfPages ?? "") 页"
                     pdfRequestStatus = "\(label) · 正在等待本段回答"
                     let action = operation == .translation
                         ? "按顺序完整翻译本段，保留术语、公式与文件页标识。"
                         : "分析本段与用户问题相关的证据、结果和限制，保留文件页码；输出简明的分段分析。"
-                    let answer = try await submitPDFTurn(question: question + "\n" + label + "。 " + action,
-                        material: chunk, session: session, workspace: workspace, generation: generation, model: pinnedModel, resumeKey: resumeKey)
+                    let answer = try await submitPDFTurn(question: submittedQuestion + "\n" + label + "。 " + action,
+                        material: chunk, session: session, workspace: workspace, generation: generation, model: pinnedModel, resumeKey: resumeKey, checkFile: checkFile)
                     completed += 1
                     if synthesizes { notes.append(label + "\n" + answer) }
 
@@ -1743,23 +2031,23 @@ final class DSHPetCommandClient: ObservableObject {
                     var level = 0
                     var approvedSummaryCalls = 1
                     while notes.count > 1 {
-                        try checkFile()
+                        try await checkFile()
                         level += 1
                         guard level <= 6 else { throw ResearchMaterialError.message("分段分析已在会话中，汇总未能收敛。") }
                         let groups = try ResearchPDFIndex.summaryGroups(notes)
                         if groups.count > approvedSummaryCalls {
                             try await approvePDFBatch(count: groups.count - approvedSummaryCalls, scope: "追加分段汇总", model: pinnedModel)
-                            try checkFile()
+                            try await checkFile()
                         }
                         approvedSummaryCalls = 0
                         var reduced: [String] = []
                         for (i, group) in groups.enumerated() {
-                            try checkFile()
+                            try await checkFile()
                             pdfRequestStatus = "已分析全部 \(total) 段 · 正在汇总 \(i + 1)/\(groups.count)"
                             let material = ResearchMaterial(source: "分段分析记录", title: index.title, text: group,
                                 scope: "全文分析的分段回答汇总；此材料为模型先前的分析，页码请对照原件。", fileReference: index.reference)
-                            let answer = try await submitPDFTurn(question: question + "\n综合各段已记录的分析，交叉核对结论、证据与限制并标明对应文件页。请在约 800 字内回答。",
-                                material: material, session: session, workspace: workspace, generation: generation, model: pinnedModel, resumeKey: resumeKey)
+                            let answer = try await submitPDFTurn(question: submittedQuestion + "\n综合各段已记录的分析，交叉核对结论、证据与限制并标明对应文件页。请在约 800 字内回答。",
+                                material: material, session: session, workspace: workspace, generation: generation, model: pinnedModel, resumeKey: resumeKey, checkFile: checkFile)
                             reduced.append(answer)
                         }
                         notes = reduced
@@ -1770,6 +2058,7 @@ final class DSHPetCommandClient: ObservableObject {
                 if draft == capturedDraft { draft = "" }
                 pdfRequestStatus = "已完成 \(total)/\(total) 段 · \(scopeName)。回答已按顺序保存在当前会话。"
             } catch {
+                timing.finish(error is CancellationError ? "cancelled" : "evidenceFailed")
                 if materialRevision == revision {
                     let message = error is CancellationError ? "已停止后续处理。" : errorMessage(error)
                     pdfRequestStatus = total == 0 ? message : "已完成 \(completed)/\(total) 段。\(message)"
@@ -1781,19 +2070,20 @@ final class DSHPetCommandClient: ObservableObject {
 
     private func planDocumentRead(_ index: ResearchPDFIndex, question: String, selection: ResearchMaterial?,
                                   requireSelection: Bool, model: ResearchModelSelection, session: String, workspace: String,
-                                  generation: Int, history: [String], check: @MainActor () throws -> Void) async throws -> [ResearchMaterial] {
+                                  generation: Int, history: [String], allowImages: Bool, check: @MainActor () async throws -> Void) async throws -> [ResearchMaterial] {
         var document: [String: Any] = ["id": index.reference.fingerprint, "title": index.title, "pages": index.pages.count,
                                        "outline": index.documentOutline, "history": history]
         if let selection { document["selection"] = ResearchMaterial.bounded(selection.text, limit: 1200) }
         var prior: ResearchMaterial?
         var verifiedFeedback: String?
+        var previousQuery: String?
         for pass in 0..<2 {
-            try check()
+            try await check()
             pdfRequestStatus = pass == 0 ? "正在定位原文…" : "正在核对并补充原文…"
             let response = try await request(action: "researchDocumentPlan", fields: [
                 "workspaceId": workspace, "sessionId": session, "selection": model.wire, "text": question, "document": document
             ], timeout: 105, expectedGeneration: generation)
-            try check()
+            try await check()
             guard response["documentId"] as? String == index.reference.fingerprint,
                   ResearchProtocol.decode(ResearchModelSelection.self, from: response["selection"]) == model,
                   let plan = ResearchProtocol.decode(ResearchDocumentPlan.self, from: response["plan"]) else {
@@ -1801,17 +2091,28 @@ final class DSHPetCommandClient: ObservableObject {
             }
             if plan.action == .useEvidence, let prior { return [prior] }
             if plan.action == .clarify { throw ResearchMaterialError.message(plan.question ?? "需要确认这次所指的原文。") }
+            if let query = plan.query, let prior, let previousQuery,
+               query.lowercased().split(whereSeparator: \.isWhitespace) == previousQuery.lowercased().split(whereSeparator: \.isWhitespace),
+               plan.action == .search || plan.action == .combined { return [prior] }
             let readEvidence = verifiedFeedback
-            let worker = Task.detached(priority: .userInitiated) {
-                try plan.read(index: index, question: question, selection: selection,
-                              requireSelection: requireSelection, verifiedFeedback: readEvidence)
+            let read: @Sendable (String?) throws -> [ResearchMaterial] = { choice in
+                if plan.action == .object {
+                    let ids = ResearchPDFObjectID.addresses(in: plan.reference ?? "")
+                    guard !ids.isEmpty else { throw ResearchMaterialError.message("模型给出的文档对象无法核对。请补充图、式或表的编号。") }
+                    return [try Self.readPDFObjects(index, ids: ids, question: question, allowImages: allowImages,
+                                                    selection: requireSelection ? selection : nil)]
+                }
+                return try plan.read(index: index, question: question, selection: selection,
+                              requireSelection: requireSelection, verifiedFeedback: readEvidence, chosenRangeID: choice)
             }
             let result: [ResearchMaterial]
             do {
-                result = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
-                try check()
+                result = try await documentRangeRead(read, selection: (requireSelection || plan.action == .combined) ? selection : nil,
+                                                     check: check).materials
+                try await check()
             } catch {
-                try check()
+                try await check()
+                if error is CancellationError { throw error }
                 // A failed exact range must never be replaced by ranked excerpts.
                 guard pass == 0, plan.action == .search || plan.action == .combined else { throw error }
                 document["feedback"] = "未找到可用原文。" + ResearchMaterial.bounded(error.localizedDescription, limit: 400)
@@ -1819,6 +2120,11 @@ final class DSHPetCommandClient: ObservableObject {
             }
             guard let first = result.first else { throw ResearchMaterialError.message("本次未取到可核对的原文。") }
             if pass == 0, plan.action == .search || plan.action == .combined {
+                if plan.needsMore == false,
+                   ResearchPDFAddress.captures(#"下一页|跨页|起点|终点|范围|next page|continue|through"#, in: question) == nil {
+                    return result
+                }
+                previousQuery = plan.query
                 prior = first
                 let lookup = Task.detached(priority: .userInitiated) {
                     try index.planningFeedback(for: first, selection: selection)
@@ -1833,6 +2139,42 @@ final class DSHPetCommandClient: ObservableObject {
         throw ResearchMaterialError.message("两次文档查询均未取得足够证据，问题已保留。")
     }
 
+    private nonisolated static func objectFollowUp(_ question: String) -> Bool {
+        question.range(of: #"^(?:(?:它|这一?个|那一?个|这(?:个|里|条|张|一式)|上式|前式)|(?:the previous|this|that|it|how does it)\b)"#,
+                       options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
+    /// Read a single, fingerprinted object packet. The program, not the planner, owns the actual formula or figure.
+    nonisolated static func readPDFObjects(_ index: ResearchPDFIndex, ids: [ResearchPDFObjectID],
+                                                   question: String, allowImages: Bool,
+                                                   selection: ResearchMaterial?, timing: ResearchTurnTiming? = nil,
+                                                   parsed: ResearchPDFRequest? = nil) throws -> ResearchMaterial {
+        let result = try index.objectEvidence(ids, includeImages: allowImages, question: question, timing: timing, parsed: parsed)
+        let hasRegions = allowImages && !result.images.isEmpty
+        var material = result.material
+        var body = material.text
+        if let selection {
+            body += "\n\n【本次另附选区】\n"
+            if let excerpts = selection.verifiedExcerpts {
+                material.verifiedExcerpts = (material.verifiedExcerpts ?? []) + excerpts.map { $0.shifted(by: body.utf16.count) }
+            }
+            body += selection.text
+        }
+        if hasRegions {
+            body += "\n\n【原页裁图】本轮另附目标对象的原始页面区域。"
+        } else if result.needsVisual {
+            body += "\n\n【本轮证据缺口】当前请求没有可由所选模型读取的完整原页视觉证据。图形关系、空间结构或缺失符号有待核验。"
+        }
+        guard body.utf16.count <= ResearchMaterial.maximumLength else {
+            throw ResearchMaterialError.message("对象证据与选区合计超出单次材料上限，请缩小选区。")
+        }
+        material.text = body
+        if result.needsVisual && !hasRegions { material.scope += " · 仅核对到部分文字" }
+        material.objectLabels = result.ids.map(\.label)
+        material.documentImages = hasRegions ? result.images : []
+        return material
+    }
+
     private static func documentDigest(_ fields: [String]) -> String {
         var hash = SHA256()
         for field in fields {
@@ -1844,43 +2186,48 @@ final class DSHPetCommandClient: ObservableObject {
     }
 
     private func submitPDFTurn(question: String, material: ResearchMaterial, session: String, workspace: String,
-                               generation: Int, model: ResearchModelSelection?, resumeKey: String) async throws -> String {
+                               generation: Int, model: ResearchModelSelection?, resumeKey: String,
+                               checkFile: @MainActor () async throws -> Void) async throws -> String {
         try Task.checkCancellation()
         guard sessionID == session, generation == connectionGeneration else { throw DSHPetCommandError.unavailable }
         let part = Self.documentDigest([question, material.text, material.scope])
         if let known = defaults.dictionary(forKey: resumeKey)?[part] as? String {
             return try await waitForPDFAnswer(id: known, session: session, generation: generation)
         }
+        let timing = ResearchTurnTiming()
+        timing.mark(.begin)
         let id = "dsh-pet-\(UUID().uuidString.lowercased())"
         let store = provenanceStore
         try await Task.detached(priority: .userInitiated) {
-            try store.record(session: session, requestID: id, material: material)
+            try store.record(session: session, requestID: id, material: material, question: question)
         }.value
-        try Task.checkCancellation()
+        try await checkFile()
         guard sessionID == session, selectedWorkspaceID == workspace, generation == connectionGeneration else { throw DSHPetCommandError.unavailable }
         var fields: [String: Any] = ["workspaceId": workspace, "sessionId": session, "requestId": id,
             "text": question, "mode": "ask", "includeContext": true, "material": material.fields]
         if let model { fields["selection"] = model.wire }
         // Admission can outlive a socket or app restart. Reuse the existing unresolved
         // request guard, so a lost acknowledgment cannot silently duplicate a segment.
-        pendingRequestID = id
-        pendingRequestText = question
-        pendingRequestSignature = "pdf:" + id
-        defaults.set(id, forKey: Keys.requestID)
-        defaults.set(question, forKey: Keys.requestText)
-        defaults.set(pendingRequestSignature, forKey: Keys.requestSignature)
-        promptMayHaveBeenSent = true
+        rememberPendingSubmission(id: id, text: question, signature: "pdf:" + id, mayHaveBeenSent: true)
+        activeTiming?.value.finish("replaced")
+        activeTiming = (timing, session, id, conversationStream?.id)
         do {
+            timing.mark(.bridgeSent)
             let response = try await request(action: "researchPrompt", fields: fields, timeout: 32, expectedGeneration: generation)
             guard response["accepted"] as? Bool == true else { throw DSHPetCommandError.malformed }
+            timing.mark(.bridgeAccepted)
             var accepted = defaults.dictionary(forKey: resumeKey) ?? [:]
             accepted[part] = id
             defaults.set(accepted, forKey: resumeKey)
             invalidatePendingSubmission()
         } catch DSHPetCommandError.server(let code, let message) {
+            timing.finish("submissionFailed")
+            if activeTiming?.request == id { activeTiming = nil }
             invalidatePendingSubmission()
             throw DSHPetCommandError.server(code: code, message: message)
         } catch {
+            timing.finish("submissionUnconfirmed")
+            if activeTiming?.request == id { activeTiming = nil }
             submissionStatus = .unconfirmed
             throw ResearchMaterialError.message("本段发送状态未确认；请核对当前会话后再继续。")
         }
@@ -2053,8 +2400,27 @@ final class DSHPetCommandClient: ObservableObject {
               revision > streamRevision || (revision == streamRevision && stream["message"] is NSNull) else { return }
         streamRevision = revision
         let current = ResearchProtocol.decodeStreamMessage(stream["message"])
+        if let activeTiming, activeTiming.session == sessionID, let current,
+           current.id != activeTiming.priorStream, !current.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            activeTiming.value.mark(.firstStream)
+        }
         if conversationStream != current { conversationStream = current }
         if current != nil, stream["settled"] as? Bool != true, !conversationRunning { conversationRunning = true }
+    }
+
+    func transcriptDidDisplay(session: String, stream: ResearchChatMessage?, lastAnswer: ResearchChatMessage?) {
+        guard let activeTiming, activeTiming.session == session else { return }
+        let settled = lastAnswer?.reply?.requestId == activeTiming.request &&
+            lastAnswer?.text.isEmpty == false
+        if settled || (stream?.id != activeTiming.priorStream &&
+                       stream?.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) {
+            activeTiming.value.mark(.firstDisplayed)
+        }
+        if settled {
+            activeTiming.value.mark(.completeDisplayed)
+            activeTiming.value.finish("complete")
+            self.activeTiming = nil
+        }
     }
 
     func beginResearchPolling() {
@@ -2067,10 +2433,10 @@ final class DSHPetCommandClient: ObservableObject {
             while !Task.isCancelled {
                 if let self, self.researchWindowForeground {
                     let timestamp = ProcessInfo.processInfo.systemUptime
-                    var due: ResearchRefresh = []
                     if timestamp - self.lastConversationRead >= (self.conversationRunning ? 5 : 12),
-                       timestamp - self.lastStreamUpdate >= 5 { due.insert(.conversation) }
-                    if !due.isEmpty { await self.refreshResearchState(due, enqueueIfBusy: false) }
+                       timestamp - self.lastStreamUpdate >= 5 {
+                        await self.refreshResearchState(enqueueIfBusy: false)
+                    }
                 }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
@@ -2091,11 +2457,7 @@ final class DSHPetCommandClient: ObservableObject {
     }
 
     func refreshResearch() {
-        refreshResearch(.all)
-    }
-
-    private func refreshResearch(_ kind: ResearchRefresh) {
-        Task { @MainActor [weak self] in await self?.refreshResearchState(kind) }
+        Task { @MainActor [weak self] in await self?.refreshResearchState() }
     }
 
     private func attachmentKey(session: String?) -> String? {
@@ -2104,14 +2466,23 @@ final class DSHPetCommandClient: ObservableObject {
     }
 
     private func resetCurrentFile(clearSelection: Bool = true) {
-        if clearSelection { removeResearchSelection() }
-        beginMaterialSource(.none)
+        if clearSelection {
+            cancelResearchSelectionCapture()
+            dismissResearchSelectionError()
+            appMaterial = nil
+        }
+        resetMaterialRead(attached: false)
         attachment = nil
         fixedMaterial = nil
         associatedPDFName = nil
         fixedMaterialURL = nil
         fixedStamp = nil
         restoredAttachmentKey = nil
+        indexPreparation = nil
+    }
+
+    private func restoreResearchSelection() {
+        appMaterial = attachmentKey(session: sessionID).flatMap { provenanceStore.pendingSelection($0) }
     }
 
     private func restoreCurrentFileIfNeeded() {
@@ -2122,35 +2493,68 @@ final class DSHPetCommandClient: ObservableObject {
             let saved = try JSONDecoder().decode(ResearchFileAttachment.self, from: data)
             loadSessionFile(URL(fileURLWithPath: saved.file.originalPath), recognizeScans: saved.recognizeScans, restoring: saved)
         } catch {
-            beginMaterialSource(.fixedFile)
+            resetMaterialRead(attached: true)
             materialError = "已关联文件的信息无法读取。请选择文件或移除这份关联。"
         }
     }
 
-    var hasAssociatedFile: Bool { attachment != nil || materialSource == .fixedFile || fixedMaterial != nil }
-
-    var displayedResearchMaterial: ResearchMaterial? {
-        if let appMaterial { return appMaterial }
-        if hasAssociatedFile { return fixedMaterial }
-        switch materialSource {
-        case .none: return nil
-        case .appSelection: return appMaterial
-        case .fixedFile: return fixedMaterial
-        case .zotero:
-            guard let paperContext, paperContext.available, paperContext.hasText else { return nil }
-            return ResearchMaterial(source: "Zotero", title: paperContext.title, text: paperContext.text,
-                scope: paperContext.scope ?? "Zotero 提供的摘录", page: paperContext.pageLabel)
-        }
+    private func researchDocumentScope(_ mode: ResearchPromptMode) throws -> ResearchDocumentScope {
+        guard includePaperContext else { return .general }
+        return try ResearchDocumentScope.resolve(question: draft, mode: mode, selection: availableResearchSelection,
+            hasFile: hasAssociatedFile, filename: associatedPDFName ?? fixedMaterial?.title,
+            captureFailed: hasSelectionFailure)
     }
+
+    /// Describe the same source decision used at submit time. Automatic mode only
+    /// guarantees which sources are eligible until the evidence has been looked up.
+    func researchMaterialSummary(_ mode: ResearchPromptMode) -> String {
+        let scope: ResearchDocumentScope
+        do { scope = try researchDocumentScope(mode) }
+        catch { return error.localizedDescription }
+        if includePaperContext, capturingSelection, scope != .file { return "等待本次选区" }
+        let activeSelection = availableResearchSelection
+        let source: String
+        if let selection = activeSelection {
+            source = "\(selection.source) · \(selection.text.utf16.count) 个 UTF‑16 字符"
+        } else {
+            source = ""
+        }
+        if scope == .selection || scope == .combined, (activeSelection?.text.utf16.count ?? 0) > ResearchMaterial.maximumLength {
+            return "选区超出带入上限，请缩小后再发送。"
+        }
+        if scope.usesFile {
+            if loadingResearchFile { return "会话文件正在读取，材料尚未就绪" }
+            guard let file = fixedMaterial, file.pdfIndex?.hasReadableContent ?? !file.text.isEmpty else {
+                return "会话文件不可用，请重试读取或重新选择"
+            }
+            let fileLabel = file.pdfIndex == nil ? "当前文件" : "当前 PDF"
+            if scope == .combined { return "完整选区（\(source)）＋\(fileLabel)相关摘录" }
+            if scope == .automatic, activeSelection != nil {
+                return "按问题选用\(fileLabel)与当前选区（\(source)）"
+            }
+            return file.pdfIndex == nil ? "将带入当前文件的已读范围" : "当前 PDF · 根据问题检索原文"
+        }
+        if scope == .selection { return "将带入完整选区（\(source)）" }
+        return includePaperContext ? "当前无附带材料" : "带入已关闭 · 本轮只发送问题"
+    }
+
+    var availableResearchSelection: ResearchMaterial? {
+        guard !capturingSelection, !hasSelectionFailure else { return nil }
+        return appMaterial
+    }
+
+    var displayedResearchMaterial: ResearchMaterial? { availableResearchSelection ?? fixedMaterial }
 
     var hasSendableResearchMaterial: Bool {
         guard let material = displayedResearchMaterial else { return false }
         if let index = material.pdfIndex { return materialTransportAvailable && index.hasReadableContent }
         guard !material.text.isEmpty, material.text.utf16.count <= ResearchMaterial.maximumLength else { return false }
-        return appMaterial == nil && materialSource == .zotero ? !(paperContext?.key?.isEmpty ?? true) : materialTransportAvailable
+        return materialTransportAvailable
     }
 
-    var canUseResearchMaterial: Bool { canUseAssociatedFile || (readyForMaterialRequest && hasSendableResearchMaterial && !capturingSelection) }
+    var canUseResearchMaterial: Bool {
+        canUseAssociatedFile || (readyForMaterialRequest && hasSendableResearchMaterial && !capturingSelection)
+    }
 
     var canUseAssociatedFile: Bool {
         readyForMaterialRequest && materialTransportAvailable && (fixedMaterial?.pdfIndex?.hasReadableContent ?? (fixedMaterial?.text.isEmpty == false))
@@ -2163,20 +2567,19 @@ final class DSHPetCommandClient: ObservableObject {
     }
 
     func noteMaterialMessage(_ message: String) {
-        materialError = message
+        lastError = message
     }
 
-    private func beginMaterialSource(_ source: ResearchMaterialSource) {
+    private func resetMaterialRead(attached: Bool) {
         materialRevision &+= 1
+        fileVerificationWorker?.task.cancel()
         pdfTask?.cancel()
         pdfRequestStatus = nil
         materialReadTask?.cancel()
         materialReadTask = nil
         loadingResearchFile = false
-        materialSource = source
+        hasAssociatedFile = attached
         materialError = nil
-        contextError = nil
-        paperContext = nil
     }
 
     struct SelectionRequest {
@@ -2184,112 +2587,104 @@ final class DSHPetCommandClient: ObservableObject {
         let revision: Int
         let connection: Int
         let session: Int
-        let previewOnly: Bool
+        let sessionID: String?
     }
 
-    func beginSelectionTranslation(previewOnly: Bool = false) -> SelectionRequest? {
-        removeResearchSelection()
-        guard !pdfRequestRunning, !choosingResearchFile, previewOnly || !loadingResearchFile else {
-            selectionError = "正在选择或处理文件，请稍后重试取词。"
+    func beginResearchSelectionCapture() -> SelectionRequest? {
+        cancelResearchSelectionCapture()
+        dismissResearchSelectionError()
+        guard !pdfRequestRunning, !choosingResearchFile else {
+            selectionFeedback = .failure("正在选择或处理文件，请稍后重试取词。")
             return nil
         }
         capturingSelection = true
-        return SelectionRequest(revision: captureRevision, connection: connectionGeneration, session: sessionBindingGeneration, previewOnly: previewOnly)
+        return SelectionRequest(revision: captureRevision, connection: connectionGeneration, session: sessionBindingGeneration, sessionID: sessionID)
     }
 
-    func finishSelectionTranslation(_ request: SelectionRequest, result: Result<ResearchMaterial, Error>) {
-        guard request.revision == captureRevision else { return }
-        guard request.previewOnly || request.connection == connectionGeneration, request.session == sessionBindingGeneration else {
-            rejectResearchSelection("科研工作区或会话已切换，请重新翻译选区。")
-            return
-        }
+    func isCurrentSelectionRequest(_ request: SelectionRequest) -> Bool {
+        capturingSelection && request.revision == captureRevision
+            && request.connection == connectionGeneration && request.session == sessionBindingGeneration && request.sessionID == sessionID
+    }
+
+    func finishResearchSelectionCapture(_ request: SelectionRequest, result: Result<ResearchMaterial, Error>,
+                                        clipboard: ResearchSelectionRead.Clipboard = .untouched) {
+        guard isCurrentSelectionRequest(request) else { return }
         switch result {
         case .failure(let error):
             rejectResearchSelection(error.localizedDescription)
+            if (error as? SelectionCaptureError)?.offersExplicitPaste == true {
+                clipboardCopyRevision = NSPasteboard.general.changeCount
+            }
         case .success(let material):
             guard material.selectionIsComplete else { rejectResearchSelection(SelectionCaptureError.tooLarge.localizedDescription); return }
             // Consuming this request prevents replay by delayed callbacks.
-            removeResearchSelection()
-            appMaterial = material
-            if request.previewOnly { includePaperContext = true; return }
-            guard material.text.utf16.count <= ResearchMaterial.maximumLength else {
-                selectionError = ResearchMaterial.oversizeMessage
-                return
-            }
-            guard connection == .connected, capabilitiesAvailable, researchAvailable, materialTransportAvailable else {
-                selectionError = "科研桥尚未连接或不支持选区翻译。重新连接后请再次触发。"
-                return
-            }
-            guard !hasPendingSubmission, submissionStatus != .submitting, !conversationRunning,
-                  sessionSnapshot?.taskRunning != true, !modelSwitching, !pdfRequestRunning else {
-                selectionError = "会话正忙或有待核对的请求，本次选区尚未发送。"
-                return
-            }
-            if modelSelectionAvailable, modelCatalog == nil {
-                let revision = captureRevision
-                Task { @MainActor in
-                    do {
-                        let catalog = try await fetchCatalog(request.connection)
-                        guard captureRevision == revision, sessionBindingGeneration == request.session,
-                              connectionGeneration == request.connection else { return }
-                        modelCatalog = catalog
-                        submitPreparedDraft(selection: (request.id, material))
-                    } catch {
-                        if captureRevision == revision { selectionError = error.localizedDescription }
-                    }
-                }
-            } else {
-                submitPreparedDraft(selection: (request.id, material))
+            cancelResearchSelectionCapture()
+            do {
+                try saveResearchSelection(material, clipboard: clipboard)
+            } catch {
+                rejectResearchSelection("无法保存本次选区。")
             }
         }
     }
 
-    func acceptResearchServiceSelection(_ material: ResearchMaterial, from application: NSRunningApplication?) {
-        removeResearchSelection()
-        includePaperContext = true
+    private func saveResearchSelection(_ material: ResearchMaterial, clipboard: ResearchSelectionRead.Clipboard) throws {
+        if let key = attachmentKey(session: sessionID) { try provenanceStore.savePendingSelection(material, for: key) }
         appMaterial = material
-        guard ResearchSelectionCapture.accessibilityAvailable,
-              let application, let target = ResearchSelectionCapture.target(application) else { return }
-        let revision = captureRevision
-        let worker = Task.detached(priority: .userInitiated) { try ResearchSelectionCapture.read(target) }
-        selectionReadTask = Task { @MainActor [weak self] in
-            let capture = await withTaskCancellationHandler {
-                try? await worker.value
-            } onCancel: {
-                worker.cancel()
-            }
-            guard let self, !Task.isCancelled, self.captureRevision == revision else { return }
-            selectionReadTask = nil
-            if let capture, let enriched = material.withLocator(from: capture) { appMaterial = enriched }
-        }
+        includePaperContext = true
+        selectionFeedback = clipboard.message.map(SelectionFeedback.advisory)
     }
 
     func removeResearchSelection() {
+        cancelResearchSelectionCapture()
+        do {
+            if let key = attachmentKey(session: sessionID) { try provenanceStore.removePendingSelection(key) }
+        } catch {
+            selectionFeedback = .failure("无法移除已保存的选区。")
+            return
+        }
+        appMaterial = nil
+        dismissResearchSelectionError()
+    }
+
+    func cancelResearchSelectionCapture() {
+        let interrupted = capturingSelection
         capturingSelection = false
         captureRevision &+= 1
-        selectionReadTask?.cancel()
-        selectionReadTask = nil
-        appMaterial = nil
-        selectionError = nil
+        if interrupted && appMaterial != nil {
+            selectionFeedback = .failure("本次未更新选区。")
+        }
+    }
+
+    func dismissResearchSelectionError() {
+        selectionFeedback = nil
+        clipboardCopyRevision = nil
     }
 
     func rejectResearchSelection(_ message: String) {
-        removeResearchSelection()
-        selectionError = message
+        cancelResearchSelectionCapture()
+        selectionFeedback = .failure(message)
+        clipboardCopyRevision = nil
     }
 
-    func clearTransientResearchMaterialOnClose() {
-        removeResearchSelection()
-        if materialSource == .zotero { beginMaterialSource(.zotero) }
+    func pasteResearchSelection() {
+        let clipboard = NSPasteboard.general
+        let revision = clipboard.changeCount
+        guard let before = clipboardCopyRevision, revision != before else {
+            selectionFeedback = .failure("请先回原窗口复制这次选中的文字。")
+            return
+        }
+        guard let request = beginResearchSelectionCapture() else { return }
+        let result = Result {
+            let text = try ResearchDocumentCopy.readExplicitPaste(clipboard)
+            guard clipboard.changeCount == revision else { throw SelectionCaptureError.clipboardInterrupted }
+            return try ResearchSelectionCapture.clipboardSelection(text, source: "手动粘贴", title: "正文已取得")
+        }
+        finishResearchSelectionCapture(request, result: result)
     }
 
     func removeResearchFile() {
         if let key = attachmentKey(session: sessionID) { defaults.removeObject(forKey: key) }
         resetCurrentFile(clearSelection: false)
-    }
-
-    func removeResearchMaterial() {
-        if hasAssociatedFile { removeResearchFile() } else { removeResearchSelection() }
     }
 
     func openAssociatedFile() {
@@ -2325,13 +2720,14 @@ final class DSHPetCommandClient: ObservableObject {
     }
 
     private func loadSessionFile(_ url: URL, recognizeScans: Bool, restoring: ResearchFileAttachment?) {
-        beginMaterialSource(.fixedFile)
+        resetMaterialRead(attached: true)
         loadingResearchFile = true
         associatedPDFName = url.pathExtension.lowercased() == "pdf" ? url.lastPathComponent : nil
         fixedMaterial = nil
         fixedMaterialURL = nil
         fixedStamp = nil
         attachment = restoring
+        indexPreparation = nil
         if restoring == nil, let key = attachmentKey(session: sessionID) {
             defaults.removeObject(forKey: key)
         }
@@ -2343,7 +2739,13 @@ final class DSHPetCommandClient: ObservableObject {
                 materialError = message
             }
         }
+        let cache = documentCache
         let worker = Task.detached(priority: .userInitiated) {
+            let start = ProcessInfo.processInfo.systemUptime
+            if let hit = try cache.existing(at: url, recognizeScans: recognizeScans),
+               restoring == nil || restoring?.file.fingerprint == hit.reference.fingerprint {
+                return (url, hit.material, hit.reference, hit.stamp, ProcessInfo.processInfo.systemUptime - start, true)
+            }
             // Follow a moved file only if its saved content matches. A changed file
             // at its original location gets a fresh index; past answers keep theirs.
             let resolved = restoring?.file.resolve() ?? url
@@ -2352,7 +2754,9 @@ final class DSHPetCommandClient: ObservableObject {
             guard try ResearchFileReference.fileStamp(resolved) == stamp, let reference = material.fileReference else {
                 throw ResearchMaterialError.message("读取时文件已发生变化，请重新选择。")
             }
-            return (resolved, material, reference, stamp)
+            try Task.checkCancellation()
+            cache.remember(at: resolved, material: material, reference: reference, stamp: stamp, recognizeScans: recognizeScans)
+            return (resolved, material, reference, stamp, ProcessInfo.processInfo.systemUptime - start, false)
         }
         materialReadTask = Task { @MainActor [weak self] in
             let result = await withTaskCancellationHandler { await worker.result } onCancel: { worker.cancel() }
@@ -2360,7 +2764,8 @@ final class DSHPetCommandClient: ObservableObject {
             materialReadTask = nil
             loadingResearchFile = false
             switch result {
-            case .success(let (resolved, material, reference, stamp)):
+            case .success(let (resolved, material, reference, stamp, elapsed, reused)):
+                indexPreparation = (elapsed, reused)
                 fixedMaterial = material
                 fixedMaterialURL = resolved
                 fixedStamp = stamp
@@ -2393,45 +2798,21 @@ final class DSHPetCommandClient: ObservableObject {
         guard fileChoiceBinding == sessionBindingGeneration else { return }
         if let url { loadFixedMaterial(url) }
     }
-    private func refreshResearchState(_ kind: ResearchRefresh = .all, enqueueIfBusy: Bool = true) async {
+    private func refreshResearchState(enqueueIfBusy: Bool = true) async {
         guard researchAvailable, connection == .connected, capabilitiesValidated, !Task.isCancelled else { return }
         if researchRefreshInFlight {
-            if enqueueIfBusy { researchRefreshQueued.formUnion(kind) }
+            if enqueueIfBusy { researchRefreshQueued = true }
             return
         }
         researchRefreshInFlight = true
         defer {
             researchRefreshInFlight = false
-            if !researchRefreshQueued.isEmpty {
-                let queued = researchRefreshQueued
-                researchRefreshQueued = []
-                refreshResearch(queued)
+            if researchRefreshQueued {
+                researchRefreshQueued = false
+                refreshResearch()
             }
         }
-        let generation = connectionGeneration
-        if kind.contains(.conversation) { await refreshConversation(generation: generation) }
-        if kind.contains(.material), !Task.isCancelled, connectionGeneration == generation, materialSource == .zotero {
-            await refreshPaperContext(generation: generation)
-        }
-    }
-
-    private func refreshPaperContext(generation: Int) async {
-        let revision = materialRevision
-        do {
-            let response = try await request(action: "researchContext", timeout: 6, expectedGeneration: generation)
-            guard connectionGeneration == generation, !Task.isCancelled,
-                  materialSource == .zotero, materialRevision == revision else { return }
-            let context = try ResearchProtocol.decodeContext(response["context"])
-            let error = context?.error ?? response["error"] as? String
-            if paperContext != context { paperContext = context }
-            if contextError != error { contextError = error }
-        } catch {
-            guard connectionGeneration == generation, !Task.isCancelled,
-                  materialSource == .zotero, materialRevision == revision else { return }
-            if paperContext != nil { paperContext = nil }
-            let message = errorMessage(error)
-            if contextError != message { contextError = message }
-        }
+        await refreshConversation(generation: connectionGeneration)
     }
 
     private func refreshConversation(generation: Int) async {
@@ -2522,11 +2903,24 @@ final class DSHPetCommandClient: ObservableObject {
         pendingSessionID = nil
         defaults.removeObject(forKey: Keys.pendingSessionID)
         let compositionKey = attachmentKey(session: nil)
+        if capturingSelection {
+            cancelResearchSelectionCapture()
+        }
         sessionID = returnedSession
         if let key = attachmentKey(session: returnedSession) {
             restoredAttachmentKey = key
             if let attachment, let encoded = try? JSONEncoder().encode(attachment) { defaults.set(encoded, forKey: key) }
             if let compositionKey { defaults.removeObject(forKey: compositionKey) }
+            if let appMaterial {
+                do {
+                    try provenanceStore.savePendingSelection(appMaterial, for: key)
+                    if let compositionKey { try provenanceStore.removePendingSelection(compositionKey) }
+                } catch {
+                    if availableResearchSelection != nil {
+                        selectionFeedback = .advisory("无法将选区迁入新会话。它仍可用于本轮。")
+                    }
+                }
+            }
         }
         defaults.set(returnedSession, forKey: Keys.sessionID)
         ResearchLaunchLog.write("session-created")
@@ -2589,6 +2983,8 @@ final class DSHPetCommandClient: ObservableObject {
     }
 
     private func clearSessionBinding() {
+        activeTiming?.value.finish("sessionChanged")
+        activeTiming = nil
         sessionBindingGeneration &+= 1
         sessionCreationTask?.cancel()
         sessionCreationTask = nil
@@ -2596,18 +2992,13 @@ final class DSHPetCommandClient: ObservableObject {
         sessionID = nil
         resetCurrentFile()
         restoreCurrentFileIfNeeded()
+        restoreResearchSelection()
         sessionSnapshot = nil
         resetResearchConversation()
         pendingSessionID = nil
-        pendingRequestID = nil
-        pendingRequestText = nil
-        pendingRequestSignature = nil
-        promptMayHaveBeenSent = false
         defaults.removeObject(forKey: Keys.sessionID)
         defaults.removeObject(forKey: Keys.pendingSessionID)
-        defaults.removeObject(forKey: Keys.requestID)
-        defaults.removeObject(forKey: Keys.requestText)
-        defaults.removeObject(forKey: Keys.requestSignature)
+        invalidatePendingSubmission()
         continuationWarning = nil
     }
 
@@ -2630,6 +3021,8 @@ final class DSHPetCommandClient: ObservableObject {
     private func invalidateConnection(clearPersistedPending: Bool) {
         connectionGeneration &+= 1
         sessionBindingGeneration &+= 1
+        cancelResearchSelectionCapture()
+        fileVerificationWorker?.task.cancel()
         sessionCreationTask?.cancel()
         sessionCreationTask = nil
         dismissCandidates()
@@ -2644,15 +3037,7 @@ final class DSHPetCommandClient: ObservableObject {
         reconnectTask = nil
         queuedPayloads.removeAll(keepingCapacity: false)
         failPending(with: DSHPetCommandError.unavailable)
-        if clearPersistedPending {
-            pendingRequestID = nil
-            pendingRequestText = nil
-            pendingRequestSignature = nil
-            promptMayHaveBeenSent = false
-            defaults.removeObject(forKey: Keys.requestID)
-            defaults.removeObject(forKey: Keys.requestText)
-            defaults.removeObject(forKey: Keys.requestSignature)
-        }
+        if clearPersistedPending { invalidatePendingSubmission() }
         connection = .disconnected
     }
 
@@ -2680,8 +3065,7 @@ final class DSHPetCommandClient: ObservableObject {
         modelSelectionRevision &+= 1
         materialTransportAvailable = false
         documentPlanningAvailable = false
-        paperContext = nil
-        contextError = nil
+        documentImageTransportAvailable = false
         conversationRunning = false
         imageLimits = nil
         dismissCandidates()
@@ -2766,7 +3150,7 @@ final class DSHPetCommandClient: ObservableObject {
                    snapshotMatchesSelectedInstance(snapshot) {
                     let runningChanged = sessionSnapshot?.taskRunning != snapshot.taskRunning
                     if sessionSnapshot != snapshot { sessionSnapshot = snapshot }
-                    if runningChanged && researchWindowForeground { refreshResearch(.conversation) }
+                    if runningChanged && researchWindowForeground { refreshResearch() }
                 }
                 continue
             }
@@ -2779,7 +3163,7 @@ final class DSHPetCommandClient: ObservableObject {
                    let state = object["state"] as? [String: Any] {
                     lastStreamUpdate = ProcessInfo.processInfo.systemUptime
                     receiveResearchStream(state)
-                    if state["settled"] as? Bool == true { refreshResearch(.conversation) }
+                    if state["settled"] as? Bool == true { refreshResearch() }
                 }
                 continue
             }
@@ -2872,6 +3256,7 @@ final class DSHPetCommandClient: ObservableObject {
                 if researchPollingTask != nil { refreshModelCatalog() }
                 materialTransportAvailable = supports.contains("researchMaterial")
                 documentPlanningAvailable = supports.contains("researchDocumentPlan")
+                documentImageTransportAvailable = supports.contains("researchDocumentImages")
                 imageLimits = decodeImageLimits(response["attachmentLimits"])
                 if taskListAvailable {
                     subscribeTasks(expectedGeneration: generation)
@@ -3060,6 +3445,16 @@ final class DSHPetCommandClient: ObservableObject {
         if let data = try? JSONEncoder().encode(draftImages) {
             defaults.set(data, forKey: Keys.draftImages)
         }
+    }
+
+    private func rememberPendingSubmission(id: String, text: String, signature: String, mayHaveBeenSent: Bool) {
+        pendingRequestID = id
+        pendingRequestText = text
+        pendingRequestSignature = signature
+        promptMayHaveBeenSent = mayHaveBeenSent
+        defaults.set(id, forKey: Keys.requestID)
+        defaults.set(text, forKey: Keys.requestText)
+        defaults.set(signature, forKey: Keys.requestSignature)
     }
 
     private func invalidatePendingSubmission() {

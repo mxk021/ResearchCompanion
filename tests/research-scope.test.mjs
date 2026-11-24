@@ -1,5 +1,6 @@
 /** Isolated backend regression tests. No user DSH/Zotero data or models are used. */
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, readdir, rm, mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -48,6 +49,8 @@ async function harness(run) {
     queue: [],
     archivedSessionIds: [],
     indexedLogs: new Map(),
+    imageBytes: new Map(),
+    imageReceipts: new Map(),
   }
   const agents = new Map()
   const getAgent = id => {
@@ -68,6 +71,29 @@ async function harness(run) {
   const reasoning = { efforts: [{ id: 'low', name: 'Low' }, { id: 'medium', name: 'Medium' }], defaultEffort: 'low' }
   const services = {
     connection: { requestRejection: () => state.httpRejection },
+    fileUploads: {
+      async uploadImageStream({ sessionId, data, mediaType, signal, name }) {
+        assert.ok(signal instanceof AbortSignal)
+        const chunks = []
+        for await (const bytes of data) {
+          signal.throwIfAborted()
+          assert.ok(bytes instanceof Uint8Array)
+          chunks.push(bytes)
+        }
+        const original = Buffer.concat(chunks)
+        // Simulate the installed store's real contract: normalization may change
+        // the encoded bytes while preserving the image. Strip the synthetic tEXt chunk.
+        assert.deepEqual(original.subarray(33, 33 + pngMetadata.length), pngMetadata)
+        const normalized = Buffer.concat([original.subarray(0, 33), original.subarray(33 + pngMetadata.length)])
+        const attachmentId = 'sha256:' + createHash('sha256').update(normalized).digest('hex')
+        const image = { attachmentId, mediaType, name, bytes: normalized.length, width: 1, height: 1 }
+        state.imageBytes.set(attachmentId, normalized)
+        const receiptId = `receipt-${state.imageReceipts.size + 1}`
+        state.imageReceipts.set(receiptId, { sessionId, image })
+        calls.push(['image.upload', original])
+        return { receiptId, image }
+      },
+    },
     sessionQuery: {
       observeSession: async (sessionId, { signal, projectionMode }) => {
         assert.equal(projectionMode, 'none')
@@ -94,7 +120,9 @@ async function harness(run) {
         if (provider === 'chatgpt' && state.subscriptionError) throw state.subscriptionError
         return models[provider] ?? []
       },
-      resolveModelInfo: async provider => provider === 'chatgpt' ? { reasoning } : {},
+      resolveModelInfo: async provider => provider === 'chatgpt'
+        ? { reasoning, inputModalities: ['text', 'image', 'audio'] }
+        : { inputModalities: ['text'] },
       resolveCallConfig: async selection => {
         if (selection.reasoningEffort !== undefined && (selection.provider !== 'chatgpt' || !reasoning.efforts.some(level => level.id === selection.reasoningEffort))) {
           throw Object.assign(new Error('invalid effort'), { code: 'UNSUPPORTED_REASONING_EFFORT' })
@@ -104,7 +132,16 @@ async function harness(run) {
     },
   }
   const ctx = {
-    attachments: { imageLimits: { maxImageBytes: 20, maxImagesPerMessage: 2, maxMessageImageBytes: 30, maxImagePixels: 100, maxImageDimension: 10, mediaTypes: ['image/png'] } },
+    attachments: {
+      imageLimits: { maxImageBytes: 128, maxImagesPerMessage: 5, maxMessageImageBytes: 640, maxImagePixels: 100, maxImageDimension: 10, mediaTypes: ['image/png'] },
+      readImage: async (ref, signal) => {
+        assert.ok(signal instanceof AbortSignal)
+        signal.throwIfAborted()
+        const data = state.imageBytes.get(ref.attachmentId)
+        if (!data) throw new Error('Fixture attachment missing from the store.')
+        return { ref, data }
+      },
+    },
     workspaceRegistry: {
       get archivedSessionIds() { return state.archivedSessionIds },
       create: async (path, title) => { calls.push(['workspace.create', path, title]); assert.equal(path, researchPath); return research },
@@ -284,7 +321,9 @@ test('research directory enumerates account routes only, with exact model abilit
     const { catalog } = await client.request('modelCatalog')
     assert.deepEqual(catalog.groups.map(group => group.id), ['deepseek-account', 'chatgpt'])
     assert.equal(catalog.groups[0].models[0].reasoning, undefined)
+    assert.deepEqual(catalog.groups[0].models[0].inputModalities, ['text'])
     assert.deepEqual(catalog.groups[1].models[0].reasoning.efforts.map(effort => effort.id), ['low', 'medium'])
+    assert.deepEqual(catalog.groups[1].models[0].inputModalities, ['text', 'image'])
     assert.equal(catalog.defaultSelection.provider, 'deepseek-account')
     assert.equal(calls.some(call => call[0] === 'llm.list' && call[1] === 'openai'), false)
     state.subscriptionError = Object.assign(new Error('do not expose opaque provider details'), { code: 'chatgpt_sign_in_required' })
@@ -509,9 +548,14 @@ test('an explicit unsupported-tools failure permits a single isolated schema-onl
 })
 
 
+async function consumeStream(handler, request, next = async function* () {}) {
+  const chunks = []
+  for await (const chunk of handler(request, next)) chunks.push(chunk)
+  return chunks
+}
+
 test('dispatch verification fingerprints only evidence actually present at the adapter boundary', async () => {
   await harness(async ({client,calls,eventHandlers}) => {
-    const {createHash} = await import('node:crypto')
     const target = {workspaceId:'research-workspace',sessionId:'research-session'}
     const selection = {provider:'chatgpt',model:'gpt-test',reasoningEffort:'medium'}
     const material = {source:'PDF',title:'Synthetic',scope:'file page 2',text:'α and β in synthetic data.'}
@@ -524,10 +568,129 @@ test('dispatch verification fingerprints only evidence actually present at the a
     const prompt = calls.filter(([name])=>name==='prompt').at(-1)[1].content[0].text
     const input = prompt.replace(material.text,'SYNTHETIC changed by fixture after admission')
     const messages = [{role:'user',source:{kind:'user',rpcId:requestId},content:[{type:'text',text:input}]}]
-    stream({...selection,sessionId:target.sessionId,messages},()=>[])
+    await consumeStream(stream, {...selection,sessionId:target.sessionId,messages})
     const quote = 'SYNTHETIC changed by fixture after admission'
-    assert.deepEqual(await get(),{requestId,selection,sha256:createHash('sha256').update(quote).digest('hex'),utf16Length:quote.length})
+    const { requestedAt, dispatchedAt, timing, ...evidence } = await get()
+    assert.deepEqual(evidence,{requestId,selection,sha256:createHash('sha256').update(quote).digest('hex'),utf16Length:quote.length})
+    assert.ok(requestedAt <= dispatchedAt)
+    assert.ok(Number.isFinite(timing.prepareMs) && timing.prepareMs >= 0)
+    assert.equal(timing.normalizeMs, 0)
+    assert.ok(Number.isFinite(timing.scheduleMs) && timing.scheduleMs >= 0)
     assert.equal((await client.request('conversation',{...target,requestId:'different'})).dispatchEvidence,null)
     assert.equal('dispatchEvidence' in (await client.request('conversation',target)),false)
+  })
+})
+
+// Two one-pixel PNGs. The source encodings also contain a tEXt chunk that the
+// staged upload fixture removes before calculating the durable attachment id.
+const pngMetadata = Buffer.from('000000297445587446697874757265006d657461646174612072656d6f766564206279206e6f726d616c697a6174696f6eb840c3b2', 'hex')
+const storedPNGs = [
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg==',
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGP4DwABAQEAsTj2FAAAAABJRU5ErkJggg==',
+].map(data => Buffer.from(data, 'base64'))
+const crops = storedPNGs.map((png, index) => ({
+  mediaType: 'image/png', name: `page-crop-${index + 1}.png`,
+  data: Buffer.concat([png.subarray(0, 33), pngMetadata, png.subarray(33)]).toString('base64'),
+}))
+const objectMaterial = {
+  source: 'PDF 文件', title: 'Synthetic derivation', scope: '文档对象 · Eq. (6)',
+  text: 'Equation (6) on page 2: q = α² − β. The variables are defined below the equation.',
+}
+const documentTarget = { workspaceId: 'research-workspace', sessionId: 'research-session' }
+const visionSelection = { provider: 'chatgpt', model: 'gpt-test', reasoningEffort: 'medium' }
+const textSelection = { provider: 'deepseek-account', model: 'deepseek-flash' }
+
+test('images enter only an explicitly scoped document turn on a declared vision route', async () => {
+  await harness(async ({ client, calls }) => {
+    const submit = (selection, overrides = {}) => client.request('researchPrompt', {
+      ...documentTarget, requestId: 'document-input', text: 'Explain Eq. (6)', mode: 'ask',
+      includeContext: true, material: objectMaterial, images: crops, selection, ...overrides,
+    })
+    assert.ok((await client.request('capabilities')).supports.includes('researchDocumentImages'))
+    await client.request('researchSelectModel', { ...documentTarget, selection: visionSelection })
+    await assert.rejects(submit(visionSelection, { material: undefined }), /必须绑定/)
+    await assert.rejects(submit(visionSelection, { selection: undefined }), /必须绑定/)
+    await assert.rejects(submit(visionSelection, { includeContext: false }), /明确开启带入/)
+    await assert.rejects(submit(visionSelection, { images: Array(5).fill(crops[0]) }), /最多四处/)
+    await client.request('researchSelectModel', { ...documentTarget, selection: textSelection })
+    await assert.rejects(submit(textSelection), /没有声明支持图片/)
+    assert.equal(calls.filter(([name]) => name === 'prompt').length, 0)
+
+    const textReply = await submit(textSelection, { images: undefined })
+    assert.equal(textReply.accepted, true)
+    assert.deepEqual(textReply.selection, textSelection)
+    const textPrompt = calls.filter(([name]) => name === 'prompt').at(-1)[1]
+    assert.deepEqual(textPrompt.content.map(part => part.type), ['text'])
+    assert.ok(textPrompt.content[0].text.includes(objectMaterial.text))
+  })
+})
+
+test('the actual model boundary verifies each crop in source order and refuses missing or altered evidence', async () => {
+  await harness(async ({ client, state, calls, eventHandlers }) => {
+    await client.request('researchSelectModel', { ...documentTarget, selection: visionSelection })
+    const handler = eventHandlers.get('llm/stream')[0]
+    const get = async requestId => (await client.request('conversation', { ...documentTarget, requestId })).dispatchEvidence
+    const sha = value => createHash('sha256').update(value).digest('hex')
+    async function admit(requestId) {
+      const previousUploads = calls.filter(([name]) => name === 'image.upload').length
+      const receipt = await client.request('researchPrompt', {
+        ...documentTarget, requestId, text: 'Explain Eq. (6)', mode: 'ask', selection: visionSelection,
+        includeContext: true, material: objectMaterial, images: crops,
+      })
+      assert.deepEqual(receipt.selection, visionSelection)
+      assert.equal(await get(requestId), null)
+      const { content } = calls.filter(([name]) => name === 'prompt').at(-1)[1]
+      assert.deepEqual(calls.filter(([name]) => name === 'image.upload').slice(previousUploads).map(([, bytes]) => bytes),
+        crops.map(crop => Buffer.from(crop.data, 'base64')))
+      assert.deepEqual(content.slice(1).map(part => part.type), ['file', 'file'])
+      const stored = content.slice(1).map(({ receiptId }) => {
+        const upload = state.imageReceipts.get(receiptId)
+        assert.equal(upload.sessionId, documentTarget.sessionId)
+        return { type: 'image', attachment: upload.image }
+      })
+      return { role: 'user', source: { kind: 'user', rpcId: requestId }, content: [content[0], ...stored] }
+    }
+    let entries = 0
+    async function* provider() { entries++; yield { type: 'fixture-accepted' } }
+    const adapter = (message, selection = visionSelection) => consumeStream(handler, {
+      ...selection, sessionId: documentTarget.sessionId, signal: AbortSignal.timeout(5000), messages: [message],
+    }, provider)
+    const good = await admit('vision-good')
+    assert.deepEqual(await adapter(good), [{ type: 'fixture-accepted' }])
+    const logged = await get('vision-good')
+    assert.deepEqual(logged.images, storedPNGs.map(sha))
+    assert.deepEqual(logged.sourceImages, crops.map(crop => sha(Buffer.from(crop.data, 'base64'))))
+    assert.notDeepEqual(logged.sourceImages, logged.images)
+    assert.equal(logged.sha256, sha(objectMaterial.text))
+    assert.equal(logged.utf16Length, objectMaterial.text.length)
+    assert.deepEqual(logged.selection, visionSelection)
+    assert.ok(logged.requestedAt <= logged.dispatchedAt)
+    assert.equal(await get('foreign-id'), null)
+    assert.doesNotMatch(JSON.stringify(logged), /iVBORw0KGgo|Synthetic derivation/)
+
+    const missing = await admit('vision-missing')
+    const stored = missing.content.slice(1)
+    await assert.rejects(adapter({ ...missing, content: missing.content.slice(0, 2) }), /裁图数量/)
+    await assert.rejects(adapter({ ...missing, content: [missing.content[0], { ...stored[0], offloaded: true }, stored[1]] }), /裁图数量/)
+    await assert.rejects(adapter({ ...missing, content: [missing.content[0], { type: 'image' }, stored[1]] }), /缺少.*裁图引用/)
+    state.imageBytes.delete(stored[0].attachment.attachmentId)
+    await assert.rejects(adapter(missing), /missing from the store/)
+    state.imageBytes.set(stored[0].attachment.attachmentId, storedPNGs[0])
+    assert.equal(await get('vision-missing'), null)
+
+    const changed = await admit('vision-changed')
+    await assert.rejects(adapter({ ...changed, content: [changed.content[0], ...stored.toReversed()] }), /裁图引用/)
+    state.imageBytes.set(stored[0].attachment.attachmentId, storedPNGs[1])
+    await assert.rejects(adapter(changed), /原页不同/)
+    assert.equal(await get('vision-changed'), null)
+
+    const wrong = await admit('vision-wrong')
+    await assert.rejects(adapter(wrong, { ...visionSelection, reasoningEffort: 'low' }), /模型及推理强度不一致/)
+    await assert.rejects(adapter(wrong, textSelection), /模型及推理强度不一致/)
+    const altered = { ...wrong.content[0], text: wrong.content[0].text.replace('α²', 'XXX') }
+    await assert.rejects(adapter({ ...wrong, content: [altered, ...stored] }), /原文与本轮快照不一致/)
+    await assert.rejects(adapter({ ...wrong, content: stored }), /未找到本轮核对的文档原文/)
+    assert.equal(await get('vision-wrong'), null)
+    assert.equal(entries, 1, 'an invalid source must fail before the provider is called')
   })
 })

@@ -30,7 +30,7 @@ html { background: var(--background); color: var(--text); }
 body { margin: 0; overflow-x: hidden; }
 button { font: inherit; }
 #transcript { padding: 2px 3px 16px; }
-#empty, #busy { color: var(--hint); margin: 10px; }
+#empty { color: var(--hint); margin: 10px; }
 #messages { container-type: inline-size; }
 .message {
   margin: 0 0 10px;
@@ -41,9 +41,6 @@ button { font: inherit; }
   min-width: 0;
 }
 .message.user { background: var(--outgoing); }
-.settled-answer:focus { outline: none; }
-.settled-answer.answer-target { box-shadow: inset 2px 0 var(--answer-focus); }
-.settled-answer.answer-target:focus-visible { outline: 1px solid var(--answer-focus); outline-offset: -1px; }
 .message-header {
   display: flex;
   align-items: baseline;
@@ -89,14 +86,15 @@ li > p { margin: .2em 0; }
 a { color: var(--link); }
 blockquote { margin: .6em 0; padding-left: .9em; border-left: 2px solid var(--line); }
 pre, code, .math-fallback { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-pre, .math-display, .math-inline {
+pre, .math-display {
   max-width: 100%;
   overflow-x: auto;
   overflow-y: hidden;
 }
 pre, .math-fallback { white-space: pre-wrap; }
 pre { white-space: pre; background: var(--background); border: 1px solid var(--line); padding: 8px; border-radius: 5px; }
-.math-inline { display: inline-block; vertical-align: -.22em; overflow-wrap: normal; }
+/* Short formulas use KaTeX's text baseline, without a nested scroll box. */
+.math-inline { overflow-wrap: normal; }
 .math-display { display: block; padding: 4px 0; }
 .math-display > .katex-display {
   /* Preserve the left edge of a formula wider than the viewport. */
@@ -190,11 +188,15 @@ details > pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .message-header .answer-material-label, .message-header .answer-source {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 28ch; font-weight: 400;
 }
+.message-header .source-objects {
+  flex: 0 1 auto; max-width: 28ch; overflow: hidden; text-overflow: ellipsis; white-space: pre;
+}
 .message-header .source-page { flex: 0 1 auto; max-width: 18ch; overflow: hidden; text-overflow: ellipsis; white-space: pre; font-weight: 400; }
 @container (max-width: 475px) {
   .message-header { flex-wrap: wrap; gap: 0 6px; }
   .message-actions { flex: 1 1 auto; }
   .message-header .answer-material-label, .message-header .answer-source { max-width: 30cqw; }
+  .message-header .source-objects { max-width: 33cqw; }
   .source-group { flex-shrink: 1; }
 }
 #reading-feedback {

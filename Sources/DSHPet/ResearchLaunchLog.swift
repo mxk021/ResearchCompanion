@@ -6,12 +6,11 @@ import Darwin
 enum ResearchLaunchLog {
     static func write(_ event: String) {
         let allowed = Set(["main-entered", "delegate-launched", "panels-created", "first-panel-presented",
-            "hotkey-ready", "hotkey-unavailable", "hotkey-disabled", "hotkey-default-option-space",
-            "hotkey-custom-registered", "hotkey-triggered", "bridge-disconnected", "bridge-connecting", "bridge-connected",
+            "bridge-disconnected", "bridge-connecting", "bridge-connected",
             "capabilities-requested", "capabilities-validated", "command-unavailable", "command-timeout",
             "command-malformed", "command-server-rejected", "command-other-error",
             "session-created", "session-reused", "session-binding-rejected",
-            "panel-opened", "panel-explicitly-closed", "app-hidden",
+            "panel-opened", "panel-explicitly-closed", "app-hidden", "pet-chat-clicked",
             "selection-service-invoked", "selection-service-origin-rejected", "selection-service-empty",
             "selection-accessibility-allowed", "selection-accessibility-denied",
             "selection-service-accepted", "selection-service-invalid",

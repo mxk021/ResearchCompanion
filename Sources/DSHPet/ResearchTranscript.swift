@@ -11,14 +11,9 @@ struct ResearchTranscript: NSViewRepresentable {
     let stream: ResearchChatMessage?
     let sessionID: String?
     let jump: Int
-    let busy: String?
-    let presentation: ResearchWindowPresentation
+    var didDisplay: ((String, ResearchChatMessage?, ResearchChatMessage?) -> Void)? = nil
 
-    func makeCoordinator() -> Coordinator {
-        let coordinator = Coordinator()
-        presentation.performReadingAction = { [weak coordinator] in coordinator?.performReadingAction($0) }
-        return coordinator
-    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> NSView {
         guard let path = Bundle.main.resourceURL?.appendingPathComponent("Transcript/index.html"),
@@ -45,7 +40,7 @@ struct ResearchTranscript: NSViewRepresentable {
             return
         }
         context.coordinator.update(messages, historyRevision: historyRevision, stream: stream,
-                                   sessionID: sessionID, jump: jump, busy: busy ?? "")
+                                   sessionID: sessionID, jump: jump, didDisplay: didDisplay)
     }
 
     static func dismantleNSView(_ view: NSView, coordinator: Coordinator) { coordinator.detach() }
@@ -58,7 +53,6 @@ struct ResearchTranscript: NSViewRepresentable {
             let stream: ResearchChatMessage?
             let session: String
             let jump: Int
-            let busy: String
 
             static func id(_ row: ResearchChatMessage) -> String { "\(row.role):\(row.id)" }
 
@@ -71,19 +65,21 @@ struct ResearchTranscript: NSViewRepresentable {
                     values["sourceDisplay"] = source.display
                     values["sourceTitle"] = source.title
                     if let page = source.page { values["sourcePage"] = page }
+                    if let objects = source.objects { values["sourceObjects"] = objects }
                     values["sourceDetails"] = source.details
+                    if let warning = source.warning { values["sourceWarning"] = warning }
                     values["canOpenSource"] = source.canOpen
                 }
                 return values
             }
 
-            /// The scroll token and busy line can change without any new text.
+            /// The scroll token can change without any new text.
             /// Revisit the history array only when the command client changes it.
-            func update(after earlier: Snapshot?) -> [String: Any]? {
+            func update(after earlier: Snapshot?, appendStream: Bool) -> [String: Any]? {
                 let reset = earlier?.session != session
                 let historyChanged = reset || earlier?.historyRevision != historyRevision
                 let streamChanged = reset || earlier?.stream != stream
-                guard historyChanged || streamChanged || earlier?.jump != jump || earlier?.busy != busy else { return nil }
+                guard historyChanged || streamChanged || earlier?.jump != jump else { return nil }
 
                 var rows: [[String: Any]] = []
                 if historyChanged {
@@ -94,9 +90,22 @@ struct ResearchTranscript: NSViewRepresentable {
                         previous[Self.id(row)] != row ? wire(row, streaming: false) : nil
                     }
                 }
-                if streamChanged, let stream { rows.append(wire(stream, streaming: true)) }
+                if streamChanged, let stream {
+                    var row = wire(stream, streaming: true)
+                    if appendStream, !reset, let previous = earlier?.stream, Self.id(previous) == Self.id(stream) {
+                        let prefix = previous.text.utf8
+                        let text = stream.text.utf8
+                        if !prefix.isEmpty, prefix.count < text.count, text.starts(with: prefix) {
+                            // Use a byte-exact prefix check. Swift String equality
+                            // can treat distinct Unicode representations as equal.
+                            row["appendAfterUTF16"] = previous.text.utf16.count
+                            row["text"] = String(decoding: text.dropFirst(prefix.count), as: UTF8.self)
+                        }
+                    }
+                    rows.append(row)
+                }
 
-                var data: [String: Any] = ["session": session, "jump": jump, "busy": busy, "rows": rows]
+                var data: [String: Any] = ["session": session, "jump": jump, "rows": rows]
                 let activeID = stream.map(Self.id)
                 if historyChanged || earlier?.stream.map(Self.id) != activeID {
                     data["order"] = messages.map(Self.id) + (activeID.map { [$0] } ?? [])
@@ -123,50 +132,7 @@ struct ResearchTranscript: NSViewRepresentable {
         private var request: Snapshot?
         private var applied: Snapshot?
         private var delivering: Snapshot?
-        private var readingRequest: (token: String, session: String, action: ResearchReadingAction, expires: TimeInterval)?
-        private var lastReadingAction: (action: ResearchReadingAction, time: TimeInterval)?
-
-        private func readingWindow(_ web: WKWebView) -> NSWindow? {
-            guard NSApp.isActive, let window = web.window, window.isKeyWindow, window.isVisible,
-                  window.attachedSheet == nil else { return nil }
-            return window
-        }
-
-        private func hasReadingFocus(_ web: WKWebView, in window: NSWindow) -> Bool {
-            guard let responder = window.firstResponder as? NSView else { return false }
-            return responder === web || responder.isDescendant(of: web)
-        }
-
-        func performReadingAction(_ action: ResearchReadingAction) {
-            guard ready, let web, let window = readingWindow(web), let current = request,
-                  current.session == applied?.session else { return }
-            let now = ProcessInfo.processInfo.systemUptime
-            if let lastReadingAction, lastReadingAction.action == action, now - lastReadingAction.time < 0.7 { return }
-            lastReadingAction = (action, now)
-            let token = UUID().uuidString
-            readingRequest = (token, current.session, action, now + 2)
-            web.callAsyncJavaScript("window.ResearchTranscript.readingCommand(action, session, token, focused);",
-                                    arguments: ["action": action.rawValue, "session": current.session,
-                                                "token": token, "focused": hasReadingFocus(web, in: window)],
-                                    in: nil, in: .page, completionHandler: nil)
-        }
-
-        private func consumeReadingRequest(_ token: String, body: [String: Any]) -> Bool {
-            guard let request = readingRequest, request.token == token else { return false }
-            readingRequest = nil
-            guard request.expires >= ProcessInfo.processInfo.systemUptime,
-                  request.session == body["session"] as? String,
-                  request.session == self.request?.session,
-                  let web, let window = readingWindow(web), hasReadingFocus(web, in: window) else { return false }
-            switch request.action {
-            case .saveSelection:
-                return body["noteID"] is String && (
-                    body["readingWholeAnswer"] as? Bool == true || !(body["selection"] as? String ?? "").isEmpty
-                )
-            case .openSource:
-                return body["directSourceID"] is String
-            }
-        }
+        private var didDisplay: ((String, ResearchChatMessage?, ResearchChatMessage?) -> Void)?
         private var savingNote = false
         private var latestNoteSave: String?
         private var savedNote: (id: String, result: ResearchNoteStorage.Saved)?
@@ -180,26 +146,29 @@ struct ResearchTranscript: NSViewRepresentable {
 
         func detach() {
             contentGeneration &+= 1
-            readingRequest = nil
             web?.configuration.userContentController.removeScriptMessageHandler(forName: "researchTranscript")
             web?.navigationDelegate = nil
             web = nil
         }
 
         func update(_ messages: [ResearchChatMessage], historyRevision: Int, stream: ResearchChatMessage?,
-                    sessionID: String?, jump: Int, busy: String) {
+                    sessionID: String?, jump: Int,
+                    didDisplay: ((String, ResearchChatMessage?, ResearchChatMessage?) -> Void)? = nil) {
+            self.didDisplay = didDisplay
             let session = sessionID ?? ""
             if request?.session != session {
                 latestNoteSave = nil
                 savedNote = nil
             }
             request = Snapshot(messages: messages, historyRevision: historyRevision, stream: stream,
-                               session: session, jump: jump, busy: busy)
+                               session: session, jump: jump)
             applyIfReady()
         }
 
-        private func applyIfReady() {
-            guard ready, !inFlight, let web, let request, let patch = request.update(after: applied) else { return }
+        private func applyIfReady(appendStream: Bool = true) {
+            guard ready, !inFlight, let web, let request,
+                  let patch = request.update(after: applied, appendStream: appendStream) else { return }
+            let usesAppend = (patch["rows"] as? [[String: Any]])?.contains { $0["appendAfterUTF16"] != nil } == true
             inFlight = true
             delivering = request
             let generation = contentGeneration
@@ -210,7 +179,15 @@ struct ResearchTranscript: NSViewRepresentable {
                 self.delivering = nil
                 if case .success = result {
                     self.applied = request
+                    if NSApp.isActive, web.window?.isVisible == true, web.window?.isMiniaturized == false {
+                        let finalAnswer = request.messages.last { $0.role == "assistant" }
+                        self.didDisplay?(request.session, request.stream, finalAnswer)
+                    }
                     self.applyIfReady()
+                } else if usesAppend {
+                    // A lost base must never stall a reply. Send the latest
+                    // complete tail once, including any intervening update.
+                    self.applyIfReady(appendStream: false)
                 }
             }
         }
@@ -230,7 +207,6 @@ struct ResearchTranscript: NSViewRepresentable {
             applied = nil
             delivering = nil
             inFlight = false
-            readingRequest = nil
             if let page { webView.loadFileURL(page, allowingReadAccessTo: page.deletingLastPathComponent()) }
         }
 
@@ -238,8 +214,6 @@ struct ResearchTranscript: NSViewRepresentable {
             guard message.frameInfo.isMainFrame, message.webView === web,
                   message.frameInfo.request.url?.standardizedFileURL == page?.standardizedFileURL,
                   let body = message.body as? [String: Any] else { return }
-            let keyboardToken = body["readingToken"] as? String
-            if let keyboardToken, !consumeReadingRequest(keyboardToken, body: body) { return }
             if body["ready"] as? Bool == true {
                 ready = true
                 applyIfReady()
@@ -254,10 +228,7 @@ struct ResearchTranscript: NSViewRepresentable {
                       window.attachedSheet == nil {
                 // Resolve from the current answer's stored capture. HTML sends an ID, never a URL or path.
                 ResearchAnswerActions.openOriginal(ResearchAnswerSource(session: session, answer: row, includePositions: false), in: window) { [weak self] in
-                    guard let self, self.request?.session == session else { return false }
-                    guard keyboardToken != nil else { return true }
-                    guard let web = self.web, let window = self.readingWindow(web) else { return false }
-                    return self.hasReadingFocus(web, in: window)
+                    self?.request?.session == session && self?.request?.answer(for: id) == row
                 }
             } else if let session = body["session"] as? String,
                       let id = (body["sourceID"] ?? body["noteID"]) as? String,
@@ -266,7 +237,9 @@ struct ResearchTranscript: NSViewRepresentable {
                       window.attachedSheet == nil {
                 let source = ResearchAnswerSource(session: session, answer: row, includePositions: false)
                 if body["sourceID"] != nil {
-                    ResearchAnswerActions.showSource(source, in: window)
+                    ResearchAnswerActions.showSource(source, in: window) { [weak self] in
+                        self?.request?.session == session && self?.request?.answer(for: id) == row
+                    }
                 } else {
                     let selection = body["selection"] as? String ?? ""
                     guard !savingNote, selection.utf16.count <= 240_000 else { return }
@@ -279,15 +252,19 @@ struct ResearchTranscript: NSViewRepresentable {
                     showNoteFeedback("", in: session)
                     Task { @MainActor in
                         defer { savingNote = false }
-                        guard request?.session == session, latestNoteSave == saveID, window.attachedSheet == nil else { return }
+                        let isCurrent = { self.request?.session == session && self.latestNoteSave == saveID
+                            && self.request?.answer(for: id) == row }
+                        guard isCurrent(), window.attachedSheet == nil else { return }
                         do {
                             let result = try await ResearchNoteActions.save(source, selected: selection.isEmpty ? nil : selection,
-                                                                            mode: mode, in: window)
-                            guard let result, request?.session == session, latestNoteSave == saveID else { return }
-                            savedNote = (saveID, result)
-                            showNoteFeedback(result.status, in: session, revealID: saveID)
+                                                                            mode: mode, in: window, ifCurrent: isCurrent)
+                            guard isCurrent() else { return }
+                            guard let result else { showNoteFeedback("", in: session); return }
+                            savedNote = (saveID, result.note)
+                            let feedback = [result.note.status, result.warning].compactMap { $0 }.joined(separator: " · ")
+                            showNoteFeedback(feedback, in: session, revealID: saveID)
                         } catch {
-                            guard request?.session == session, latestNoteSave == saveID else { return }
+                            guard isCurrent() else { return }
                             showNoteFeedback("笔记未保存。\(error.localizedDescription)", in: session)
                         }
                     }

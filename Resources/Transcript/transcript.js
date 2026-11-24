@@ -15,7 +15,6 @@
   const noteFeedbackText = document.getElementById('note-feedback-text');
   const revealNote = document.getElementById('reveal-note');
   const dismissNoteFeedback = document.getElementById('dismiss-note-feedback');
-  const busy = document.getElementById('busy');
   const empty = document.getElementById('empty');
   const rows = new Map();
   const rowByArticle = new WeakMap();
@@ -28,7 +27,6 @@
   let lastY = window.scrollY;
   let layoutDeferred = false;
   let activeFormula;
-  let activeAnswer;
   let openMore;
   let noteRevealID = '';
 
@@ -130,14 +128,6 @@
       rows.get(record.id) === record && order.includes(record.id);
   }
 
-  function setAnswer(record) {
-    if (!isAnswer(record)) record = undefined;
-    if (activeAnswer === record) return;
-    activeAnswer?.article.classList.remove('answer-target');
-    activeAnswer = record;
-    activeAnswer?.article.classList.add('answer-target');
-  }
-
   function answerWithSelection(selection) {
     const range = selection.getRangeAt(0);
     function containingBody(node) {
@@ -153,43 +143,10 @@
     return touched.length === 1 && isAnswer(touched[0]) ? touched[0] : undefined;
   }
 
-  function focusAnswer(record) {
+  function clearSelectionOutside(record) {
     const selection = window.getSelection();
     if (selection?.rangeCount && !selection.isCollapsed && (!record || answerWithSelection(selection) !== record)) {
       selection.removeAllRanges();
-    }
-    setAnswer(record);
-  }
-
-  function readingCommand(action, expectedSession, token, focused) {
-    if (expectedSession !== session) return;
-    if (!focused) {
-      readingFeedback('请先在对话正文中选中或聚焦一条回答。');
-      return;
-    }
-    const selection = window.getSelection();
-    const hasSelection = selection && !selection.isCollapsed && selection.rangeCount > 0;
-    let record;
-    let selected;
-    if (!formulaActions.hidden && isAnswer(activeFormula?.message)) {
-      record = activeFormula.message;
-      selected = activeFormula.markdown;
-    } else if (hasSelection) {
-      record = answerWithSelection(selection);
-      if (record && action === 'saveSelection') selected = selectedMarkdown(record.body, true);
-    } else if (isAnswer(activeAnswer)) {
-      record = activeAnswer;
-    }
-    setAnswer(record);
-
-    if (action === 'saveSelection') {
-      if (record && selected) post({ noteID: record.id, session, selection: selected, readingToken: token });
-      else if (record && !hasSelection) post({ noteID: record.id, session, readingWholeAnswer: true, readingToken: token });
-      else readingFeedback(hasSelection ? '请选中同一条回答内的文字或公式。' : '请先选中或聚焦一条回答。');
-    } else if (action === 'openSource') {
-      if (!record) readingFeedback('请先选中或聚焦一条回答。');
-      else if (record.openSource.hidden) readingFeedback('这条回答没有可直接打开的原文，请查看「来源」。');
-      else post({ directSourceID: record.id, session, readingToken: token });
     }
   }
 
@@ -260,17 +217,19 @@
     const sourceGroup = document.createElement('div');
     sourceGroup.className = 'source-group';
     const openSource = button('answer-direct-source', '');
+    const objectLabel = document.createElement('span');
+    objectLabel.className = 'source-objects';
     const openMaterial = document.createElement('span');
     openMaterial.className = 'answer-material-label';
     const pageLabel = document.createElement('span');
     pageLabel.className = 'source-page';
-    openSource.append(openMaterial, pageLabel);
+    openSource.append(objectLabel, openMaterial, pageLabel);
     const showSource = button('answer-source', '');
     sourceGroup.append(openSource, showSource);
     const split = document.createElement('div');
     split.className = 'note-split';
     const saveNote = button('answer-note', '保存为笔记');
-    saveNote.title = '选中本条回答的一段后保存选中内容；未选中时保存整条回答。';
+    saveNote.setAttribute('aria-description', '有选区时保存选中的回答内容');
     const note = actionMenu('answer-note-options', '▾', '笔记保存选项');
     const supplement = button('note-supplement', '添加补充后保存…');
     const saveAs = button('note-save-as', '另存为…');
@@ -289,7 +248,7 @@
     source.append(summary, original);
     article.append(header, body, source);
     const record = { id: row.id, article, body, source, original, sourceGroup, openSource, showSource,
-      openMaterial, pageLabel, split, actions, copy, more: overflow.menu, moreItems: overflow.items,
+      objectLabel, openMaterial, pageLabel, split, actions, copy, more: overflow.menu, moreItems: overflow.items,
       raw: null, originalRaw: null, blocks: null };
     rowByArticle.set(article, record);
     copy.addEventListener('click', () => post({ copyID: record.id, session }));
@@ -361,24 +320,37 @@
     return true;
   }
 
-  function updateRow(record, row) {
-    record.desired = row;
+  const headerFields = ['role', 'streaming', 'sourceDisplay', 'sourceDetails', 'canOpenSource',
+    'sourceTitle', 'sourceObjects', 'sourcePage', 'sourceWarning'];
+
+  function updateHeader(record, row) {
     const completedAnswer = row.role === 'assistant' && !row.streaming;
     record.sourceGroup.hidden = record.split.hidden = !completedAnswer;
     record.article.classList.toggle('settled-answer', completedAnswer);
-    if (completedAnswer) record.article.tabIndex = 0;
-    else record.article.removeAttribute('tabindex');
     const sourceDisplay = typeof row.sourceDisplay === 'string' ? row.sourceDisplay : '';
     const sourceDetails = typeof row.sourceDetails === 'string' ? row.sourceDetails : '';
     record.openSource.hidden = !completedAnswer || row.canOpenSource !== true || !sourceDisplay;
+    record.objectLabel.hidden = !row.sourceObjects;
+    record.objectLabel.textContent = row.sourceObjects ? row.sourceObjects + ' · ' : '';
     record.openMaterial.textContent = row.sourceTitle || sourceDisplay;
     record.pageLabel.textContent = row.sourcePage ? ' · ' + row.sourcePage : '';
     record.openSource.title = sourceDetails;
     record.openSource.setAttribute('aria-label', '打开原文 · ' + sourceDisplay);
     const inspect = record.openSource.hidden && sourceDisplay ? '摘录 · ' + sourceDisplay : '来源详情';
-    record.showSource.textContent = inspect;
-    record.showSource.title = record.openSource.hidden ? sourceDetails || '查看已记录的材料信息' : '查看当时发送的原文摘录与来源信息';
+    if (row.sourceWarning) {
+      record.showSource.textContent = record.openSource.hidden ? inspect + ' · 图注待核对' : '图注待核对';
+      record.showSource.title = row.sourceWarning;
+    } else {
+      record.showSource.textContent = inspect;
+      record.showSource.title = record.openSource.hidden ? sourceDetails || '查看已记录的材料信息' : '查看当时发送的原文摘录与来源信息';
+    }
     placeCopy(record);
+  }
+
+  function updateRow(record, row) {
+    const before = record.desired;
+    if (!before || headerFields.some(key => before[key] !== row[key])) updateHeader(record, row);
+    record.desired = row;
     if (record.raw !== row.text) {
       let shown = false;
       try {
@@ -435,8 +407,17 @@
   }
 
   function update(patch) {
+    // A stream continuation is against the last received text, including a
+    // pending render held back to preserve the reader's selection. Validate
+    // before changing any row so Swift can retry a rejected delta in full.
+    const updates = patch.rows.map(row => {
+      if (row.appendAfterUTF16 === undefined) return row;
+      const before = rows.get(row.id)?.desired;
+      if (session !== patch.session || !row.streaming || !before?.streaming ||
+          before.text.length !== row.appendAfterUTF16) throw new Error('Stream continuation base does not match');
+      return { ...row, text: before.text + row.text };
+    });
     if (session !== patch.session) {
-      setAnswer(undefined);
       closeMore();
       clearTimeout(readingFeedbackTimer);
       document.getElementById('reading-feedback').hidden = true;
@@ -458,7 +439,7 @@
     }
     if (patch.order) {
       const last = rows.get(order.at(-1));
-      const final = patch.rows.find(row => row.id === patch.order.at(-1));
+      const final = updates.find(row => row.id === patch.order.at(-1));
       // Use the same row when the live reply becomes its persisted item.
       // A final correction can differ at the same position. Delay only its
       // selected blocks, never display a second copy of that reply.
@@ -472,7 +453,7 @@
       }
       order = patch.order;
     }
-    for (const row of patch.rows) {
+    for (const row of updates) {
       let record = rows.get(row.id);
       if (!record) {
         record = createRow(row);
@@ -481,20 +462,13 @@
       updateRow(record, row);
     }
     if (patch.order) arrange();
-    if (activeAnswer && !isAnswer(activeAnswer)) setAnswer(undefined);
-    if (busy.textContent !== patch.busy) {
-      busy.hidden = patch.busy.length === 0;
-      busy.textContent = patch.busy;
-    }
+
     moveToLatest();
   }
 
   document.addEventListener('selectionchange', () => {
     const selection = window.getSelection();
-    if (selection?.rangeCount && !selection.isCollapsed) {
-      setAnswer(answerWithSelection(selection));
-      return;
-    }
+    if (selection?.rangeCount && !selection.isCollapsed) return;
     if (!layoutDeferred && deferredRows.size === 0) return;
     if (layoutDeferred) arrange();
     for (const record of deferredRows) updateRow(record, record.desired);
@@ -503,7 +477,7 @@
   document.addEventListener('focusin', event => {
     if (formulaActions.contains(event.target)) return;
     if (openMore && !openMore.contains(event.target)) closeMore();
-    focusAnswer(rowByArticle.get(event.target.closest('article')));
+    clearSelectionOutside(rowByArticle.get(event.target.closest('article')));
   });
   document.addEventListener('click', event => {
     if (openMore && !openMore.contains(event.target)) closeMore();
@@ -512,10 +486,8 @@
       if (event.detail > 0) {
         const selection = window.getSelection();
         const record = rowByArticle.get(event.target.closest('article'));
-        if (record && selection?.rangeCount && !selection.isCollapsed && record.body.contains(event.target)) {
-          setAnswer(answerWithSelection(selection));
-        } else {
-          focusAnswer(record);
+        if (!(record && selection?.rangeCount && !selection.isCollapsed && record.body.contains(event.target))) {
+          clearSelectionOutside(record);
         }
       }
     }
@@ -530,7 +502,7 @@
     if (!math) return;
     event.preventDefault();
     const message = Array.from(rows.values()).find(row => row.body.contains(math));
-    focusAnswer(message);
+    clearSelectionOutside(message);
     activeFormula = { message, tex: math.dataset.latex, markdown: math.dataset.markdown };
     formulaSave.hidden = formulaSaveOptions.hidden = message?.desired?.role !== 'assistant' || message.desired.streaming;
     formulaActions.hidden = false;
@@ -567,6 +539,6 @@
     if (openMore && getComputedStyle(openMore).display === 'none') closeMore();
   });
 
-  window.ResearchTranscript = Object.freeze({ update, readingCommand, noteSaved });
+  window.ResearchTranscript = Object.freeze({ update, noteSaved });
   post({ ready: true });
 })();

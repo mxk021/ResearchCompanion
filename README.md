@@ -1,32 +1,28 @@
 # Research Companion · 科研助手
 
-Research Companion 是一款免费开源的 macOS 文献阅读助手。把 PDF、文本文件或一段选中的原文带进科研窗口，结合材料提问，再把回答和公式存成 Markdown 笔记。模型与会话由你自己安装的 DeepSeek Harness Desktop（DSH）提供。
+Research Companion 是一款开源的 macOS 文献阅读助手。关联 PDF、纯文本或 Markdown，按页码、章节或原句定位证据，结合原文提问，再把回答和公式存成 Markdown 笔记。模型和会话由你安装的 DeepSeek Harness Desktop（DSH）提供。
 
-![使用合成材料展示的科研对话与公式](docs/images/research-transcript.png)
+## 安装 v0.3.0
 
-## 下载和安装
+公开安装包适用于 Apple Silicon（arm64）。最低部署目标为 macOS 14.0，实机验收范围见发行说明。App 采用 ad hoc 签名，未经 Apple 公证，首次打开可能需要在系统设置中单独允许。取词的辅助功能权限也可能在更新后重新授权。[v0.3.0 发行页](https://github.com/mxk021/ResearchCompanion/releases/tag/v0.3.0) · [安装和首次使用](docs/SETUP.md)
 
-当前下载版本为 **v0.2.11 Community Beta（构建 23）**。安装包只验证了 Apple Silicon（arm64）。macOS 14.0 是部署目标，尚未在 macOS 14 实机上验收。发行包内的 App 使用 ad hoc 签名，未经 Apple 公证。
+1. 从发行页下载 `ResearchCompanion-0.3.0-arm64.dmg` 与同名 `.sha256`。把两个文件放在同一目录，运行 `shasum -a 256 -c ResearchCompanion-0.3.0-arm64.dmg.sha256`，确认结果为 `OK`。
+2. 打开安装镜像，把 **Research Companion** 拖到「应用程序」。另行安装兼容的 **DSH Desktop 0.2.2-rc.5**，启动一次后正常退出。打开科研助手，在「连接设置」中点「安装科研桥」或「更新科研桥」，再启动 DSH 并配置自己的模型账号。[DSH 官方下载](https://www.deepseek.com/harness/) · [安装与升级步骤](docs/SETUP.md)
+3. 选择一份 PDF、文本或 Markdown，等待材料就绪。选定模型后，在输入框提出问题。Zotero 10 用户也可安装镜像内的 0.1.6 版只读选区扩展。[可选的 Zotero 设置](docs/SETUP.md#可选的系统权限和-zotero)
 
-1. 到发行页的 **Assets** 下载 `ResearchCompanion-0.2.11-arm64.dmg` 和同名 `.sha256` 文件，将两者放在同一目录。[v0.2.11 下载与发行说明](https://github.com/mxk021/ResearchCompanion/releases/tag/v0.2.11)
-2. 在该目录打开终端，运行 `shasum -a 256 -c ResearchCompanion-0.2.11-arm64.dmg.sha256`。看到 `OK` 后打开 DMG，把 **Research Companion** 拖入「应用程序」，从那里双击启动。若 macOS 提示无法验证开发者，请先核实来源，再按安装指南为这个 App 手动允许首次打开。[安装指南](docs/SETUP.md)
-3. 另行安装兼容的 **DSH Desktop 0.2.2-rc.5**，首次启动 DSH 后正常退出。在科研助手的「连接设置」中点「安装科研桥」，再打开 DSH，配置自己的模型账号。选一份 PDF 或 Markdown，等待索引就绪，选择模型后即可提问。原 v0.2.10 公开安装可在同一处点「更新科研桥」。[DSH 官方下载](https://www.deepseek.com/harness/)
+## 阅读、核对和保存
 
-## 阅读和写笔记
+- 在原应用选中文字，然后点科研助手的「选取文字」，或使用原应用的「服务 → 选取文字（科研助手）」。核对预览后，可输入翻译、解释或其他要求。WPS 的原生自动复制会改变通用剪贴板。部分阅读器需按界面提示手动复制再粘贴。
+- 已关联的 PDF 可按页、栏、章节、原句起止及图表公式编号定位。可按需对扫描页执行本机 OCR。可在同一轮使用选区和相关文件证据。多段翻译或分析请先查看请求计划，确认范围和模型。
+- 在回答中点「打开原文」核对可用页位，或点「来源」读取当轮摘录。格式复杂的页面会存在边界歧义，遇到待核对或出处未核验的提示，请查看原页。无法取词时，仍可向已关联的文件提问。
+- 回答支持本机 Markdown 和 LaTeX 排版。通过回答菜单保存笔记，或按标题、材料和归档状态查找历史。永久删除仅在宿主明确提供相应能力时可用。
 
-- 从支持的阅读应用选中文字，使用「选取文字」预览；默认 **⌃⌥T** 直接翻译。系统服务可接收当前应用传入的选区。浏览器、受保护内容与阅读器的支持取决于它们是否提供可读选区。
-- 选择 PDF 后，材料区显示标题、作者、DOI 或网址及读取状态。可问「第 3 页右栏最后一段讲什么」，或给出起止原句请求翻译。没有选区、选区过短或取词失败时仍可查阅已关联的 PDF。位置不唯一、顺序颠倒或区间包含不可读页时，助手会说明原因。
-- 同一模型可提出页码、起止原句或检索词，本机在当前文件中取证。选区与文件可并存。「只翻译选区」使用本次选中的文字，「结合论文解释这段」会同时带入相关文件证据。整篇翻译、分析或超长区间先显示分段范围、请求数与所选模型，确认后执行。扫描页可按需使用本机 OCR；回答的来源入口保留当轮实际发送的摘录。
-- Markdown 与 LaTeX 在本机渲染。聚焦回答后，用 **⌥⌘S** 将回答或选中的公式保存为笔记，**⌥⌘O** 返回来源。历史可按标题、材料与归档状态查找。
+## 模型与数据
 
-## 依赖与数据
-
-- **模型账号**由你自行配置。发送问题或触发选区翻译时，相关材料会交给 DSH 中选定的提供方，费用与额度取决于你的账号。安装包不附带模型账号、ChatGPT 私人订阅适配器或授权。
-- **会话历史**支持检索和归档。标准 DSH 可能不提供永久删除，只有宿主明确支持时才能使用。导出的 Markdown 笔记保存在你选择的目录。
-- **Zotero** 是可选项。如需从 Zotero 10 主窗口读取当前论文的选区，可安装 DMG 中的扩展。直接打开 PDF 或 Markdown 无需安装 Zotero。[安装与权限说明](docs/SETUP.md)
+PDF 索引、OCR、取词和笔记渲染在本机执行。提交问题或启动由模型协助的检索时，DSH 会将本轮所需的文字、文件概况或原页裁图交给所选模型提供方，费用及额度取决于你的账号。公开安装包只包含应用、科研桥、安装说明和可选 Zotero 扩展。模型账户和兼容提供方由用户自行配置。[模型账号和数据说明](docs/SETUP.md#连接及数据)
 
 ## 参与开发
 
-欢迎提交可复现的问题、文档修正和代码改进。报告问题时请用合成材料复现，并删去账号、凭据、私人路径及论文内容。[报告问题](https://github.com/mxk021/ResearchCompanion/issues/new?template=bug_report.md) · [贡献指南](CONTRIBUTING.md) · [构建与测试](docs/BUILD.md)
+请用合成材料提供复现步骤，并移除凭据、私人路径和文献内容。[报告问题](https://github.com/mxk021/ResearchCompanion/issues/new?template=bug_report.md) · [贡献指南](CONTRIBUTING.md) · [构建与测试](docs/BUILD.md) · [版本记录](CHANGELOG.md)
 
-Research Companion 是独立项目，与 DSH、OpenAI 和 Zotero 无官方隶属关系。项目自身代码采用 MIT 许可证，随包字体与第三方组件保留各自的声明。[MIT 许可证](LICENSE) · [第三方来源与许可](docs/THIRD_PARTY.md) · [版本记录](CHANGELOG.md)
+Research Companion 是独立项目，与 DSH、OpenAI 和 Zotero 无官方隶属关系。项目代码采用 MIT 许可证，字体和其他第三方组件保留各自的许可声明。[MIT 许可证](LICENSE) · [第三方来源与许可](docs/THIRD_PARTY.md)

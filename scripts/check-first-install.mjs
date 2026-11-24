@@ -17,6 +17,8 @@ assert.ok(process.versions.electron, 'Run with the DSH Desktop Electron runtime 
 assert.ok(process.argv[2], 'Supply a bridge .tgz, optionally followed by the packaged Research Companion executable.')
 const tgz = resolve(process.argv[2])
 const nativeApp = process.argv[3] && resolve(process.argv[3])
+const setupCheck = process.env.RC_TEST_SETUP_CHECK
+assert.ok(!setupCheck || nativeApp, 'The optional setup check also needs the packaged native app.')
 const resources = resolve(dirname(process.execPath), '../Resources')
 const packages = join(resources, 'app.asar/dsh')
 const installation = join(packages, 'node_modules/@deepseek-ai')
@@ -33,6 +35,9 @@ const env = { HOME: home, CFFIXED_USER_HOME: home, TMPDIR: testDir, DSH_HOME: ds
   PATH: '/usr/bin:/bin:/usr/sbin:/sbin', ELECTRON_RUN_AS_NODE: '1' }
 const cli = join(resources, 'runtime/cli/bin/dsh')
 let host
+async function assertSetup(expected) {
+  if (setupCheck) await execute(resolve(setupCheck), [home, resolve(dirname(nativeApp), '../..'), basename(tgz), expected], {env})
+}
 async function start(workspaceOverride) {
   const child = fork(join(installation, 'dsh-desktop-host/lib/index.js'),
     [packages, profile, join(resources, 'runtime/primary-runtime')],
@@ -85,11 +90,13 @@ async function stop() {
 }
 try {
   await mkdir(home, { recursive: true, mode: 0o700 })
+  await assertSetup('uninitialized')
   await assert.rejects(execute(cli, ['plugin', '--profile', 'desktop', 'add', '--offline', '--ignore-scripts', 'file:' + tgz], { env }),
     error => /initialize its profile/.test(error.stderr))
   // Use the installation's actual profile initializer and default Desktop bundle list.
   require(join(installation, 'dsh-app-boot/lib/index.js')).initProfile(profile,
     require(join(installation, 'dsh-official-bundles/lib/index.js')).PROFILE_TEMPLATES.web.bundles)
+  await assertSetup('absent')
   const store = join(dsh, 'local-plugins/ResearchCompanion')
   await mkdir(store, { recursive: true, mode: 0o700 })
   async function installPackage(source) {
@@ -102,13 +109,14 @@ try {
   }
   const previous = process.env.RC_TEST_UPGRADE_FROM
   await installPackage(previous ?? tgz)
+  await assertSetup(previous ? 'upgradeable' : 'selected')
   const metadata = JSON.parse(await readFile(join(profile, 'package.json')))
   assert.ok(metadata.dsh.profile.bundles.includes('dsh-research-companion'))
   assert.deepEqual(Object.keys(metadata.dependencies), ['dsh-research-companion'])
   const { manifest, path } = await start()
   const [capabilities, state] = await Promise.all([request(manifest, 'capabilities'), request(manifest, 'workspaces')])
   assert.ok(capabilities.supports.includes('researchHistory'))
-  assert.equal(capabilities.supports.includes('researchDocumentPlan'), !previous)
+  if (!previous) assert.ok(capabilities.supports.includes('researchDocumentPlan'))
   assert.ok(!capabilities.supports.some(feature => feature.startsWith('research.retirement.') || feature === 'researchSafeDelete'))
   assert.equal(state.workspaces.length, 1)
   assert.equal(state.workspaces[0].path, workspace)
@@ -127,6 +135,7 @@ try {
   assert.equal((await request(manifest, 'createSession', { workspaceId, sessionId, title: 'Synthetic optics' })).sessionId, sessionId)
   await stop()
   if (previous) await installPackage(tgz)
+  await assertSetup('selected')
   const reopened = await start()
   assert.ok((await request(reopened.manifest,'capabilities')).supports.includes('researchDocumentPlan'))
   const persisted = (await request(reopened.manifest, 'workspaces')).workspaces
@@ -151,6 +160,7 @@ try {
   console.log('The unconfigured ChatGPT provider offered no model. A pre-existing synthetic legacy workspace retained its registered identity after an upgrade.')
   console.log('Fresh HOME: stock CLI installed the release bridge offline; stock Host created one workspace, persisted a named synthetic session across restart, and withheld unsupported deletion.')
   if (nativeApp) console.log('The packaged native command client connected over the owner-local socket.')
+  if (setupCheck) console.log('The native setup view can find the packaged archive and recognized the isolated profile states.')
 } finally {
   try { await stop() } finally { await rm(testDir, { recursive: true, force: true }) }
 }

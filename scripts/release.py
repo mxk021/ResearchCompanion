@@ -13,6 +13,7 @@ import sys
 import tarfile
 import tempfile
 import zipfile
+from pdfium_bundle import LIBRARY as PDFIUM_LIBRARY, RESOURCE_PATHS as PDFIUM_NOTICES
 
 ROOT = Path(__file__).resolve().parent.parent
 META = json.loads((ROOT / 'release.json').read_text())
@@ -73,7 +74,10 @@ def native_checks(temp, env, clt_only):
     for check, source in [('check-note-export', 'ResearchNoteStorage'), ('check-composer', 'ComposerTextView'),
                           ('check-transcript', 'ResearchWindowGeometry'), ('check-pdf-layout', 'ResearchPDFLayout')]:
         binary = temp / check
-        run(*common, ROOT / f'Sources/DSHPet/{source}.swift', ROOT / f'scripts/{check}.swift', '-o', binary, env=env)
+        sources = [ROOT / f'Sources/DSHPet/{source}.swift']
+        if check == 'check-pdf-layout':
+            sources.append(ROOT / 'Sources/DSHPet/ResearchPDFImageGeometry.swift')
+        run(*common, *sources, ROOT / f'scripts/{check}.swift', '-o', binary, env=env)
         args = [ROOT / 'Resources/Transcript'] if check == 'check-transcript' else []
         run(binary, *args, env=env)
     for flags in ([], ['--selection']):
@@ -96,7 +100,8 @@ def verify_app(app, bridge_name, expected_arch, forbidden_paths):
     resources = contents / 'Resources'
     info = plistlib.loads((contents / 'Info.plist').read_bytes())
     if (info['CFBundleIdentifier'], info['CFBundleShortVersionString'], info['CFBundleVersion'],
-        info['ResearchCompanionPublicDistribution']) != (META['bundleIdentifier'], META['version'], META['build'], True):
+        info['ResearchCompanionPublicDistribution'], info['ResearchCompanionBridgeArchive']) != (
+            META['bundleIdentifier'], META['version'], META['version'], True, bridge_name):
         raise ValueError('Unexpected bundle identity, release version, or distribution flavor')
     executable = contents / 'MacOS' / info['CFBundleExecutable']
     if output('lipo', '-archs', executable).split() != [expected_arch]:
@@ -104,9 +109,14 @@ def verify_app(app, bridge_name, expected_arch, forbidden_paths):
     run('codesign', '--verify', '--strict', '--deep', app)
     listed = set((ROOT / 'Resources/PublicManifest.txt').read_text().splitlines())
     listed |= {'SETUP.md', 'LICENSE', info['CFBundleIconFile'], bridge_name}
+    listed |= PDFIUM_NOTICES
     actual = {p.relative_to(resources).as_posix() for p in resources.rglob('*') if p.is_file()}
     if actual != listed or any(p.is_symlink() for p in contents.rglob('*')):
         raise ValueError(f'Unexpected app resources: {sorted(actual ^ listed)}')
+    frameworks = contents / 'Frameworks'
+    if sorted(p.name for p in frameworks.iterdir()) != [PDFIUM_LIBRARY] or (
+            output('lipo', '-archs', frameworks / PDFIUM_LIBRARY).split() != [expected_arch]):
+        raise ValueError('Unexpected bundled PDF rasterizer.')
     for p in contents.rglob('*'):
         if p.is_file() and any(value in p.read_bytes() for value in forbidden_paths):
             raise ValueError(f'Local path in distribution file: {p.relative_to(contents)}')
@@ -119,6 +129,26 @@ def verify_app(app, bridge_name, expected_arch, forbidden_paths):
                 raise ValueError(f'Local path in bridge: {entry.name}')
 
 
+def check_pdf_rasterizer(temp, app, arch, env):
+    # Run the production rasterizer against synthetic rotated pages in a small
+    # test bundle, with the exact signed library taken from the packaged App.
+    contents = temp / 'PDFRasterCheck.app/Contents'
+    frameworks = contents / 'Frameworks'
+    frameworks.mkdir(parents=True)
+    shutil.copy2(app / 'Contents/Frameworks' / PDFIUM_LIBRARY, frameworks)
+    executable = contents / 'MacOS/PDFRasterCheck'
+    executable.parent.mkdir()
+    (contents / 'Info.plist').write_bytes(plistlib.dumps({
+        'CFBundleExecutable': executable.name,
+        'CFBundleIdentifier': 'com.local.research-companion.pdf-raster-check',
+        'CFBundlePackageType': 'APPL',
+    }))
+    run('swiftc', '-O', '-parse-as-library', '-sdk', env['SDKROOT'], '-target', f'{arch}-apple-macos14.0',
+        '-module-cache-path', temp / 'raster-modules', ROOT / 'scripts/check-pdf-raster.swift',
+        ROOT / 'Sources/DSHPet/ResearchPDFCropRenderer.swift', '-o', executable, env=env)
+    run(executable, env=env)
+
+
 def package(options):
     arch = platform.machine()
     if platform.system() != 'Darwin':
@@ -129,6 +159,8 @@ def package(options):
         raise SystemExit('The notarized release path requires the full Xcode test gate.')
     if options.notary_profile and options.identity == '-':
         raise SystemExit('Notarization requires a Developer ID Application identity.')
+    if options.offline and options.pdfium_archive is None:
+        raise SystemExit('--offline requires --pdfium-archive for the pinned PDFium input.')
     name = f"ResearchCompanion-{META['version']}-{arch}.dmg"
     dest = options.output.resolve()
     dest.mkdir(parents=True, exist_ok=True)
@@ -162,10 +194,12 @@ def package(options):
         bridge = build_bridge(temp, payload, options.offline, env)
         binary = native_checks(temp, env, options.clt_only)
         app = dmg_root / APP
+        pdfium = ['--pdfium-archive', options.pdfium_archive.resolve()] if options.pdfium_archive else []
         run(PYTHON, 'scripts/package-macos.py', '--binary', binary, '--output', app, '--public-bridge', bridge,
-            '--sign-identity', options.identity, env={**os.environ, 'SDKROOT': env['SDKROOT']})
+            '--sign-identity', options.identity, *pdfium, env={**os.environ, 'SDKROOT': env['SDKROOT']})
         forbidden = [str(path).encode() for path in (real_home, ROOT, temp)]
         verify_app(app, bridge.name, arch, forbidden)
+        check_pdf_rasterizer(temp, app, arch, env)
         if options.identity != '-':
             detail = subprocess.run(['codesign', '-dv', '--verbose=4', app], capture_output=True, check=True, text=True).stderr
             if 'Authority=Developer ID Application:' not in detail or 'runtime' not in detail or 'Timestamp=' not in detail:
@@ -219,6 +253,7 @@ if __name__ == '__main__':
     parser.add_argument('--tag', help='Require this tag to match release.json')
     parser.add_argument('--identity', default='-', help='Developer ID Application signing identity; omit for ad-hoc')
     parser.add_argument('--notary-profile', help='Explicitly submit the DMG to Apple using this Keychain profile')
-    parser.add_argument('--offline', action='store_true', help='Use previously downloaded, integrity-locked pnpm packages')
+    parser.add_argument('--offline', action='store_true', help='Use integrity-locked pnpm packages and a local PDFium archive')
+    parser.add_argument('--pdfium-archive', type=Path, help='Use the SHA-256 pinned PDFium archive from disk')
     parser.add_argument('--clt-only', action='store_true', help='Draft verification on Command Line Tools without XCTest')
     package(parser.parse_args())

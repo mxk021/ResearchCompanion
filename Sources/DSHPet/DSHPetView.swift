@@ -16,6 +16,7 @@ import SwiftUI
 struct DSHPetView: View {
     @ObservedObject var model: DSHPetModel
     @ObservedObject var settings: PetSettings
+    let onActivateChat: () -> Void
     let onOpenHarness: () -> Void
 
     /// 按下时鼠标与窗口原点的偏移（全局坐标），拖拽中保持不变
@@ -23,6 +24,7 @@ struct DSHPetView: View {
     @State private var hasGrabOffset = false
     /// 拖拽按下时的鼠标全局坐标（用于区分「单击」与「拖动」）
     @State private var dragStart: CGPoint?
+    @State private var exceededClickDistance = false
     /// 小雨拖拽奔跑方向；用锚点累积细小移动，避免鼠标抖动导致频繁换向。
     @State private var dragDirection: XiaoyuDragDirection?
     @State private var dragDirectionAnchorX: CGFloat?
@@ -257,7 +259,7 @@ struct DSHPetView: View {
 
     /// 拖拽：让窗口跟随鼠标的全局位置（抓取点保持在光标下），
     /// 不依赖手势 translation，避免窗口移动后坐标系反馈导致拖拽缩水。
-    /// 单击无操作；双击触发宠物动作，并唤出正在运行的桌面版 Harness；锁定位置时不可拖拽。
+    /// Single click raises the conversation. Double-click retains the pet’s Harness action.
     private var dragGesture: some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { _ in
@@ -273,6 +275,10 @@ struct DSHPetView: View {
                     dragDirectionAnchorX = mouse.x
                     hasGrabOffset = true
                 }
+                if let start = dragStart, hypot(mouse.x - start.x, mouse.y - start.y) >= 4 {
+                    exceededClickDistance = true
+                }
+                guard exceededClickDistance else { return }
                 // 锁定位置：不移动窗口（仍允许单击）
                 if settings.lockPosition {
                     dragDirection = nil
@@ -297,30 +303,22 @@ struct DSHPetView: View {
                     return
                 }
                 let mouse = NSEvent.mouseLocation
-                // 几乎没移动 → 单击
-                let isTap: Bool
-                if let start = dragStart {
-                    isTap = hypot(mouse.x - start.x, mouse.y - start.y) < 4
-                } else {
-                    isTap = false
-                }
-                if isTap {
-                    // 双击（0.35s 内两次单击）→ 宠物动作 + 打开当前 Harness；单击无操作
+                if let start = dragStart, !exceededClickDistance,
+                   hypot(mouse.x - start.x, mouse.y - start.y) < 4 {
                     let now = Date()
+                    resetDragTracking(panel: panel)
                     if let last = lastTapAt, now.timeIntervalSince(last) < 0.35 {
                         lastTapAt = nil
                         model.triggerWiggle()
-                        if model.bubblePresentation?.taskID != nil {
-                            model.openBubbleTask()
-                        } else {
-                            onOpenHarness()
-                        }
+                        if model.bubblePresentation?.taskID != nil { model.openBubbleTask() }
+                        else { onOpenHarness() }
                     } else {
                         lastTapAt = now
+                        onActivateChat()
                     }
-                    resetDragTracking(panel: panel)
                     return
                 }
+                lastTapAt = nil
                 if settings.lockPosition {
                     resetDragTracking(panel: panel)
                     return
@@ -339,6 +337,7 @@ struct DSHPetView: View {
 
     private func resetDragTracking(panel: DSHPetPanel?) {
         dragStart = nil
+        exceededClickDistance = false
         dragDirection = nil
         dragDirectionAnchorX = nil
         hasGrabOffset = false

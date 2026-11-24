@@ -6,18 +6,20 @@ import UniformTypeIdentifiers
 
 /// A captured selection, an indexed attachment, or the evidence prepared for one request.
 struct ResearchMaterial: Equatable, Sendable {
+    static let selectionServiceSource = "系统服务"
     static let maximumLength = 24_000
     static let localSelectionLimit = 1_048_576
     static let oversizeMessage = "已完整保留本机选区。单次材料上限为 24,000 个 UTF‑16 字符，请缩小选区后再发送。"
     var id = UUID()
     let source: String
     let title: String
-    let text: String
-    let scope: String
+    var text: String
+    var scope: String
     var url: String?
     var page: String?
     var fileReference: ResearchFileReference? = nil
     var localWebURL: String? = nil
+    var zoteroLocation: ResearchZoteroLocation? = nil
     var selectionIsComplete = false
     var pdfIndex: ResearchPDFIndex? = nil
     var pdfPages: String? = nil
@@ -25,6 +27,11 @@ struct ResearchMaterial: Equatable, Sendable {
     var backgroundPages: String? = nil
     var pdfPositions: [ResearchPDFSourcePosition]? = nil
     var backgroundPositions: [ResearchPDFSourcePosition]? = nil
+    var objectLabels: [String]? = nil
+    var sourceGroups: [ResearchPDFSourceGroup]? = nil
+    var documentImages: [Data] = []
+    var verifiedExcerpts: [ResearchVerifiedExcerpt]? = nil
+    var evidenceChecks: [ResearchPDFEvidenceCheck]? = nil
 
     var fields: [String: String] {
         var value = ["source": source, "title": title, "text": text, "scope": scope]
@@ -63,7 +70,9 @@ struct ResearchMaterial: Equatable, Sendable {
         guard original.utf16.count <= localSelectionLimit else { throw SelectionCaptureError.tooLarge }
         guard hasReadableText(original) else { throw ResearchMaterialError.message("没有可读取的选中文字。") }
         return Self(source: source, title: title, text: original,
-                    scope: "当前选区 · \(original.utf16.count) 个 UTF‑16 字符", url: url, selectionIsComplete: true)
+                    scope: "当前选区 · \(original.utf16.count) 个 UTF‑16 字符", url: url, selectionIsComplete: true,
+                    verifiedExcerpts: [.init(kind: .selection, range: NSRange(location: 0, length: original.utf16.count),
+                                             title: title, doi: ResearchVerifiedExcerpt.doi(from: url.flatMap(URL.init(string:))))])
     }
 
     /// Only combine excerpts on an explicit reference to the associated document.
@@ -86,17 +95,25 @@ struct ResearchMaterial: Equatable, Sendable {
         return try withBackgroundEvidence(background)
     }
 
-    func withBackgroundEvidence(_ background: Self) throws -> Self {
+    func withBackgroundEvidence(_ background: Self, reviewedOrder: Bool = false) throws -> Self {
         let location = [source, title, page.map { "页标签 " + $0 }].compactMap { $0 }.joined(separator: " · ")
         let range = background.pdfPages.map { " · PDF 文件页 " + $0 } ?? ""
-        let body = "【本次选区 · " + location + "】\n" + text + "\n\n【会话文件摘录 · " + background.source + " · " + background.title + range + "】\n" + background.text
+        let selectionHeading = "【本次选区 · " + location + "】\n"
+        let backgroundHeading = "\n\n【会话文件摘录 · " + background.source + " · " + background.title + range + "】\n"
+        let prefix = selectionHeading + text + backgroundHeading
+        let body = prefix + background.text
         guard body.utf16.count <= Self.maximumLength else {
             throw ResearchMaterialError.message("完整选区与相关文件摘录合计超出单次材料上限。请缩小选区或单独提问。")
         }
-        let scope = Self.bounded("主要来源为" + source + "选区；另附会话文件「" + background.title + "」" + range + "的相关摘录。", limit: 512)
+        let origin = reviewedOrder ? "经用户对照采用的候选顺序。 " : ""
+        let scope = Self.bounded(origin + "主要来源为" + source + "选区；另附会话文件「" + background.title + "」" + range + "的相关摘录。", limit: 512)
+        let excerpts = (verifiedExcerpts ?? []).map { $0.shifted(by: selectionHeading.utf16.count) }
+            + (background.verifiedExcerpts ?? []).map { $0.shifted(by: prefix.utf16.count, kind: .context) }
         return Self(id: id, source: "选区与会话文件", title: title, text: body, scope: scope, url: url, page: page,
-                    fileReference: fileReference, localWebURL: localWebURL, backgroundFile: background.fileReference,
-                    backgroundPages: background.pdfPages, pdfPositions: pdfPositions, backgroundPositions: background.pdfPositions)
+                    fileReference: fileReference, localWebURL: localWebURL, zoteroLocation: zoteroLocation,
+                    pdfPages: pdfPages, backgroundFile: background.fileReference,
+                    backgroundPages: background.pdfPages, pdfPositions: pdfPositions, backgroundPositions: background.pdfPositions,
+                    verifiedExcerpts: excerpts.isEmpty ? nil : excerpts, evidenceChecks: background.evidenceChecks)
     }
 
     private func relevantText(question: String, selection: String) throws -> Self {
@@ -114,21 +131,20 @@ struct ResearchMaterial: Equatable, Sendable {
             return left.score > right.score
         }
         guard !ranked.isEmpty else { throw ResearchMaterialError.message("在会话文件的已读范围内没有找到相关段落。请指定关键词或移除选区后单独询问文件。") }
-        let excerpt = ranked.prefix(3).map { $0.0 }.sorted().map { parts[$0] }.joined(separator: "\n[…]\n")
-        return Self(source: source, title: title, text: excerpt, scope: "相关文件段落", fileReference: fileReference)
+        let separator = "\n[…]\n"
+        var excerpt = ""
+        var excerpts: [ResearchVerifiedExcerpt] = []
+        for position in ranked.prefix(3).map(\.index).sorted() {
+            if !excerpt.isEmpty { excerpt += separator }
+            let part = parts[position]
+            excerpts.append(.init(kind: .body, range: NSRange(location: excerpt.utf16.count, length: part.utf16.count), title: title))
+            excerpt += part
+        }
+        return Self(source: source, title: title, text: excerpt, scope: "相关文件段落", fileReference: fileReference,
+                    verifiedExcerpts: excerpts)
     }
 
-    func withLocator(from capture: Self) -> Self? {
-        func comparable(_ value: String) -> String {
-            value.replacingOccurrences(of: "\r\n", with: "\n")
-                .replacingOccurrences(of: "\r", with: "\n").precomposedStringWithCanonicalMapping
-        }
-        guard selectionIsComplete, capture.selectionIsComplete,
-              source == capture.source, comparable(text) == comparable(capture.text) else { return nil }
-        return Self(source: source, title: capture.title, text: text, scope: scope,
-                    url: capture.url, page: capture.page, fileReference: capture.fileReference,
-                    localWebURL: capture.localWebURL, selectionIsComplete: true)
-    }
+
 }
 
 enum ResearchMaterialError: LocalizedError {
@@ -139,8 +155,47 @@ enum ResearchMaterialError: LocalizedError {
     }
 }
 
-enum ResearchMaterialSource: Equatable {
-    case none, zotero, appSelection, fixedFile
+/// Reuse a verified index while reading the same file revision in this process.
+/// No document contents are persisted or reused for a different path or OCR mode.
+final class ResearchPDFLoadCache: @unchecked Sendable {
+    final class Entry {
+        let material: ResearchMaterial
+        let reference: ResearchFileReference
+        let stamp: ResearchFileReference.FileStamp
+        let recognizeScans: Bool
+
+        init(material: ResearchMaterial, reference: ResearchFileReference,
+             stamp: ResearchFileReference.FileStamp, recognizeScans: Bool) {
+            self.material = material
+            self.reference = reference
+            self.stamp = stamp
+            self.recognizeScans = recognizeScans
+        }
+    }
+
+    private let entries: NSCache<NSString, Entry> = {
+        let value = NSCache<NSString, Entry>()
+        value.countLimit = 2
+        return value
+    }()
+
+    func existing(at url: URL, recognizeScans: Bool) throws -> Entry? {
+        guard let entry = entries.object(forKey: url.path as NSString),
+              entry.recognizeScans == recognizeScans else { return nil }
+        try Task.checkCancellation()
+        guard (try? ResearchFileReference.fileStamp(url)) == entry.stamp else {
+            entries.removeObject(forKey: url.path as NSString)
+            return nil
+        }
+        return entry
+    }
+
+    func remember(at url: URL, material: ResearchMaterial, reference: ResearchFileReference,
+                  stamp: ResearchFileReference.FileStamp, recognizeScans: Bool) {
+        guard let index = material.pdfIndex, index.pages.count <= 160, stamp.size <= 32 * 1_048_576 else { return }
+        entries.setObject(Entry(material: material, reference: reference, stamp: stamp, recognizeScans: recognizeScans),
+                          forKey: url.path as NSString)
+    }
 }
 
 enum ResearchFileMaterial {
@@ -181,7 +236,9 @@ enum ResearchFileMaterial {
         let shown = text.utf16.count
         let scope = shown < total ? "仅带入前 \(shown) / \(total) 个 UTF‑16 字符。" : "全文 · \(shown) 个 UTF‑16 字符"
         return ResearchMaterial(source: kind, title: title, text: text, scope: scope,
-                                fileReference: try ResearchFileReference.capture(url))
+                                fileReference: try ResearchFileReference.capture(url),
+                                verifiedExcerpts: [.init(kind: .body, range: NSRange(location: 0, length: shown),
+                                                         title: title, partial: shown < total)])
     }
 
 
@@ -201,7 +258,7 @@ struct ResearchMaterialCard: View {
                         command.rejectResearchSelection("未能启动选区读取，请回到原应用重新选取。")
                     }
                 }
-                .help("重新获取原应用的选区，仅在此预览")
+                .help("预览原应用当前高亮的文字。")
                 .disabled(command.pdfRequestRunning || command.choosingResearchFile || command.retirementInProgress)
                 Button("选择文件…") { chooseFile() }
                     .disabled(command.choosingResearchFile || command.pdfRequestRunning || command.retirementInProgress || command.selectedWorkspaceID == nil)
@@ -209,7 +266,7 @@ struct ResearchMaterialCard: View {
                 if command.loadingResearchFile || command.pdfRequestRunning {
                     Button("停止") { command.stopPDFWork() }
                 }
-                if command.hasAssociatedFile || command.appMaterial != nil {
+                if command.hasAssociatedFile || command.displayedResearchMaterial != nil {
                     Toggle("带入材料", isOn: $command.includePaperContext)
                         .toggleStyle(.switch).controlSize(.mini).fixedSize()
                 }
@@ -218,13 +275,15 @@ struct ResearchMaterialCard: View {
                 HStack {
                     Text("正在读取本次选区…").font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    Button("取消") { command.removeResearchSelection() }.controlSize(.small)
+                    Button("取消") { NSApp.sendAction(#selector(AppDelegate.cancelResearchTextFromPanel(_:)), to: NSApp.delegate, from: nil) }
+                        .controlSize(.small)
                 }
             }
-            if let selected = command.appMaterial {
+            if let selected = command.availableResearchSelection {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 5) {
-                        Text("选区 · " + selected.source).font(.caption.weight(.semibold)).fixedSize()
+                        Text("选区 · " + selected.source)
+                            .font(.caption.weight(.semibold)).fixedSize()
                         Text([selected.title, selected.page.map { "页标签 " + $0 }].compactMap { $0 }.joined(separator: " · "))
                             .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                             .help([selected.title, selected.localWebURL ?? selected.url, selected.page.map { "页标签 " + $0 }]
@@ -240,19 +299,32 @@ struct ResearchMaterialCard: View {
                         .accessibilityLabel("移除选区").help("移除选区，保留会话文件")
                     }
                     .buttonStyle(.borderless)
-                    SelectionExcerptView(material: selected)
-                        .frame(height: selectionHeight(selected))
+                    if let address = selected.url {
+                        Text(address)
+                            .font(.caption).foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                            .accessibilityLabel("网页出处 " + address)
+                            .help(address)
+                    }
+                    SelectionExcerptCard(material: selected, availableSize: availableSize).equatable()
                     if selected.text.utf16.count > ResearchMaterial.maximumLength {
                         Text(ResearchMaterial.oversizeMessage).font(.caption).foregroundStyle(.secondary)
                     }
                 }
             }
-            if let error = command.selectionError {
-                HStack {
-                    Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
-                    Spacer(minLength: 2)
-                    Button { command.removeResearchSelection() } label: { Image(systemName: "xmark.circle") }
-                        .buttonStyle(.borderless).accessibilityLabel("清除取词提示").help("清除取词提示")
+            if let message = command.selectionError {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(message).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                    if command.clipboardCopyRevision != nil || (command.hasSelectionFailure && command.appMaterial != nil) {
+                        HStack {
+                            if command.clipboardCopyRevision != nil {
+                                Button("粘贴选区") { command.pasteResearchSelection() }
+                            }
+                            if command.hasSelectionFailure && command.appMaterial != nil {
+                                Button("使用上次选区") { command.dismissResearchSelectionError() }
+                            }
+                        }.controlSize(.small)
+                    }
                 }
             }
             if command.hasAssociatedFile || command.associatedPDFName != nil {
@@ -292,10 +364,13 @@ struct ResearchMaterialCard: View {
                     }
                 }
             }
-            if let progress = command.pdfRequestStatus {
-                Text(progress).font(.caption).foregroundStyle(.secondary).lineLimit(3).textSelection(.enabled)
+            if !command.capturingSelection, !command.hasSelectionFailure, !command.pdfRequestRunning,
+               command.submissionStatus != .submitting, !command.conversationRunning {
+                let next = command.researchMaterialSummary(.ask)
+                Text(next).font(.caption).foregroundStyle(.secondary)
+                    .lineLimit(2).help(next)
             }
-            if let error = (command.associatedPDFName == nil ? command.materialError : nil) ?? command.contextError {
+            if command.associatedPDFName == nil, let error = command.materialError {
                 Text(error).font(.caption).foregroundStyle(.secondary).lineLimit(3).textSelection(.enabled)
             }
         }
@@ -319,13 +394,7 @@ struct ResearchMaterialCard: View {
     }
 
     private func pdfStatus(_ index: ResearchPDFIndex?) -> String {
-        if command.loadingResearchFile {
-            return command.materialError.flatMap { $0.contains(" / ") ? $0 : nil } ?? "正在解析…"
-        }
-        if let message = command.materialError, index == nil || message.contains("无法") || message.contains("已移走") {
-            return message
-        }
-        return index?.cardStatus ?? "文件失效或读取失败"
+        command.materialError ?? index?.cardStatus ?? (command.loadingResearchFile ? "正在读取…" : "尚无可用原文")
     }
 
     private var fileMenu: some View {
@@ -345,14 +414,6 @@ struct ResearchMaterialCard: View {
         } label: { Image(systemName: "ellipsis.circle") }
         .menuStyle(.borderlessButton).fixedSize().disabled(command.pdfRequestRunning)
         .accessibilityLabel("会话文件操作").help("会话文件操作")
-    }
-
-    private func selectionHeight(_ selection: ResearchMaterial) -> CGFloat {
-        let row = max(18, Int((availableSize.width - 64) / 12))
-        let lines = selection.text.prefix(1_000).split(separator: "\n", omittingEmptySubsequences: false)
-        let estimate = lines.reduce(0) { $0 + max(1, ($1.count + row - 1) / row) }
-        let maximum = min(160, max(76, availableSize.height * 0.16))
-        return min(maximum, CGFloat(estimate) * 19 + 7)
     }
 
     private func chooseFile() {
@@ -386,18 +447,14 @@ struct ResearchPDFCardContent: View {
             Text(metadata.title ?? filename)
                 .font(.callout.weight(.semibold)).lineLimit(2)
                 .help(metadata.title.map { $0 + "\n" + filename } ?? filename)
-            if metadata.title == nil {
-                Text("论文标题未识别").font(.caption).foregroundStyle(.secondary)
+            if let author = metadata.authorDisplay {
+                Text(author).lineLimit(1).help(metadata.authors.joined(separator: "、"))
             }
-            Text("作者  " + (metadata.authorDisplay ?? "未识别"))
-                .lineLimit(1).help(metadata.authors.joined(separator: "、"))
             if let url = metadata.link {
                 Link(destination: url) {
                     Text(url.host == "doi.org" ? "DOI  " + String(url.path.dropFirst()) : url.absoluteString)
                         .lineLimit(1).truncationMode(.middle)
                 }.help(url.absoluteString)
-            } else {
-                Text("网址或 DOI  未识别")
             }
             Text(status).foregroundStyle(.secondary).lineLimit(2).help(statusDetail ?? status)
         }
@@ -406,35 +463,111 @@ struct ResearchPDFCardContent: View {
     }
 }
 
-/// Native selectable text retains the complete local excerpt; only its viewport is bounded.
+/// Recompute the height when the selection or window size changes. Other
+/// command updates, including streamed replies, do not reflow this sample.
+private struct SelectionExcerptCard: View, Equatable {
+    let material: ResearchMaterial
+    let availableSize: CGSize
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.material.id == rhs.material.id && lhs.availableSize == rhs.availableSize
+    }
+
+    var body: some View {
+        let row = max(18, Int((availableSize.width - 64) / 12))
+        let preview = SelectionPreviewText(String(material.text.prefix(1_000)))
+        let lines = preview.displayed.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+        let estimate = lines.reduce(0) { $0 + max(1, ($1.count + row - 1) / row) }
+        let maximum = min(160, max(76, availableSize.height * 0.16))
+        return SelectionExcerptView(material: material)
+            .frame(height: min(maximum, CGFloat(estimate) * 19 + 7))
+    }
+}
+
+/// The preview can reflow line breaks while native selection still copies the captured original.
 private struct SelectionExcerptView: NSViewRepresentable {
     let material: ResearchMaterial
 
-    final class Coordinator { var rendered: UUID? }
+    final class Coordinator {
+        var selection: UUID?
+        var worker: Task<SelectionPreviewText?, Never>?
+    }
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scroll = NSTextView.scrollableTextView()
+        let scroll = NSScrollView()
         scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = false
         scroll.autohidesScrollers = true
-        guard let view = scroll.documentView as? NSTextView else { return scroll }
+        scroll.borderType = .noBorder
+        let view = ExcerptTextView()
+        view.isRichText = false
         view.isEditable = false
         view.isSelectable = true
+        view.isVerticallyResizable = true
+        view.isHorizontallyResizable = false
+        view.autoresizingMask = [.width]
         view.drawsBackground = false
         view.textColor = .labelColor
         view.font = .systemFont(ofSize: 13)
         view.textContainerInset = NSSize(width: 0, height: 2)
         view.textContainer?.lineFragmentPadding = 0
+        view.textContainer?.widthTracksTextView = true
+        view.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
         view.layoutManager?.allowsNonContiguousLayout = true
         view.setAccessibilityLabel("本次选区原文")
+        scroll.documentView = view
         return scroll
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
-        guard context.coordinator.rendered != material.id, let view = scroll.documentView as? NSTextView else { return }
-        context.coordinator.rendered = material.id
-        view.string = material.text
-        view.scrollRangeToVisible(NSRange(location: 0, length: 0))
+        let coordinator = context.coordinator
+        let id = material.id
+        guard coordinator.selection != id, let view = scroll.documentView as? ExcerptTextView else { return }
+        coordinator.selection = id
+        coordinator.worker?.cancel()
+        coordinator.worker = nil
+        let text = material.text
+        if text.utf16.count <= ResearchMaterial.maximumLength {
+            view.showPreview(SelectionPreviewText(text))
+            return
+        }
+
+        // An oversized selection remains available for copying. Prepare its
+        // display without holding the main actor or showing the previous text.
+        view.showPreview(nil)
+        let worker = Task.detached(priority: .userInitiated) { SelectionPreviewText.prepare(text) }
+        coordinator.worker = worker
+        Task { @MainActor [weak coordinator, weak view] in
+            guard let preview = await worker.value, !worker.isCancelled,
+                  let coordinator, coordinator.selection == id else { return }
+            coordinator.worker = nil
+            view?.showPreview(preview)
+        }
+    }
+
+    static func dismantleNSView(_ view: NSScrollView, coordinator: Coordinator) {
+        coordinator.selection = nil
+        coordinator.worker?.cancel()
+        coordinator.worker = nil
+    }
+
+    private final class ExcerptTextView: NSTextView {
+        private var preview: SelectionPreviewText?
+
+        func showPreview(_ preview: SelectionPreviewText?) {
+            self.preview = preview
+            string = preview?.displayed ?? ""
+            scrollRangeToVisible(NSRange(location: 0, length: 0))
+        }
+
+        override var writablePasteboardTypes: [NSPasteboard.PasteboardType] { [.string] }
+
+        override func writeSelection(to pasteboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
+            guard type == .string, let preview else { return false }
+            let originals = selectedRanges.compactMap { preview.originalText(for: $0.rangeValue) }
+            return !originals.isEmpty && pasteboard.setString(originals.joined(separator: "\n"), forType: .string)
+        }
     }
 }

@@ -193,9 +193,13 @@ final class DSHPetModel: ObservableObject {
         }
         closeTaskPanel()
         if barPhase != .composer { barPhase = .composer }
-        if focus { composerFocusRequest &+= 1 }
+        if focus { focusComposerEditor() }
         commandClient.refreshWorkspaces()
         commandClient.beginResearchPolling()
+    }
+
+    func focusComposerEditor() {
+        if isResearchPanelOpen { composerFocusRequest &+= 1 }
     }
 
     func collapseComposer(reason: ResearchPanelCloseReason) {
@@ -211,7 +215,7 @@ final class DSHPetModel: ObservableObject {
         }
         if isResearchPanelOpen {
             isResearchPanelOpen = false
-            commandClient.clearTransientResearchMaterialOnClose()
+            commandClient.cancelResearchSelectionCapture()
             ResearchLaunchLog.write("panel-explicitly-closed")
         }
         commandClient.stopResearchPolling()

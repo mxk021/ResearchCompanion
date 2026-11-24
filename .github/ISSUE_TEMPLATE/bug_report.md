@@ -8,7 +8,7 @@ assignees: ''
 
 ## 环境
 
-- Research Companion 版本与构建号
+- Research Companion 版本
 - macOS 版本与芯片型号
 - DSH Desktop 版本（涉及连接或模型时填写）
 - Zotero 与选区扩展版本（涉及 Zotero 时填写）

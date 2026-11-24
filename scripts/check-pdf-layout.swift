@@ -32,6 +32,9 @@ struct PDFLayoutCheck {
         line("Right four resumes below the band.", x: 327, y: 500)
         line("y = a + b", x: 48, y: 480)
         line("Right five concludes the table.", x: 327, y: 480)
+        line("Copyright: Synthetic publication.", x: 48, y: 190, size: 10)
+        line("Terms of distribution follow the copyright notice.", x: 48, y: 174, size: 8)
+        line("The main article continues in the opposite column.", x: 327, y: 167, size: 10)
         line("Correspondence: Test editor", x: 48, y: 130, size: 8)
         line("14", x: 300, y: 25, size: 8)
         context.endPDFPage()
@@ -49,14 +52,51 @@ struct PDFLayoutCheck {
         context.beginPDFPage(nil)
         line("2. Author. Additional experiment.", x: 48, y: 680)
         context.endPDFPage()
+        context.beginPDFPage(nil)
+        let leftBody = [
+            "The setup uses two calibrated light detectors.",
+            "The first trial is used to measure the noise floor.",
+            "Each iteration collects a forward measurement",
+        ]
+        let rightBody = [
+            "with the initial bias, then one reverse reading.",
+            "Both signals are kept for comparison after the run.",
+            "The deviation is computed at the end of each trial.",
+        ]
+        for n in leftBody.indices {
+            line(rightBody[n], x: 320, y: CGFloat(501 - 15 * n))
+            line(leftBody[n], x: 48, y: CGFloat(501 - 15 * n))
+        }
+        let picture = CGContext(data: nil, width: 32, height: 48, bitsPerComponent: 8, bytesPerRow: 32,
+                               space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)!
+        picture.setFillColor(gray: 0.6, alpha: 1)
+        picture.fill(CGRect(x: 0, y: 0, width: 32, height: 48))
+        context.draw(picture.makeImage()!, in: CGRect(x: 54, y: 128, width: 208, height: 305))
+        let graphicLabels = ["Detector layout", "Measured field", "Probe", "Bias"]
+        line(graphicLabels[0], x: 116, y: 444, size: 10)
+        line(graphicLabels[1], x: 57, y: 350, size: 10)
+        line(graphicLabels[2], x: 192, y: 350, size: 10)
+        line(graphicLabels[3], x: 117, y: 196, size: 10)
+        let captionLines = [
+            "Fig. 4. Geometry of the two detector configurations.",
+            "Each thermometer is mounted on a separate",
+            "fixture that isolates its response when the driver",
+            "is connected to the circuit.",
+        ]
+        for (n, text) in captionLines.enumerated() {
+            line(text, x: 48, y: CGFloat(94 - 12 * n), size: 11)
+        }
+        line("17", x: 48, y: 25, size: 8)
+        context.endPDFPage()
         context.closePDF()
         let pdf = PDFDocument(data: bytes as Data)!
         var inReferences = false
-        func read(_ i: Int) throws -> (blocks: [ResearchPDFBlock], reliableOrder: Bool) {
+        func read(_ i: Int, checkGraphics: Bool = false) throws -> (blocks: [ResearchPDFBlock], reliableOrder: Bool) {
             let page = pdf.page(at: i)!
             let geometry = ResearchPDFLayout.Geometry(page)
             let fragments = try ResearchPDFLayout.native(page, text: page.string!, geometry: geometry)
-            let output = ResearchPDFLayout.blocks(fragments, geometry: geometry, pageNumber: i + 1, inReferences: &inReferences)
+            let output = ResearchPDFLayout.blocks(fragments, geometry: geometry, pageNumber: i + 1,
+                                                 inReferences: &inReferences, page: checkGraphics ? page : nil)
             let raw = page.string! as NSString
             for item in output.blocks.flatMap(\.lines) {
                 precondition(!item.bounds.isEmpty && !item.sourceRanges.isEmpty && !item.ocr)
@@ -77,6 +117,8 @@ struct PDFLayoutCheck {
         precondition(labels.contains { $0.0.hasPrefix("A full-width band") && $0.1 == 0 })
         precondition(labels.contains { $0.0 == "y = a + b" && $0.2 == .formula })
         precondition(labels.contains { $0.0.hasPrefix("Table 3.") && $0.2 == .table })
+        precondition(labels.contains { $0.0.hasPrefix("Terms of distribution") && $0.1 == 1 && $0.2 == .footnote })
+        precondition(labels.contains { $0.0.hasPrefix("The main article continues") && $0.1 == 2 && $0.2 == .body })
         precondition(labels.contains { $0.0.hasPrefix("Correspondence:") && $0.2 == .footnote })
         precondition(labels.contains { $0.0 == "14" && $0.2 == .footer })
         let threeColumns = try read(1)
@@ -84,6 +126,13 @@ struct PDFLayoutCheck {
         let references = try read(2)
         let continued = try read(3)
         precondition(references.blocks.contains { $0.kind == .reference } && continued.blocks.first?.kind == .reference)
-        print("PASS synthetic spanning bands, left/right column order, verifiable native ranges, formulas, footnotes, references and ambiguous three-column layout.")
+        inReferences = false
+        let floating = try read(4, checkGraphics: true)
+        precondition(floating.reliableOrder)
+        precondition(floating.blocks.filter { $0.kind == .figureLabel }.flatMap(\.lines).map(\.text) == graphicLabels)
+        precondition(floating.blocks.filter { $0.kind == .caption && $0.detachedCaption }
+            .flatMap(\.lines).map(\.text) == captionLines)
+        precondition(floating.blocks.filter { $0.kind == .body }.flatMap(\.lines).map(\.text) == leftBody + rightBody)
+        print("PASS synthetic spanning bands, column order, detached raster figure and caption continuation, native ranges, formulas, footnotes, references and ambiguous three-column layout.")
     }
 }

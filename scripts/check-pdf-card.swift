@@ -75,6 +75,44 @@ struct PDFCardCheck {
     }
 
     @MainActor static func main() async throws {
+        let wrapped = "A decomposed cafe\u{301} has a soft\r\nline break.\r\n\r\nThis paragraph remains separate."
+        let preview = SelectionPreviewText(wrapped)
+        precondition(preview.displayed == "A decomposed cafe\u{301} has a soft line break.\r\n\r\nThis paragraph remains separate.")
+        let visibleRange = (preview.displayed as NSString).range(of: "soft line break.")
+        precondition(preview.originalText(for: visibleRange) == "soft\r\nline break.")
+        let wholePreview = NSRange(location: 0, length: preview.displayed.utf16.count)
+        precondition(preview.originalText(for: wholePreview)?.utf8.elementsEqual(wrapped.utf8) == true)
+        let chinese = SelectionPreviewText("这是同一段中的原文\n继续显示在下一行。")
+        precondition(chinese.displayed == "这是同一段中的原文继续显示在下一行。")
+        let indexText = chinese.displayed as NSString
+        precondition(chinese.originalText(for: indexText.range(of: "原文继续")) == "原文\n继续")
+        precondition(chinese.originalText(for: indexText.range(of: "原文")) == "原文")
+        precondition(chinese.originalText(for: indexText.range(of: "继续")) == "继续")
+        for protected in [
+            "The display starts here\nx = y + z\nwhere the symbols first appear.",
+            "The resulting function is\nf(x)\nwhere the notation follows the text.",
+            "The formula spans\n\\begin{aligned}\ncontains free variable names\nwith deliberate structure\n\\end{aligned}",
+            "This one ends here.\nAnother starts here.\n    Indented paragraph.",
+            "Text appears beforehand\n1. Step after paragraph\n2. Another step",
+            "The dashed line ends multi-\nline despite a continuation.",
+            "Prose here\n```txt\nplain words split\nlike source code\n```",
+            "This line contains Unicode breaks\u{85}the first one is NEL\u{2028}the next is LS",
+            "A genuine paragraph separator\u{2029}marks the next paragraph."
+        ] {
+            precondition(SelectionPreviewText(protected).displayed.utf8.elementsEqual(protected.utf8))
+        }
+        let longSelection = String(repeating: wrapped + "\r\n\r\n", count: 840)
+        let longPreview = await Task.detached { SelectionPreviewText.prepare(longSelection) }.value
+        guard let longPreview else { throw Failure("Missing prepared selection preview") }
+        let longRange = NSRange(location: 0, length: longPreview.displayed.utf16.count)
+        precondition(longPreview.originalText(for: longRange)?.utf8.elementsEqual(longSelection.utf8) == true)
+        let cancelledPreview = Task.detached {
+            try? await Task.sleep(for: .seconds(5))
+            return SelectionPreviewText.prepare(longSelection)
+        }
+        cancelledPreview.cancel()
+        let cancelledResult = await cancelledPreview.value
+        precondition(cancelledResult == nil)
         let directory = URL(fileURLWithPath: CommandLine.arguments[1])
         let file = directory.appendingPathComponent("synthetic.pdf")
         let list = directory.appendingPathComponent("references.pdf")
@@ -107,10 +145,68 @@ struct PDFCardCheck {
         let answer = ResearchChatMessage(id: "reply", role: "assistant", text: "Verified", originalPrompt: nil, reply: reply)
         let reopened = ResearchProvenanceStore(root: directory.appendingPathComponent("sources"))
         let saved = ResearchAnswerSource(session: "test", answer: answer, store: reopened)
+        let contents = saved.noteContents()
+        precondition(contents.quotations.map(\.text) == [evidence.text])
+        precondition(contents.exportWarning == nil)
+        var legacyMaterial = evidence
+        legacyMaterial.verifiedExcerpts = nil
+        try store.record(session: "legacy", requestID: "fixture", material: legacyMaterial)
+        let legacySource = ResearchAnswerSource(session: "legacy", answer: answer, store: reopened, includePositions: false)
+        let legacyContents = legacySource.noteContents()
+        precondition(legacyContents.quotations.isEmpty && legacySource.sourcePresentation?.objects == nil)
+        precondition(legacyContents.exportWarning?.contains("没有可核验的文字摘录") == true)
+
+        var copied = try ResearchMaterial.selection("WPS copy — 原文\r\n第二行  ", source: "WPS", title: "Copy fixture")
+        copied.scope = "用户确认使用 · 出处未独立核验"
+        copied.verifiedExcerpts = nil
+        let copySnapshots = directory.appendingPathComponent("copy-sources")
+        let copyStore = ResearchProvenanceStore(root: copySnapshots)
+        try copyStore.savePendingSelection(copied, for: "copy")
+        let persisted = try FileManager.default.contentsOfDirectory(at: copySnapshots, includingPropertiesForKeys: nil)
+        struct LegacySelection: Decodable { let text: String }
+        precondition(persisted.count == 1)
+        let copyBytes = try Data(contentsOf: persisted[0])
+        precondition((try? JSONDecoder().decode(LegacySelection.self, from: copyBytes)) == nil,
+                     "Rolling back must not interpret a copied selection as a verified excerpt.")
+        let restoredCopy = ResearchProvenanceStore(root: copySnapshots).pendingSelection("copy")
+        precondition(restoredCopy == copied && restoredCopy?.text.utf8.elementsEqual(copied.text.utf8) == true)
+        let copyPayload = ResearchSourceMaterial(key: "inline:copy", title: copied.title, text: copied.text,
+            source: copied.source, scope: copied.scope, url: nil, pageLabel: nil, pageIndex: nil)
+        let copyContext = ResearchReplyContext(question: question, questionId: "copy", requestId: "copy", time: nil, material: copyPayload)
+        let copyAnswer = ResearchChatMessage(id: "copy", role: "assistant", text: "Response", originalPrompt: nil, reply: copyContext)
+        try copyStore.record(session: "test", requestID: "copy", material: copied)
+        let copySource = ResearchAnswerSource(session: "test", answer: copyAnswer, store: copyStore)
+        precondition(copySource.directTarget == nil && copySource.noteContents().quotations.isEmpty)
+
+        var partialCaption = evidence
+        partialCaption.verifiedExcerpts = [.init(kind: .caption,
+            range: NSRange(location: 0, length: evidence.text.utf16.count), title: evidence.title, page: 2, partial: true)]
+        try store.record(session: "partial-caption", requestID: "fixture", material: partialCaption)
+        let captionSource = ResearchAnswerSource(session: "partial-caption", answer: answer, store: reopened, includePositions: false)
+        precondition(captionSource.local?.verifiedExcerpts == nil && captionSource.sourcePresentation?.canOpen == true)
+        precondition(captionSource.sourcePresentation?.warning?.contains("可能不完整") == true)
+        let captionNote = captionSource.noteContents()
+        precondition(captionNote.quotations.map(\.text) == [evidence.text])
+        precondition(captionNote.exportWarning?.contains("可能不完整") == true)
+        let captionMarkdown = captionSource.markdown(interpretation: "待核对", supplement: "", savedAt: Date())
+        precondition(captionMarkdown.contains("局部摘录") && captionMarkdown.contains(evidence.text))
+        let relocated = directory.appendingPathComponent("same-caption.pdf")
+        try FileManager.default.copyItem(at: file, to: relocated)
+        try store.relink(session: "partial-caption", reply: reply, file: relocated)
+        let relocatedSource = ResearchAnswerSource(session: "partial-caption", answer: answer, store: reopened, includePositions: false)
+        precondition(relocatedSource.local?.file?.originalPath == relocated.path)
+        precondition(relocatedSource.sourcePresentation?.warning == captionSource.sourcePresentation?.warning)
+        precondition(relocatedSource.noteContents().quotations.map(\.text) == [evidence.text])
         guard case .pdf(let reference, let recovered, let first) = saved.directTarget else { throw Failure("Lost source target") }
         precondition(first == 2 && recovered == positions)
         let bytes = reference.verifiedPDFData(at: file)
         precondition(bytes != nil)
+        let outside = ResearchPDFSourcePosition(page: 2, bounds: CGRect(x: -90, y: -90, width: 12, height: 7))
+        do {
+            _ = try ResearchPDFEvidenceReader.prepare(data: bytes!, filename: file.lastPathComponent,
+                                                      positions: [anchor, outside], firstPage: 2, requireMappedPositions: true)
+            throw Failure("Incomplete review overlay was accepted")
+        } catch is ResearchMaterialError {}
         precondition(saved.markdown(interpretation: "$x^2$", supplement: "", savedAt: Date()).contains(evidence.text.components(separatedBy: "\n").last!))
         guard case .pdf(_, let legacy, let oldPage) = ResearchDirectSource.locatedFile(reference, positions: nil, pages: "2–4、9") else {
             throw Failure("Lost legacy page")
@@ -123,6 +219,31 @@ struct PDFCardCheck {
         let lightweight = reopened.read(session: "many-lines", reply: reply, includePositions: false)
         precondition(lightweight?.pdfPages == "2" && lightweight?.positionDigest != nil && lightweight?.pdfPositions == nil)
         precondition(reopened.read(session: "many-lines", reply: reply)?.pdfPositions?.count == 750)
+        var grouped = evidence
+        let context = ResearchPDFSourcePosition(page: 1, bounds: CGRect(x: 40, y: 560, width: 300, height: 18))
+        grouped.backgroundPositions = [context]
+        grouped.backgroundFile = reference
+        grouped.objectLabels = ["式 (5)", "Fig. 1"]
+        grouped.sourceGroups = [
+            .init(role: .object, title: "目标摘录", range: 0..<positions.count),
+            .init(role: .context, title: "辅助依据", range: 0..<1),
+        ]
+        try store.record(session: "grouped", requestID: "fixture", material: grouped)
+        let groupedHistory = ResearchAnswerSource(session: "grouped", answer: answer, store: reopened, includePositions: false)
+        precondition(groupedHistory.sourcePresentation?.objects == "式 (5) · Fig. 1")
+        precondition(groupedHistory.sourcePresentation?.page == "摘录页 2")
+        precondition(groupedHistory.local?.sourceGroups == nil && groupedHistory.local?.positionDigest != nil)
+        let navigation = groupedHistory.pdfNavigation(for: reference, background: false)
+        precondition(navigation.positions == positions && navigation.targets.map(\.title) == ["目标摘录", "辅助依据"])
+        precondition(navigation.targets.map(\.positions) == [positions, [context]])
+        precondition(groupedHistory.pdfNavigation(for: reference, background: true).targets.first?.positions == [context])
+        let unrelated = try ResearchFileReference.capture(list)
+        precondition(groupedHistory.pdfNavigation(for: unrelated, background: false).targets.isEmpty)
+        precondition(saved.pdfNavigation(for: reference, background: false).targets.isEmpty)
+        let prepared = try ResearchPDFEvidenceReader.prepare(data: bytes!, filename: file.lastPathComponent,
+            positions: positions, firstPage: 2,
+            targets: navigation.targets + [.init(title: "错误的完整图注", positions: [anchor, outside])])
+        precondition(prepared.targetNames == ["目标摘录", "辅助依据"])
         if CommandLine.arguments.contains("--render") {
             let _ = NSApplication.shared
             let suite = "ResearchPDFCardCheck." + UUID().uuidString
@@ -143,9 +264,7 @@ struct PDFCardCheck {
             window.orderFrontRegardless()
             try await Task.sleep(for: .milliseconds(300))
             try await save(host.view, to: directory.appendingPathComponent("card.png"))
-            let history = ResearchAnswerSource(session: "test", answer: answer, store: reopened, includePositions: false)
-            precondition(history.local?.pdfPositions == nil && history.local?.positionDigest != nil)
-            ResearchAnswerActions.openOriginal(history, in: window)
+            ResearchAnswerActions.openOriginal(groupedHistory, in: window)
             while window.attachedSheet == nil {
                 if ContinuousClock.now > deadline { throw Failure("Source window did not open") }
                 try await Task.sleep(for: .milliseconds(20))
@@ -160,7 +279,45 @@ struct PDFCardCheck {
             precondition(viewer.currentPage === viewer.document?.page(at: 1), "Reader landed on the wrong PDF page")
             precondition(viewer.currentPage!.annotations.contains { $0.type == "Square" })
             try await save(sheet.contentView!, to: directory.appendingPathComponent("reader.png"))
+            func navigationMenu(_ view: NSView) -> NSPopUpButton? {
+                if let menu = view as? NSPopUpButton { return menu }
+                return view.subviews.compactMap { navigationMenu($0) }.first
+            }
+            let menu = navigationMenu(sheet.contentView!)!
+            precondition(menu.itemTitles == ["目标摘录", "辅助依据"])
+            menu.selectItem(at: 1)
+            menu.sendAction(menu.action, to: menu.target)
+            while viewer.currentPage !== viewer.document?.page(at: 0) {
+                if ContinuousClock.now > deadline { throw Failure("The supporting target must navigate to its own page") }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            precondition(viewer.currentPage!.annotations.contains { $0.type == "Square" })
+            precondition(viewer.document?.page(at: 1)?.annotations.isEmpty == true)
             window.endSheet(sheet)
+
+            // Use the production comparison view, checking the reopened PDF, physical page,
+            // highlight and the candidate text against an independently located selection.
+            let review = DSHPetCommandClient.PDFLayoutReview(
+                evidence: ResearchPDFReviewRequired(reason: "请核对本页候选顺序。", pages: [2], materials: [evidence]),
+                reference: reference)
+            var accepted = false
+            let comparison = NSHostingController(rootView: ResearchPDFReviewView(review: review) { accepted = $0 })
+            let comparisonWindow = NSWindow(contentViewController: comparison)
+            comparisonWindow.setContentSize(NSSize(width: 720, height: 460))
+            window.beginSheet(comparisonWindow, completionHandler: nil)
+            var compared: PDFView?
+            let reviewDeadline = ContinuousClock.now.advanced(by: .seconds(12))
+            while compared?.currentPage == nil {
+                if ContinuousClock.now > reviewDeadline { throw Failure("Review did not load the fingerprinted PDF") }
+                try await Task.sleep(for: .milliseconds(30))
+                compared = reader(comparison.view)
+            }
+            guard let compared, let comparedPage = compared.currentPage,
+                  comparedPage === compared.document?.page(at: 1),
+                  comparedPage.annotations.contains(where: { $0.type == "Square" }),
+                  !accepted else { throw Failure("Review opened without its source or silently accepted") }
+            try await save(comparison.view, to: directory.appendingPathComponent("review.png"))
+            window.endSheet(comparisonWindow)
             window.orderOut(nil)
         }
         precondition(reference.matches(file), "Source PDF changed during verification")

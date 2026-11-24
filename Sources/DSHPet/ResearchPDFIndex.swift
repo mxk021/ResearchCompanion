@@ -11,6 +11,9 @@ final class ResearchPDFIndex: Equatable, @unchecked Sendable {
         var blocks: [ResearchPDFBlock]
         let reliableOrder: Bool
         let state: ResearchPDFPageState
+        var hasLocalOrderMap = false
+        var geometry: ResearchPDFLayout.Geometry? = nil
+        var equationLabels: Set<String> = []
         var text: String { blocks.map(\.text).joined(separator: "\n\n") }
         var utf16Length: Int { blocks.reduce(0) { $0 + $1.text.utf16.count + 2 } }
         var ocr: Bool { blocks.contains { $0.lines.contains(where: \.ocr) } }
@@ -21,11 +24,15 @@ final class ResearchPDFIndex: Equatable, @unchecked Sendable {
         cache.totalCostLimit = 40 * 1024 * 1024
         return cache
     }()
+    // Evidence geometry and verbatim spans remain attached to the parser
+    // that produced them. Historical answer snapshots remain unchanged.
+    private static let layoutRevision = 5
     enum WholeTask { case translation, analysis }
     let pages: [Page]
     let reference: ResearchFileReference
     let title: String
     let corpus: ResearchPDFCorpus
+    let objects: ResearchPDFObjectIndex
     let metadata: ResearchPDFMetadata
     let cardStatus: String
     let status: String
@@ -49,9 +56,11 @@ final class ResearchPDFIndex: Equatable, @unchecked Sendable {
         return groups
     }
 
-    static func read(_ url: URL, title: String, recognizeScans: Bool = false, progress: @Sendable (String) -> Void) throws -> ResearchPDFIndex {
+    static func read(_ url: URL, title: String, recognizeScans: Bool = false,
+                     measureRelationships: ((Duration) -> Void)? = nil,
+                     progress: @Sendable (String) -> Void) throws -> ResearchPDFIndex {
         let reference = try ResearchFileReference.capture(url)
-        let key = "\(url.standardizedFileURL.path)|\(reference.fingerprint)|\(recognizeScans)" as NSString
+        let key = "\(layoutRevision)|\(url.standardizedFileURL.path)|\(reference.fingerprint)|\(recognizeScans)" as NSString
         if let existing = cache.object(forKey: key) {
             try Task.checkCancellation()
             return existing
@@ -84,7 +93,8 @@ final class ResearchPDFIndex: Equatable, @unchecked Sendable {
                     progress("正在" + (useOCR ? "本机 OCR" : "建立页索引") + " · PDF 第 \(number) / \(count) 页")
                     lastUpdate = now
                 }
-                var fragments = readable ? try ResearchPDFLayout.native(page, text: native, geometry: geometry) : []
+                let partialNative = !readable && !useOCR
+                var fragments = readable || partialNative ? try ResearchPDFLayout.native(page, text: native, geometry: geometry) : []
                 var state: ResearchPDFPageState = thin ? .needsOCR : .native
                 if useOCR {
                     do {
@@ -103,12 +113,22 @@ final class ResearchPDFIndex: Equatable, @unchecked Sendable {
                     } catch is CancellationError { throw CancellationError() }
                     catch { state = .failed }
                 }
-                let layout = ResearchPDFLayout.blocks(fragments, geometry: geometry, pageNumber: number, inReferences: &inReferences)
-                pages.append(Page(number: number, blocks: layout.blocks, reliableOrder: layout.reliableOrder, state: state))
+                let layout = ResearchPDFLayout.blocks(fragments, geometry: geometry, pageNumber: number,
+                    inReferences: &inReferences, page: page, measureRelationships: measureRelationships)
+                // Keep broken spans in the reading map. A bad glyph in an
+                // unrelated equation need not disable a verified prose range,
+                // but a range that includes that glyph must still fail.
+                let localMap = !fragments.contains { $0.box.isEmpty } && (!partialNative || layout.blocks.lazy
+                    .filter { $0.kind == .body }.flatMap(\.lines)
+                    .filter { $0.text.utf16.count >= 24 && ResearchMaterial.hasReadableText($0.text) }.prefix(4).count == 4)
+                pages.append(Page(number: number, blocks: layout.blocks, reliableOrder: layout.reliableOrder && localMap, state: state,
+                                  hasLocalOrderMap: localMap, geometry: geometry,
+                                  equationLabels: ResearchPDFObjectIndex.numberedEquations(in: native)))
             }
         }
         try distinguishRunningMargins(&pages)
-        let index = try ResearchPDFIndex(pages: pages, metadata: ResearchPDFMetadata.read(doc), reference: reference, title: title)
+        let index = try ResearchPDFIndex(pages: pages, metadata: ResearchPDFMetadata.read(doc),
+                                         reference: reference, title: title, document: doc)
         try Task.checkCancellation()
         guard reference.matches(url) else {
             throw ResearchMaterialError.message("建立索引时原文件已变化，请重新读取。")
@@ -125,24 +145,39 @@ final class ResearchPDFIndex: Equatable, @unchecked Sendable {
     /// Repeated journal/running titles are useful in the source view but interrupt a
     /// paragraph at a page break. An isolated line in the margin can still be body text.
     private static func distinguishRunningMargins(_ pages: inout [Page]) throws {
-        func key(_ block: ResearchPDFBlock) -> String? {
-            guard let margin = block.marginCandidate, block.kind == .body || block.kind == .header || block.kind == .footer,
-                  block.lines.count <= 2, block.text.count < 180 else { return nil }
-            let normal = block.text.lowercased().replacingOccurrences(of: #"[0-9]+"#, with: "#", options: .regularExpression)
-                .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
-            return (margin == .header ? "h" : "f") + normal
+        func signatures(_ block: ResearchPDFBlock, on page: Page) -> [(key: String, kind: ResearchPDFBlockKind)] {
+            guard block.lines.count <= 2, block.text.count < 180 else { return [] }
+            var values: [(key: String, kind: ResearchPDFBlockKind)] = []
+            if let margin = block.marginCandidate, [.body, .header, .footer].contains(block.kind) {
+                let normal = block.text.lowercased().replacingOccurrences(of: #"[0-9]+"#, with: "#", options: .regularExpression)
+                    .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+                values.append(((margin == .header ? "h" : "f") + normal, margin))
+            }
+            // A masthead may be larger than the body font, or set as a
+            // heading. Confirm the same wording in the same narrow top band
+            // on another physical page before removing it from reading order.
+            if (block.kind == .body || block.kind == .heading), block.lines.count == 1,
+               let geometry = page.geometry {
+                let box = block.bounds.applying(geometry.display)
+                let y = box.midY / geometry.canvas.height
+                if y > 0.94, y < 1, block.text.contains(where: \.isLetter) {
+                    values.append(("masthead:\(Int((y * 40).rounded())):" + block.text.lowercased(), .header))
+                }
+            }
+            return values
         }
         var counts: [String: Int] = [:]
         for page in pages {
             try Task.checkCancellation()
-            for value in Set(page.blocks.compactMap(key)) { counts[value, default: 0] += 1 }
+            let keys = page.blocks.flatMap { signatures($0, on: page).map(\.key) }
+            for value in Set(keys) { counts[value, default: 0] += 1 }
         }
         for i in pages.indices {
             try Task.checkCancellation()
             for j in pages[i].blocks.indices {
                 let block = pages[i].blocks[j]
-                if let value = key(block), counts[value, default: 0] >= 2, let margin = block.marginCandidate {
-                    pages[i].blocks[j].kind = margin
+                if let value = signatures(block, on: pages[i]).first(where: { counts[$0.key, default: 0] >= 2 }) {
+                    pages[i].blocks[j].kind = value.kind
                 }
             }
         }
@@ -170,8 +205,10 @@ final class ResearchPDFIndex: Equatable, @unchecked Sendable {
         return found
     }
 
-    init(pages: [Page], metadata: ResearchPDFMetadata, reference: ResearchFileReference, title: String) throws {
+    init(pages: [Page], metadata: ResearchPDFMetadata, reference: ResearchFileReference, title: String,
+         document: PDFDocument? = nil) throws {
         self.pages = pages
+        self.objects = try ResearchPDFObjectIndex(pages: pages, document: document)
         self.corpus = try ResearchPDFCorpus(pages: pages)
         self.metadata = metadata
         self.reference = reference
@@ -199,6 +236,45 @@ final class ResearchPDFIndex: Equatable, @unchecked Sendable {
         if !ocr.isEmpty { details.append("本机 OCR 页 \(Self.pageList(ocr))。") }
         if !uncertain.isEmpty { details.append("部分文字或版面顺序需核对的文件页 \(Self.pageList(uncertain))。") }
         status = details.joined(separator: " ")
+    }
+
+    /// Corroborate a native line only when rectangular selection disagrees with its glyph ranges.
+    /// No OCR transcription enters the material. Unknown, extra or missing symbols fail closed.
+    static func confirmNativeLineByOCR(_ line: ResearchPDFLine, page: PDFPage) throws -> Bool {
+        try Task.checkCancellation()
+        guard !line.ocr, let original = page.pageRef, !line.sourceRanges.isEmpty else { return false }
+        let pieces = line.sourceRanges.compactMap { page.selection(for: $0)?.string }
+        func comparable(_ value: String) -> String {
+            value.precomposedStringWithCompatibilityMapping.filter { !$0.isWhitespace }
+        }
+        let expected = comparable(line.text)
+        guard pieces.count == line.sourceRanges.count, !expected.isEmpty,
+              comparable(pieces.joined()) == expected else { return false }
+        let geometry = ResearchPDFLayout.Geometry(page)
+        let area = line.bounds.applying(geometry.display).insetBy(dx: -1, dy: -0.65)
+        guard !area.isEmpty, area.width.isFinite, area.height.isFinite else { return false }
+        let scale = min(3.5, 1800 / area.width, 160 / area.height)
+        let width = Int(ceil(area.width * scale)), height = Int(ceil(area.height * scale))
+        guard width >= 8, height >= 8,
+              let image = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                    bytesPerRow: 0, space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)
+        else { return false }
+        image.setFillColor(gray: 1, alpha: 1)
+        image.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        image.scaleBy(x: scale, y: scale)
+        image.translateBy(x: -area.minX, y: -area.minY)
+        image.concatenate(geometry.display)
+        image.drawPDFPage(original)
+        guard let crop = image.makeImage() else { return false }
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = false
+        request.recognitionLanguages = ["en-US", "zh-Hans", "zh-Hant"]
+        do { try VNImageRequestHandler(cgImage: crop).perform([request]) } catch { return false }
+        try Task.checkCancellation()
+        guard let observations = request.results, observations.count == 1,
+              let candidate = observations[0].topCandidates(1).first, candidate.confidence >= 0.8 else { return false }
+        return comparable(candidate.string) == expected
     }
 
     /// Vision boxes use the upright rendered image. Invert the exact render transform so

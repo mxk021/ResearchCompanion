@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Research Companion — Read-only Context Bridge",
-  "version": "0.1.4",
+  "version": "0.1.6",
   "description": "Expose only the currently open paper and its current text selection on request to the paired local Research Companion. No library writes, external requests, or model credentials.",
   "author": "Local Research Companion",
   "applications": {

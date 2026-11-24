@@ -18,8 +18,8 @@ private final class BenchmarkReady: NSObject, WKScriptMessageHandler {
 @main private struct TranscriptBenchmark {
     @MainActor static func main() {
         let arguments = CommandLine.arguments
-        guard arguments.count == 2 || (arguments.count == 3 && arguments[2] == "--legacy") else {
-            fputs("Usage: benchmark-transcript path/to/Transcript [--legacy]\n", stderr)
+        guard arguments.count == 2 || (arguments.count == 3 && ["--legacy", "--append"].contains(arguments[2])) else {
+            fputs("Usage: benchmark-transcript path/to/Transcript [--legacy|--append]\n", stderr)
             exit(2)
         }
         let app = NSApplication.shared
@@ -69,24 +69,30 @@ private final class BenchmarkReady: NSObject, WKScriptMessageHandler {
         let nativeStart = ProcessInfo.processInfo.systemUptime
         let setup = try await evaluate(#"""
         const mode = Boolean(delta);
-        window.bench = {history, reply, times: [], jsBytes: 0, mode};
+        window.bench = {history, reply, times: [], jsBytes: 0, mode, previousText: ''};
         const b = window.bench;
         b.update = (text, streaming, first) => {
           const row = {id: 'tail', role: 'assistant', text, original: '', streaming};
+          if (appendText && !first && streaming && b.previousText && text.startsWith(b.previousText)) {
+            row.text = text.slice(b.previousText.length);
+            row.appendAfterUTF16 = b.previousText.length;
+          }
           const payload = mode
             ? {session:'bench', jump: 1, order: first ? history.map(r => r.id) : (b.times.length === 0 ? history.map(r => r.id).concat(row.id) : undefined),
-               busy: streaming ? 'Working' : '', rows: first ? history : [row]}
-            : {session: 'bench', jump:1, rows: first ? history : history.concat(row), busy: streaming ? 'Working' : ''};
+               rows: first ? history : [row]}
+            : {session: 'bench', jump:1, rows: first ? history : history.concat(row)};
           const bytes = new TextEncoder().encode(JSON.stringify(payload)).length;
           b.jsBytes += first ? 0 : bytes;
           const start = performance.now();
           window.ResearchTranscript.update(payload);
           const height = document.documentElement.scrollHeight;
+          b.previousText = streaming ? text : '';
           return {milliseconds: performance.now() - start, height};
         };
         return b.update('', false, true);
         """#, ["history": history.map { row in row.merging(["original": ""]) { first, _ in first } },
-               "reply": reply, "delta": !CommandLine.arguments.contains("--legacy")])
+               "reply": reply, "delta": !CommandLine.arguments.contains("--legacy"),
+               "appendText": CommandLine.arguments.contains("--append")])
         let first = ProcessInfo.processInfo.systemUptime - nativeStart
         let result = try await evaluate(#"""
         const b = window.bench;
@@ -100,7 +106,29 @@ private final class BenchmarkReady: NSObject, WKScriptMessageHandler {
         return {calls: updates, rows: document.querySelectorAll('#messages article').length, formulas: document.querySelectorAll('#messages article:last-child .katex').length, sourceUTF16: b.reply.length, bytes: b.jsBytes,
           totalMs: b.times.reduce((a,b)=>a+b,0), medianMs: sorted[Math.floor(sorted.length/2)], p95Ms: sorted[Math.floor(sorted.length*.95)], maxMs: sorted.at(-1)};
         """#, ["updates": updates])
-        let data = try JSONSerialization.data(withJSONObject: ["initialNativeMs": first * 1000, "initialWeb": setup, "stream": result], options: [.prettyPrinted,.sortedKeys])
+        // Force layout before reading each scroll position. This measures
+        // WebKit's synchronous work, independent of refresh rate and animation.
+        let scrolling = try await evaluate(#"""
+        const height = document.documentElement.scrollHeight - window.innerHeight;
+        const offsets = [0.1, 0.7, 0.25, 0.9, 0.45, 0.8, 0.15, 0.65];
+        const times = [];
+        let moved = 0;
+        for (let cycle = 0; cycle < 4; cycle++) for (const offset of offsets) {
+          const start = performance.now();
+          window.scrollTo(0, height * offset);
+          const error = Math.abs(window.scrollY - height * offset);
+          times.push(performance.now() - start);
+          if (error < 2) moved++;
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        times.sort((a,b) => a-b);
+        if (height < window.innerHeight || moved !== times.length) throw new Error('History did not scroll to every test offset');
+        return {positions: moved, scrollableHeight: height, medianMs: times[Math.floor(times.length * 0.5)],
+          p95Ms: times[Math.floor(times.length * 0.95)]};
+        """#)
+        let data = try JSONSerialization.data(withJSONObject: [
+            "initialNativeMs": first * 1000, "initialWeb": setup, "stream": result, "scroll": scrolling,
+        ], options: [.prettyPrinted,.sortedKeys])
         print(String(decoding: data, as: UTF8.self))
     }
 }

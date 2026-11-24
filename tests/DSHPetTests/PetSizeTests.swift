@@ -13,7 +13,7 @@ final class PetSizeTests: XCTestCase {
         settings.glowEnabled = false
         settings.showStatusBubble = false
         let model = DSHPetModel()
-        let view = DSHPetView(model: model, settings: settings, onOpenHarness: {})
+        let view = DSHPetView(model: model, settings: settings, onActivateChat: {}, onOpenHarness: {})
 
         for size: CGFloat in [60, 108, 200] {
             settings.ballSize = size
