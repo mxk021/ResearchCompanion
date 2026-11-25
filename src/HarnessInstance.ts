@@ -5,12 +5,14 @@ import {
   mkdirSync,
   lstatSync,
   readFileSync,
+  realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { WindowsPipeAccess, type WindowsPipeIdentity } from './WindowsPipeAccess.js'
 
 export type HarnessInstanceKind = 'desktop' | 'web' | 'unknown'
 
@@ -27,11 +29,17 @@ export interface HarnessInstanceDescriptor {
   webURL?: string
   statusSocketPath: string
   commandSocketPath: string
+  transport?: WindowsPipeIdentity
 }
 
 export const INSTANCE_PROTOCOL_VERSION = 1 as const
 
 const MAX_UNIX_SOCKET_PATH_BYTES = 103
+const windowsInstanceKeys = new WeakMap<HarnessInstanceDescriptor, WindowsPipeAccess>()
+
+export function windowsPipeAccess(instance: HarnessInstanceDescriptor | undefined): WindowsPipeAccess | undefined {
+  return instance && windowsInstanceKeys.get(instance)
+}
 
 interface HarnessContextHints {
   name?: unknown
@@ -80,20 +88,11 @@ export function createHarnessInstanceDescriptor(context?: unknown): HarnessInsta
   ))
   const kind: HarnessInstanceKind = explicitKind
     ?? (profile === 'desktop' ? 'desktop' : profile === 'web' ? 'web' : 'unknown')
-  const instanceId = randomUUID().replaceAll('-', '').slice(0, 12)
-  const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid
-  const socketDir = join('/tmp', `dsh-pet-${uid}`)
-  mkdirSync(socketDir, { recursive: true, mode: 0o700 })
-  const directoryInfo = lstatSync(socketDir)
-  if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink() || directoryInfo.uid !== uid) {
-    throw new Error('Refusing an unsafe research companion socket directory')
-  }
-  chmodSync(socketDir, 0o700)
-
-  const statusSocketPath = join(socketDir, `${instanceId}-s.sock`)
-  const commandSocketPath = join(socketDir, `${instanceId}-c.sock`)
-  assertSocketPath(statusSocketPath)
-  assertSocketPath(commandSocketPath)
+  const windows = process.platform === 'win32' ? WindowsPipeAccess.create() : undefined
+  const instanceId = randomUUID().replaceAll('-', '').slice(0, windows ? 24 : 12)
+  const [statusSocketPath, commandSocketPath] = windows
+    ? [windows.path(instanceId, 's'), windows.path(instanceId, 'c')]
+    : unixInstancePaths(instanceId)
 
   const webURL = safeLoopbackURL(
     process.env.DSH_PET_WEB_URL
@@ -102,7 +101,7 @@ export function createHarnessInstanceDescriptor(context?: unknown): HarnessInsta
       ?? contextWebURL(hints),
   )
   const targetId = targetIdentity(profile, hints)
-  return {
+  const instance: HarnessInstanceDescriptor = {
     protocolVersion: INSTANCE_PROTOCOL_VERSION,
     instanceId,
     kind,
@@ -113,7 +112,26 @@ export function createHarnessInstanceDescriptor(context?: unknown): HarnessInsta
     ...(webURL === undefined ? {} : { webURL }),
     statusSocketPath,
     commandSocketPath,
+    ...(windows === undefined ? {} : { transport: windows.identity }),
   }
+  if (windows) windowsInstanceKeys.set(instance, windows)
+  return instance
+}
+
+function unixInstancePaths(instanceId: string): [string, string] {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid
+  const socketDir = join('/tmp', `dsh-pet-${uid}`)
+  mkdirSync(socketDir, { recursive: true, mode: 0o700 })
+  const directoryInfo = lstatSync(socketDir)
+  if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink() || directoryInfo.uid !== uid) {
+    throw new Error('Refusing an unsafe research companion socket directory')
+  }
+  chmodSync(socketDir, 0o700)
+  const statusSocketPath = join(socketDir, `${instanceId}-s.sock`)
+  const commandSocketPath = join(socketDir, `${instanceId}-c.sock`)
+  assertSocketPath(statusSocketPath)
+  assertSocketPath(commandSocketPath)
+  return [statusSocketPath, commandSocketPath]
 }
 
 /** Refresh the origin after WebServer has finished listening. */
@@ -127,6 +145,7 @@ export function refreshHarnessInstanceWebURL(descriptor: HarnessInstanceDescript
 
 /** The default discovery directory shared by Desktop and Web Harness hosts. */
 export function instanceDiscoveryDirectory(home = homedir()): string {
+  if (process.platform === 'win32') return join(process.env.LOCALAPPDATA || join(home, 'AppData', 'Local'), 'Research Companion', 'instances')
   return join(home, 'Library', 'Application Support', 'Research Companion', 'instances')
 }
 
@@ -150,18 +169,30 @@ export class HarnessInstanceManifest {
   publish(): void {
     mkdirSync(this.directory, { recursive: true, mode: 0o700 })
     const info = lstatSync(this.directory)
-    if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid?.()) throw new Error('Unsafe instance discovery directory')
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Unsafe instance discovery directory')
+    const windows = windowsPipeAccess(this.descriptor)
+    if (process.platform === 'win32') {
+      if (!windows || realpathSync.native(this.directory).toLowerCase() !== resolve(this.directory).toLowerCase()) {
+        throw new Error('Unsafe Windows instance discovery directory')
+      }
+    } else if (info.uid !== process.getuid?.()) throw new Error('Unsafe instance discovery directory')
     const temporary = `${this.path}.${process.pid}.${randomUUID()}.tmp`
-    writeFileSync(temporary, `${JSON.stringify(this.descriptor)}\n`, { mode: 0o600 })
-    chmodSync(temporary, 0o600)
-    renameSync(temporary, this.path)
-    chmodSync(this.path, 0o600)
+    const manifest = windows ? { ...this.descriptor, protectedCredential: windows.protectedCredential } : this.descriptor
+    try {
+      writeFileSync(temporary, `${JSON.stringify(manifest)}\n`, { flag: 'wx', mode: 0o600 })
+      if (!windows) chmodSync(temporary, 0o600)
+      renameSync(temporary, this.path)
+      if (!windows) chmodSync(this.path, 0o600)
+    } finally {
+      if (existsSync(temporary)) unlinkSync(temporary)
+    }
     this.published = true
   }
 
   remove(): void {
     if (!this.published || !existsSync(this.path)) return
     try {
+      if (lstatSync(this.path).isSymbolicLink()) return
       const current = JSON.parse(readFileSync(this.path, 'utf8')) as { instanceId?: unknown }
       if (current.instanceId !== this.descriptor.instanceId) return
       unlinkSync(this.path)

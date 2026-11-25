@@ -111,8 +111,11 @@ export function apply(ctx: Context): void {
   // All pet commands are scoped to one new workspace; existing sessions stay private.
   const legacyWorkspace = join(homedir(), 'Documents', 'Codex', 'ResearchCompanionWorkspace')
   const registeredLegacy = ctx.workspaceRegistry.list().some(workspace => workspace.path === legacyWorkspace)
+  const localWorkspace = process.platform === 'win32'
+    ? join(instanceDiscoveryDirectory(), '..', 'Workspace')
+    : join(homedir(), 'Library', 'Application Support', 'Research Companion', 'Workspace')
   const researchWorkspacePath = resolve(process.env.DSH_RESEARCH_WORKSPACE ?? (registeredLegacy ? legacyWorkspace
-    : join(homedir(), 'Library', 'Application Support', 'Research Companion', 'Workspace')))
+    : localWorkspace))
   let researchWorkspaceId: string | undefined
   let researchCanonicalPath = researchWorkspacePath
   const workspaceReady = mkdir(researchWorkspacePath, { recursive: true, mode: 0o700 })
@@ -269,7 +272,7 @@ export function apply(ctx: Context): void {
       ? snapshotOf(globalState)
       : snapshotForSession(activeSessionId)
 
-  const localBridge = new LocalStateBridge(snapshot, instance.statusSocketPath)
+  const localBridge = new LocalStateBridge(snapshot, instance.statusSocketPath, instance)
 
   const workspaceForSummary = (sessionId: string) => ctx.workspaceRegistry.list().find(workspace =>
     workspace.sessionIds.some(candidate => String(candidate) === sessionId),
@@ -811,7 +814,9 @@ export function apply(ctx: Context): void {
       ...(resolveAvailable && typeof files?.list === 'function' ? ['fileCandidates'] : []),
       ...(resolveAvailable && typeof skills?.list === 'function' && typeof commands?.list === 'function' ? ['skillCandidates'] : []),
       ...(typeof (ctx.sessionController as unknown as { projections?: unknown }).projections === 'function' ? ['taskPreview'] : []),
-      'researchContext', 'researchPrompt', 'conversation', 'researchStream', 'researchMaterial',
+      // The Windows client reads its authenticated Zotero selection before constructing inline material.
+      ...(process.platform === 'win32' ? [] : ['researchContext']),
+      'researchPrompt', 'conversation', 'researchStream', 'researchMaterial',
       ...(imageUploads() ? ['researchDocumentImages'] : []),
       ...(researchSessionQuery() !== undefined && archiveSessionIDs() !== undefined ? ['researchHistory'] : []),
       ...(retirement.available(optionalService) ? ['researchSafeDelete','research.retirement.offline.v1'] : []),

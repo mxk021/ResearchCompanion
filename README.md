@@ -22,6 +22,10 @@ Research Companion 是一款开源的 macOS 文献阅读助手。关联 PDF、�
 
 PDF 索引、OCR、取词和笔记渲染在本机执行。提交问题或启动由模型协助的检索时，DSH 会将本轮所需的文字、文件概况或原页裁图交给所选模型提供方，费用及额度取决于你的账号。公开安装包只包含应用、科研桥、安装说明和可选 Zotero 扩展。模型账户和兼容提供方由用户自行配置。[模型账号和数据说明](docs/SETUP.md#连接及数据)
 
+## Windows 候选版开发
+
+Windows 移植在独立开发分支验证。安装、构建和未验收的项目见 [Windows 候选版说明](windows/README.md)。
+
 ## 参与开发
 
 请用合成材料提供复现步骤，并移除凭据、私人路径和文献内容。[报告问题](https://github.com/mxk021/ResearchCompanion/issues/new?template=bug_report.md) · [贡献指南](CONTRIBUTING.md) · [构建与测试](docs/BUILD.md) · [版本记录](CHANGELOG.md)
