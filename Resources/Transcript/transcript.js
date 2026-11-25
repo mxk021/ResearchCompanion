@@ -16,6 +16,7 @@
   const revealNote = document.getElementById('reveal-note');
   const dismissNoteFeedback = document.getElementById('dismiss-note-feedback');
   const empty = document.getElementById('empty');
+  const emptyGuidance = document.getElementById('empty-guidance');
   const rows = new Map();
   const rowByArticle = new WeakMap();
   const deferredRows = new Set();
@@ -211,19 +212,22 @@
     const header = document.createElement('header');
     header.className = 'message-header';
     const byline = document.createElement('span');
-    byline.textContent = row.role === 'user' ? '你' : '科研伙伴';
+    byline.textContent = row.role === 'user' ? '你' : '科研助手';
     const actions = document.createElement('div');
     actions.className = 'message-actions';
     const sourceGroup = document.createElement('div');
     sourceGroup.className = 'source-group';
     const openSource = button('answer-direct-source', '');
+    const openLabel = document.createElement('span');
+    openLabel.className = 'source-open-label';
+    openLabel.textContent = '打开原文 · ';
     const objectLabel = document.createElement('span');
     objectLabel.className = 'source-objects';
     const openMaterial = document.createElement('span');
     openMaterial.className = 'answer-material-label';
     const pageLabel = document.createElement('span');
     pageLabel.className = 'source-page';
-    openSource.append(objectLabel, openMaterial, pageLabel);
+    openSource.append(openLabel, objectLabel, openMaterial, pageLabel);
     const showSource = button('answer-source', '');
     sourceGroup.append(openSource, showSource);
     const split = document.createElement('div');
@@ -336,14 +340,13 @@
     record.pageLabel.textContent = row.sourcePage ? ' · ' + row.sourcePage : '';
     record.openSource.title = sourceDetails;
     record.openSource.setAttribute('aria-label', '打开原文 · ' + sourceDisplay);
-    const inspect = record.openSource.hidden && sourceDisplay ? '摘录 · ' + sourceDisplay : '来源详情';
-    if (row.sourceWarning) {
-      record.showSource.textContent = record.openSource.hidden ? inspect + ' · 图注待核对' : '图注待核对';
-      record.showSource.title = row.sourceWarning;
-    } else {
-      record.showSource.textContent = inspect;
-      record.showSource.title = record.openSource.hidden ? sourceDetails || '查看已记录的材料信息' : '查看当时发送的原文摘录与来源信息';
-    }
+    const inspect = record.openSource.hidden && sourceDisplay ? '查看来源 · ' + sourceDisplay : '来源详情';
+    record.showSource.toggleAttribute('data-source-warning', Boolean(row.sourceWarning));
+    record.showSource.textContent = row.sourceWarning
+      ? (record.openSource.hidden ? '证据待核对 · ' + inspect : '证据待核对')
+      : inspect;
+    record.showSource.title = row.sourceWarning ||
+      (record.openSource.hidden ? sourceDetails || '查看已记录的材料信息' : '查看当时发送的原文摘录与来源信息');
     placeCopy(record);
   }
 
@@ -432,6 +435,9 @@
       activeFormula = undefined;
       noteSaved('', session, '');
       setFollowing(true);
+    }
+    if (typeof patch.emptyGuidance === 'string' && emptyGuidance.textContent !== patch.emptyGuidance) {
+      emptyGuidance.textContent = patch.emptyGuidance;
     }
     if (jump !== patch.jump) {
       jump = patch.jump;

@@ -84,7 +84,7 @@ struct DSHPetTaskPanelView: View {
                 Text("当前没有进行中的任务")
                     .font(.system(size: 12, weight: .medium))
                 if command.taskListAvailable {
-                    Text("在 Harness 中运行的任务会自动出现在这里")
+                    Text("在 DSH 中运行的任务会自动出现在这里")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -314,7 +314,7 @@ struct DSHPetTaskPanelView: View {
                 .buttonStyle(.plain)
                 .font(.system(size: 10, weight: .medium))
             Spacer()
-            Button("打开 Harness") { model.openHarness() }
+            Button("打开 DSH") { model.openHarness() }
                 .buttonStyle(.plain)
                 .font(.system(size: 10, weight: .medium))
         }

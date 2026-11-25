@@ -164,7 +164,7 @@ struct ResearchSetupView: View {
     @State private var issue: String?
     private var compatible: Bool { environment.version == ResearchSetup.supportedVersion }
     private var guidance: String {
-        guard let version = environment.version else { return "问答需要 DeepSeek Harness 桌面版。先从开发者网站取得兼容版本。" }
+        guard let version = environment.version else { return "问答需要 DSH 桌面版。先从开发者网站取得兼容版本。" }
         guard compatible else { return "当前 DSH 为 " + version + "。已验证版本为 " + ResearchSetup.supportedVersion + "，请先核对版本。" }
         if [.absent, .upgradeable].contains(bridge), environment.archive == nil {
             return "此应用副本未附科研桥。请使用公开发行安装盘，或按原方式维护科研桥。"

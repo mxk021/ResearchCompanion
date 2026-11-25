@@ -9,7 +9,7 @@ struct ResearchMaterial: Equatable, Sendable {
     static let selectionServiceSource = "系统服务"
     static let maximumLength = 24_000
     static let localSelectionLimit = 1_048_576
-    static let oversizeMessage = "已完整保留本机选区。单次材料上限为 24,000 个 UTF‑16 字符，请缩小选区后再发送。"
+    static let oversizeMessage = "已完整保留本机选区。选区过长，请缩小后再发送。"
     var id = UUID()
     let source: String
     let title: String
@@ -70,7 +70,7 @@ struct ResearchMaterial: Equatable, Sendable {
         guard original.utf16.count <= localSelectionLimit else { throw SelectionCaptureError.tooLarge }
         guard hasReadableText(original) else { throw ResearchMaterialError.message("没有可读取的选中文字。") }
         return Self(source: source, title: title, text: original,
-                    scope: "当前选区 · \(original.utf16.count) 个 UTF‑16 字符", url: url, selectionIsComplete: true,
+                    scope: "当前选区", url: url, selectionIsComplete: true,
                     verifiedExcerpts: [.init(kind: .selection, range: NSRange(location: 0, length: original.utf16.count),
                                              title: title, doi: ResearchVerifiedExcerpt.doi(from: url.flatMap(URL.init(string:))))])
     }
@@ -225,7 +225,7 @@ enum ResearchFileMaterial {
         }
         let encoding: String.Encoding = data.starts(with: [0xFF, 0xFE]) || data.starts(with: [0xFE, 0xFF]) ? .utf16 : .utf8
         guard let original = String(data: data, encoding: encoding) else {
-            throw ResearchMaterialError.message("无法解码纯文本；支持 UTF‑8 或带 BOM 的 UTF‑16。")
+            throw ResearchMaterialError.message("无法读取这份纯文本。请另存为 UTF-8 纯文本后重试。")
         }
         let text = ResearchMaterial.bounded(original)
         guard ResearchMaterial.hasReadableText(text) else {
@@ -234,7 +234,7 @@ enum ResearchFileMaterial {
         let kind = ["md", "markdown"].contains(ext) ? "Markdown 文件" : "纯文本文件"
         let total = original.utf16.count
         let shown = text.utf16.count
-        let scope = shown < total ? "仅带入前 \(shown) / \(total) 个 UTF‑16 字符。" : "全文 · \(shown) 个 UTF‑16 字符"
+        let scope = shown < total ? "仅带入文件开头的内容。" : "全文"
         return ResearchMaterial(source: kind, title: title, text: text, scope: scope,
                                 fileReference: try ResearchFileReference.capture(url),
                                 verifiedExcerpts: [.init(kind: .body, range: NSRange(location: 0, length: shown),
@@ -249,18 +249,24 @@ struct ResearchMaterialCard: View {
     let availableSize: CGSize
     @State private var fileDetails = false
     @State private var dragOver = false
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Button("选取文字") {
+        let palette = ResearchPalette(scheme)
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Button {
                     if !NSApp.sendAction(#selector(AppDelegate.selectResearchTextFromPanel(_:)), to: NSApp.delegate, from: nil) {
                         command.rejectResearchSelection("未能启动选区读取，请回到原应用重新选取。")
                     }
+                } label: {
+                    Label("选取文字", systemImage: "text.viewfinder")
                 }
                 .help("预览原应用当前高亮的文字。")
                 .disabled(command.pdfRequestRunning || command.choosingResearchFile || command.retirementInProgress)
-                Button("选择文件…") { chooseFile() }
+                Button { chooseFile() } label: {
+                    Label("选择文件…", systemImage: "paperclip")
+                }
                     .disabled(command.choosingResearchFile || command.pdfRequestRunning || command.retirementInProgress || command.selectedWorkspaceID == nil)
                 Spacer(minLength: 2)
                 if command.loadingResearchFile || command.pdfRequestRunning {
@@ -270,7 +276,9 @@ struct ResearchMaterialCard: View {
                     Toggle("带入材料", isOn: $command.includePaperContext)
                         .toggleStyle(.switch).controlSize(.mini).fixedSize()
                 }
-            }.controlSize(.small)
+            }
+            .buttonStyle(ResearchToolbarButton(filled: true))
+            .controlSize(.small)
             if command.capturingSelection {
                 HStack {
                     Text("正在读取本次选区…").font(.caption).foregroundStyle(.secondary)
@@ -285,7 +293,8 @@ struct ResearchMaterialCard: View {
                         Text("选区 · " + selected.source)
                             .font(.caption.weight(.semibold)).fixedSize()
                         Text([selected.title, selected.page.map { "页标签 " + $0 }].compactMap { $0 }.joined(separator: " · "))
-                            .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                            .font(.caption).foregroundStyle(scheme == .dark ? palette.secondary : .secondary)
+                            .lineLimit(1).truncationMode(.middle)
                             .help([selected.title, selected.localWebURL ?? selected.url, selected.page.map { "页标签 " + $0 }]
                                 .compactMap { $0 }.joined(separator: "\n"))
                         Spacer(minLength: 3)
@@ -301,7 +310,7 @@ struct ResearchMaterialCard: View {
                     .buttonStyle(.borderless)
                     if let address = selected.url {
                         Text(address)
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(scheme == .dark ? palette.secondary : .secondary)
                             .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
                             .accessibilityLabel("网页出处 " + address)
                             .help(address)
@@ -367,7 +376,7 @@ struct ResearchMaterialCard: View {
             if !command.capturingSelection, !command.hasSelectionFailure, !command.pdfRequestRunning,
                command.submissionStatus != .submitting, !command.conversationRunning {
                 let next = command.researchMaterialSummary(.ask)
-                Text(next).font(.caption).foregroundStyle(.secondary)
+                Text(next).font(.system(size: 11)).foregroundStyle(palette.secondary)
                     .lineLimit(2).help(next)
             }
             if command.associatedPDFName == nil, let error = command.materialError {
@@ -376,9 +385,13 @@ struct ResearchMaterialCard: View {
         }
         .onChange(of: command.fixedMaterial?.fileReference?.fingerprint) { _, _ in fileDetails = false }
         .onChange(of: command.sessionID) { _, _ in fileDetails = false }
-        .padding(8)
-        .background(.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 11))
-        .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(Color.accentColor.opacity(dragOver ? 0.8 : 0), lineWidth: 2))
+        .padding(10)
+        .background(palette.raised.opacity(0.54), in: RoundedRectangle(cornerRadius: 11))
+        .overlay {
+            RoundedRectangle(cornerRadius: 11)
+                .strokeBorder(dragOver ? palette.accent : palette.rule, lineWidth: dragOver ? 2 : 1)
+                .allowsHitTesting(false)
+        }
         .dropDestination(for: URL.self) { urls, _ in
             guard urls.count == 1, let url = urls.first, url.isFileURL else {
                 command.noteMaterialMessage("请一次拖入一个本机文件。")
@@ -441,6 +454,7 @@ struct ResearchPDFCardContent: View {
     let filename: String
     let status: String
     let statusDetail: String?
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -456,7 +470,8 @@ struct ResearchPDFCardContent: View {
                         .lineLimit(1).truncationMode(.middle)
                 }.help(url.absoluteString)
             }
-            Text(status).foregroundStyle(.secondary).lineLimit(2).help(statusDetail ?? status)
+            Text(status).foregroundStyle(scheme == .dark ? ResearchPalette(scheme).secondary : .secondary)
+                .lineLimit(2).help(statusDetail ?? status)
         }
         .font(.caption).frame(maxWidth: .infinity, alignment: .leading)
         .textSelection(.enabled)

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' file:; style-src 'self' file: 'unsafe-inline'; font-src 'self' file:; img-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' file:; style-src 'self' file: 'unsafe-inline'; font-src 'self' file:; img-src file:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>科研对话</title>
   <link rel="stylesheet" href="vendor/katex/katex.min.css">
   <link rel="stylesheet" href="transcript.css">
@@ -14,7 +14,7 @@
 </head>
 <body>
   <main id="transcript" aria-label="科研对话">
-    <p id="empty">选中材料后翻译、解释，或直接输入问题。</p>
+    <p id="empty"><img class="empty-brand-mark" src="ResearchCompanionMark.png" alt=""><span id="empty-guidance" role="status">选取文字、选择文件，或直接输入问题。</span></p>
     <section id="messages" aria-label="消息"></section>
   </main>
   <p id="reading-feedback" role="status" aria-live="polite" hidden></p>

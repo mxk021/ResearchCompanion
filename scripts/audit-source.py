@@ -16,6 +16,7 @@ DENY_PART = {".dsh", "PrivateProvenance", "node_modules", ".DS_Store", ".env",
 DENY_PATH = {"scripts/check-paper-sample.json", "scripts/install-retirement.py", "tests/retirement-install-finalize.py"}
 DENY_SUFFIX = {".dmg", ".zip", ".tgz", ".xpi", ".pdf", ".log", ".p12", ".pfx", ".key", ".p8", ".pem", ".sqlite", ".db", ".plist"}
 BINARY = {".woff", ".woff2", ".ttf", ".png"}
+ARTWORK = {"docs/images/research-transcript.png", "Resources/AppIcon.png"}
 
 def git(*args):
     return subprocess.check_output(["git", *args])
@@ -40,7 +41,7 @@ def inspect_tree(entries, seen):
         data = git("cat-file", "blob", oid)
         if b"\x00" in data:
             permitted = ((path.suffix in BINARY - {".png"} and str(path.parent) == "Resources/Transcript/vendor/katex/fonts")
-                         or str(path) == "docs/images/research-transcript.png")
+                         or str(path) in ARTWORK)
             if not permitted:
                 bad = True
                 print(f"{path}: unreviewed binary")

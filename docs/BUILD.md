@@ -1,6 +1,6 @@
 # 构建与发布
 
-在 Git 的干净检出目录运行以下命令。从源码重建 v0.3.1 时先检出 `v0.3.1` 标签，开发分支可运行同一脚本。需要 macOS、完整 Xcode（含 SwiftPM、XCTest 和当前 macOS SDK）、Python 3.9 或更新版本、Node 和 pnpm。版本要求见 `package.json`，依赖按 `pnpm-lock.yaml` 安装。首次安装锁定依赖需要访问 npm。构建与测试不需要 DSH 登录或模型额度。
+在 Git 的干净检出目录运行以下命令。从源码重建 v0.3.4 时先检出 `v0.3.4` 标签，开发分支可运行同一脚本。需要 macOS、完整 Xcode（含 SwiftPM、XCTest 和当前 macOS SDK）、Python 3.9 或更新版本、Node 和 pnpm。版本要求见 `package.json`，依赖按 `pnpm-lock.yaml` 安装。首次安装锁定依赖需要访问 npm。构建与测试不需要 DSH 登录或模型额度。
 
 ```sh
 python3 scripts/release.py
@@ -25,9 +25,11 @@ python3 scripts/release.py
 
 本机打包可用 `--local-signing-keychain <绝对路径>` 和 `--sign-identity <40 位 SHA-1 证书指纹>` 复用本机代码签名证书。该模式将指定要求绑定到 bundle ID 和证书指纹。私钥保存在用户钥匙串，原位升级沿用同一证书和 bundle ID。首次从按 CDHash 识别的 ad hoc 包切换时，需为新签名授权一次。公开包独立构建，默认采用 ad hoc 签名。公证选项另需 Developer ID。[Apple 代码签名要求](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements/)
 
-同一身份的后续原位升级可用 `--previous-app "/Applications/Research Companion.app" --require-same-identity`。脚本仅在两个包互相满足对方指定要求时产出候选。若本次只更新可执行文件，可加 `--reuse-installed-resources`，离线复制已严格验签的本机资源和 PDFium。资源或框架发生变化时走常规打包。安装后以正式进程的「设置 → 交互与提醒 → 选取文字」授权状态为准。Zotero 只读桥使用已有配对。
+同一身份的后续原位升级可用 `--previous-app "/Applications/Research Companion.app" --require-same-identity`。脚本仅在两个包互相满足对方指定要求时产出候选。`--reuse-installed-resources` 会离线复制已严格验签的本机资源和 PDFium，并从当前源码更新对话资源及生成 App 图标。其他资源或框架发生变化时走常规打包。安装后以正式进程的「设置 → 交互与提醒 → 选取文字」授权状态为准。Zotero 只读桥使用已有配对。
 
 使用 `swiftc -parse-as-library scripts/benchmark-transcript.swift -o <临时可执行文件>` 编译合成基准，再传入 App 内的 `Contents/Resources/Transcript`。它测量 90 条历史的初次排版、72 次流式更新以及滚动后同步布局。比较版本时保持参数和设备相同。文档问答的客户端单调时钟可从本机 `research-timing` 日志读取。模型入口的科研桥阶段时间单独比较，勿与重叠的客户端区间相加。
+
+App 图标使用 `Resources/AppIcon.png` 的 1024 像素母版。打包脚本生成各尺寸并封装为 `ResearchCompanionWormhole.icns`，也从同一母版提取菜单栏、对话和设置共用的透明符号。
 
 论文请求先区分输出动作、起止原文、对象编号和具名符号。图注、正文、公式及浮动对象沿同一原页坐标索引。跨栏图注需要原文和版面共同支持，图注与引理按独立段落边界分开。公式和定义按需使用内置 PDFium 的字形与页面区域复核，PDFium 字符序号不用于 PDFKit 选区。复杂公式继续保留原页裁图。
 
@@ -51,11 +53,11 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 
 ## 发布版本
 
-v0.3.1 采用 App 版本号及构建号 `0.3.1`。公开包内的 App 采用 ad hoc 签名，未经 Apple 公证。常规 CI 只做构建和校验，发布由维护者在仓库中操作。
+v0.3.4 采用 App 版本号及构建号 `0.3.4`。公开包内的 App 采用 ad hoc 签名，未经 Apple 公证。首次打开可能被 Gatekeeper 拦截，公开包升级或从本机签名包更换为公开包后可能需要重新授予辅助功能权限。常规 CI 只做构建和校验，发布由维护者在仓库中操作。
 
 1. 核对候选提交、版本标签和构建输入。在审核过的干净检出目录运行 `python3 scripts/audit-source.py --history`，检查暂存区与本地引用可达的提交。另行复核截图、第三方声明，以及 GitHub 上的附件、Actions 日志和产物。
 2. 核对标签指向实际构建提交，并验证原始镜像。脚本的 `--tag` 只检查版本字符串。已有标签的版本保留原提交和原附件，软件实现变更应更新版本并打新标签。
-3. 将通过验证的 DMG 和 `.sha256` 上传到对应 Release。发行说明列出测试环境、签名和公证状态、需另装的宿主、账号要求与实机验收范围。[v0.3.1 发行页](https://github.com/mxk021/ResearchCompanion/releases/tag/v0.3.1)
+3. 将通过验证的 DMG 和 `.sha256` 上传到对应 Release。发行说明列出测试环境、签名和公证状态、需另装的宿主、账号要求与实机验收范围。[v0.3.4 发行页](https://github.com/mxk021/ResearchCompanion/releases/tag/v0.3.4)
 4. 发布后以该仓库可见性允许的权限重新下载附件。核对 SHA-256，挂载镜像并验证 App 的版本、架构、签名和安装内容。[GitHub Releases](https://github.com/mxk021/ResearchCompanion/releases)
 
 ## 可选的 Developer ID 签名与 Apple 公证

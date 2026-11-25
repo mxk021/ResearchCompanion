@@ -3,6 +3,11 @@ import SwiftUI
 struct ResearchModelPicker: View {
     @ObservedObject var command: DSHPetCommandClient
     @State private var showingModels = false
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var detailInk: Color {
+        colorScheme == .dark ? ResearchPalette(colorScheme).secondary : .secondary
+    }
 
     private var selected: ResearchModelSelection? { command.selectedResearchModel }
     private var selectedModel: ResearchModelCatalog.Model? { command.modelCatalog?.model(for: selected) }
@@ -28,13 +33,12 @@ struct ResearchModelPicker: View {
             HStack(spacing: 5) {
                 Text(title).lineLimit(1).truncationMode(.tail)
                 if let effort {
-                    Text(effort).foregroundStyle(.secondary).lineLimit(1)
+                    Text(effort).foregroundStyle(detailInk).lineLimit(1)
                 }
                 Image(systemName: "chevron.down").imageScale(.small)
             }
-            .font(.caption)
         }
-        .buttonStyle(.bordered)
+        .buttonStyle(ResearchToolbarButton(filled: true))
         .accessibilityIdentifier("research.modelPicker")
         .accessibilityLabel("模型 " + title + (effort.map { "，推理强度 " + $0 } ?? ""))
         .popover(isPresented: $showingModels, arrowEdge: .bottom) { modelPanel }
@@ -49,18 +53,18 @@ struct ResearchModelPicker: View {
                     .disabled(!command.modelSelectionAvailable || command.modelCatalogLoading)
             }
             if !command.modelSelectionAvailable {
-                Text("当前科研桥无法读取模型目录。").foregroundStyle(.secondary)
+                Text("当前科研桥无法读取模型目录。").foregroundStyle(detailInk)
             } else if let issue = command.modelCatalogError {
-                Text(issue).foregroundStyle(.secondary)
+                Text(issue).foregroundStyle(detailInk)
             } else if command.modelCatalog == nil || command.modelCatalogLoading {
                 ProgressView().controlSize(.small).accessibilityLabel("正在读取可用模型")
             }
             if let selectionError = command.modelSwitchError {
                 Text(selectionError).foregroundStyle(.red)
             } else if command.conversationRunning {
-                Text("正在生成，结束后可切换。").foregroundStyle(.secondary)
+                Text("正在生成，结束后可切换。").foregroundStyle(detailInk)
             } else if let selected, command.modelCatalog != nil, selectedModel == nil {
-                Text(selected.model + " 当前不可用，请选择可用模型。").foregroundStyle(.secondary)
+                Text(selected.model + " 当前不可用，请选择可用模型。").foregroundStyle(detailInk)
             }
             if let selected, let reasoning = selectedModel?.reasoning, !reasoning.efforts.isEmpty {
                 HStack {
@@ -81,7 +85,7 @@ struct ResearchModelPicker: View {
                     .disabled(!command.canSelectResearchModel || command.modelCatalogLoading)
                 }
             } else if selectedModel != nil {
-                Text("推理强度不可调").foregroundStyle(.secondary)
+                Text("推理强度不可调").foregroundStyle(detailInk)
             }
             if let directory = command.modelCatalog {
                 ScrollView {
@@ -89,7 +93,7 @@ struct ResearchModelPicker: View {
                         ForEach(directory.groups) { group in
                             Text(group.name).font(.subheadline.weight(.semibold)).padding(.top, 4)
                             if let error = group.error {
-                                Text(error).font(.caption).foregroundStyle(.secondary)
+                                Text(error).font(.caption).foregroundStyle(detailInk)
                             }
                             ForEach(group.models) { model in
                                 let active = selected?.provider == group.id && selected?.model == model.id

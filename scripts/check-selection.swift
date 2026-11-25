@@ -222,7 +222,7 @@ import ApplicationServices
         client.finishResearchSelectionCapture(warning, result: .success(retained), clipboard: .restoreFailed)
         precondition(client.appMaterial == retained && client.selectionError?.contains("已保存本次选区") == true)
         client.draft = "只翻译这个选区"
-        precondition(client.researchMaterialSummary(.translate).contains("Safari"))
+        precondition(client.researchMaterialSummary(.translate) == "将带入完整选区")
         precondition(DSHPetCommandClient(defaults: defaults, provenanceStore: store).appMaterial == retained)
         precondition(!client.hasPendingSubmission && !client.capturingSelection)
 
@@ -403,7 +403,7 @@ import ApplicationServices
             try ResearchSelectionCapture.exactSelection(excerpt, source: "Explicit mode fixture", title: "Mode fixture")))
         client.draft = "只解释选区"
         precondition(client.researchMaterialSummary(.explain).contains("完整选区"))
-        precondition(client.researchMaterialSummary(.ask).contains("Explicit mode fixture"))
+        precondition(client.researchMaterialSummary(.ask) == "将带入完整选区")
         client.includePaperContext = false
         precondition(client.researchMaterialSummary(.ask).contains("本轮只发送问题"))
         client.includePaperContext = true

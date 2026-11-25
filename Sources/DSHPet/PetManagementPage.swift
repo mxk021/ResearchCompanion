@@ -5,6 +5,7 @@ import SwiftUI
 struct PetManagementPage: View {
     @ObservedObject var settings: PetSettings
     @ObservedObject var library: CustomPetLibrary
+    let wide: Bool
 
     @State private var pendingPackage: PendingPackage?
     @State private var petToDelete: ImportedPet?
@@ -17,20 +18,10 @@ struct PetManagementPage: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            PetManagementHeader()
-
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: 18) {
-                    petList.frame(width: 420, alignment: .leading)
-                    Divider()
-                    previewPanel.frame(width: 280, alignment: .leading)
-                }
-                VStack(alignment: .leading, spacing: 24) {
-                    petList
-                    previewPanel
-                }
-            }
+        SettingsColumns(wide: wide) {
+            petList
+        } detail: {
+            previewPanel
         }
         .onAppear {
             ensureCurrentSkinAvailable()
@@ -52,74 +43,64 @@ struct PetManagementPage: View {
     }
 
     private var petList: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            PetManagementCard(title: "已导入的宠物") {
+        SettingsCard(title: "已导入的宠物") {
+            HStack(spacing: 8) {
+                Button {
+                    choosePackage()
+                } label: {
+                    Label("导入宠物", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.borderedProminent)
+                Button {
+                    refreshLibrary()
+                } label: {
+                    Label("刷新", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+            }
+            Text("选择包含 pet.json 的文件夹。也可以从 ~/.codex/pets 中选择已安装的 Codex 宠物。")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            SettingsRule()
+            if library.pets.isEmpty {
+                Text("还没有导入宠物")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 8)
+            } else {
                 VStack(alignment: .leading, spacing: 0) {
-                    HStack(spacing: 10) {
-                        Button {
-                            choosePackage()
-                        } label: {
-                            Label("导入宠物", systemImage: "square.and.arrow.down")
-                        }
-                        .buttonStyle(.borderedProminent)
-
-                        Button {
-                            refreshLibrary()
-                        } label: {
-                            Label("刷新", systemImage: "arrow.clockwise")
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                    .padding(.bottom, 8)
-
-                    Text("选择包含 pet.json 的文件夹。也可以从 ~/.codex/pets 中选择已安装的 Codex 宠物。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.bottom, 12)
-
-                    Divider().opacity(0.45)
-
-                    if library.pets.isEmpty {
-                        VStack(alignment: .leading, spacing: 7) {
-                            Label("还没有导入宠物", systemImage: "pawprint")
-                                .font(.headline)
-                            Text("点击“导入宠物”选择一个兼容的 Codex v2 宠物包。")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(.vertical, 24)
-                    } else {
-                        ForEach(library.pets) { pet in
-                            ImportedPetRow(
-                                pet: pet,
-                                atlas: library.atlas(for: pet.skin),
-                                isCurrent: settings.skin == pet.skin,
-                                use: { settings.skin = pet.skin },
-                                remove: { petToDelete = pet }
-                            )
-                            if pet.id != library.pets.last?.id { Divider().opacity(0.4) }
-                        }
-                    }
-
-                    if let message {
-                        Label(message, systemImage: messageIsError ? "exclamationmark.triangle" : "checkmark.circle")
-                            .font(.caption)
-                            .foregroundStyle(messageIsError ? Color.orange : Color.secondary)
-                            .padding(.top, 12)
+                    ForEach(library.pets) { pet in
+                        ImportedPetRow(
+                            pet: pet,
+                            atlas: library.atlas(for: pet.skin),
+                            isCurrent: settings.skin == pet.skin,
+                            use: { settings.skin = pet.skin },
+                            remove: { petToDelete = pet }
+                        )
+                        if pet.id != library.pets.last?.id { SettingsRule() }
                     }
                 }
+            }
+            if let message {
+                Label(message, systemImage: messageIsError ? "exclamationmark.triangle" : "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(messageIsError ? Color.orange : Color.secondary)
             }
         }
     }
 
     private var previewPanel: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("导入预览").font(.headline)
-            VStack(spacing: 12) {
-                if let pendingPackage {
+        SettingsCard(title: "导入预览") {
+            if let pendingPackage {
+                SettingsPreviewField {
                     PetPackagePreview(atlas: pendingPackage.package.atlas, mood: packagePreviewMood)
-                        .frame(height: 190)
+                        .frame(height: 196)
+                }
+                HStack {
+                    Text(pendingPackage.package.displayName)
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer(minLength: 6)
                     Picker("预览状态", selection: $packagePreviewMood) {
                         Text("空闲").tag("idle")
                         Text("思考中").tag("waiting")
@@ -128,37 +109,27 @@ struct PetManagementPage: View {
                         Text("挥手").tag("wave")
                     }
                     .labelsHidden()
-                    .frame(width: 150)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(pendingPackage.package.displayName)
-                            .font(.headline)
-                        if !pendingPackage.package.description.isEmpty {
-                            Text(pendingPackage.package.description)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(3)
-                        }
-                    }
-                    HStack(spacing: 8) {
-                        Button("导入") { importPendingPackage() }
-                            .buttonStyle(.borderedProminent)
-                        Button("取消") { self.pendingPackage = nil }
-                            .buttonStyle(.bordered)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    Image(systemName: "pawprint.circle")
-                        .font(.system(size: 42))
-                        .foregroundStyle(.secondary)
-                    Text("选择宠物包后先在这里预览，再确认导入。")
+                    .frame(width: 90)
+                }
+                if !pendingPackage.package.description.isEmpty {
+                    Text(pendingPackage.package.description)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
+                        .lineLimit(3)
                 }
+                SettingsRule()
+                HStack(spacing: 8) {
+                    Button("导入") { importPendingPackage() }
+                        .buttonStyle(.borderedProminent)
+                    Button("取消") { self.pendingPackage = nil }
+                        .buttonStyle(.bordered)
+                }
+            } else {
+                Text("选择宠物包后可先预览，再确认导入。")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .frame(maxWidth: .infinity, minHeight: 250)
-            .padding(14)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
         }
     }
 
@@ -239,41 +210,6 @@ struct PetManagementPage: View {
     }
 }
 
-private struct PetManagementHeader: View {
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("宠物管理").font(.system(size: 26, weight: .semibold))
-            Text("导入兼容的 Codex 宠物包，管理 Research Companion 中可用的桌宠。")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-        }
-        .padding(.bottom, 24)
-    }
-}
-
-private struct PetManagementCard<Content: View>: View {
-    let title: String
-    @ViewBuilder let content: Content
-
-    init(title: String, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.content = content()
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(title).font(.headline).padding(.bottom, 12)
-            content
-        }
-        .padding(.vertical, 18)
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(Color(nsColor: .separatorColor).opacity(0.55))
-                .frame(height: 0.5)
-        }
-    }
-}
-
 private struct ImportedPetRow: View {
     let pet: ImportedPet
     let atlas: CodexSpriteAtlas?
@@ -297,7 +233,7 @@ private struct ImportedPetRow: View {
                     Text(pet.description).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
                 if isCurrent {
-                    Text("当前使用中").font(.caption2).foregroundStyle(.blue)
+                    Text("当前使用中").font(.caption2).foregroundStyle(.tint)
                 }
             }
             Spacer(minLength: 6)

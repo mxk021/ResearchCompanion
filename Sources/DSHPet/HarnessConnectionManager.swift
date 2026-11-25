@@ -24,9 +24,9 @@ struct HarnessInstance: Codable, Equatable, Identifiable {
     var displayName: String {
         let name: String
         switch kind {
-        case .desktop: name = "DeepSeek Harness 桌面版"
-        case .web: name = "DeepSeek Harness 网页版"
-        case .unknown: name = "Harness（来源未知）"
+        case .desktop: name = "DSH 桌面版"
+        case .web: name = "DSH 网页版"
+        case .unknown: name = "DSH（来源未知）"
         }
         return profile.map { "\(name) · \($0)" } ?? name
     }
@@ -153,7 +153,7 @@ final class HarnessConnectionManager: ObservableObject {
         }
         if candidate != effectiveInstance {
             guard onTargetChange?(candidate) ?? true else {
-                message = "请先处理当前草稿或未确认的消息，再切换 Harness。"
+                message = "请先处理当前草稿或未确认的消息，再切换 DSH。"
                 return false
             }
             effectiveInstance = candidate
@@ -168,11 +168,11 @@ final class HarnessConnectionManager: ObservableObject {
         }
         if effectiveInstance == nil {
             if instances.count > 1 {
-                message = "检测到多个 Harness，请选择本次连接的目标。"
+                message = "检测到多个 DSH，请选择本次连接的目标。"
             } else if selectionID != "auto" || autoBindingKey != nil {
-                message = "选定的 Harness 未运行。不会自动改连其他目标。"
+                message = "选定的 DSH 未运行。不会自动改连其他目标。"
             } else {
-                message = "未发现 Harness 实例；请确认桥接插件已在目标 Harness 中加载。"
+                message = "未发现 DSH 实例。请确认桥接插件已在目标 DSH 中加载。"
             }
         } else {
             message = nil
@@ -224,7 +224,7 @@ final class HarnessConnectionManager: ObservableObject {
     func open() {
         openingError = nil
         guard let instance = effectiveInstance else {
-            openingError = "请先选择可用的 Harness；未发现可打开的实例。"
+            openingError = "未发现可打开的 DSH 实例，请先选择可用的连接目标。"
             return
         }
         switch instance.kind {
@@ -236,12 +236,12 @@ final class HarnessConnectionManager: ObservableObject {
                     openingError = "未找到该实例所属的桌面应用，也没有可验证的网页地址。"
                     return
                 }
-                if !NSWorkspace.shared.open(webURL) { openingError = "无法打开该 Harness 网页版。" }
+                if !NSWorkspace.shared.open(webURL) { openingError = "无法打开该 DSH 网页版。" }
                 return
             }
             NSWorkspace.shared.openApplication(at: appURL, configuration: .init()) { [weak self] _, error in
                 if error != nil {
-                    Task { @MainActor in self?.openingError = "无法唤起选定的 Harness 桌面版。" }
+                    Task { @MainActor in self?.openingError = "无法唤起选定的 DSH 桌面版。" }
                 }
             }
         case .web:
@@ -249,16 +249,16 @@ final class HarnessConnectionManager: ObservableObject {
                 openingError = "该网页版尚未提供可验证的访问地址。"
                 return
             }
-            if !NSWorkspace.shared.open(url) { openingError = "无法打开该 Harness 网页版。" }
+            if !NSWorkspace.shared.open(url) { openingError = "无法打开该 DSH 网页版。" }
         case .unknown:
             // A local-socket connection can be fully usable even when the
             // plugin could not classify the Host. Prefer its advertised Web UI
             // over refusing to open anything.
             guard let url = HarnessInstance.safeWebURL(instance.webURL, loopbackOnly: true) else {
-                openingError = "此 Harness 未报告运行类型，也没有可验证的网页地址；请从原入口打开。"
+                openingError = "此 DSH 实例未报告运行类型，也没有可验证的网页地址。请从原入口打开。"
                 return
             }
-            if !NSWorkspace.shared.open(url) { openingError = "无法打开该 Harness 网页版。" }
+            if !NSWorkspace.shared.open(url) { openingError = "无法打开该 DSH 网页版。" }
         }
     }
 

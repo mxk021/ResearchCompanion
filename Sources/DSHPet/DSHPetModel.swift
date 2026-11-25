@@ -92,7 +92,7 @@ final class DSHPetModel: ObservableObject {
         case .connected:
             return "已连接 · \(moodLabel) · \(transportKind.rawValue)"
         case .unreachable:
-            return "Harness 未连接（灰球）"
+            return "DSH 未连接（灰球）"
         }
     }
 

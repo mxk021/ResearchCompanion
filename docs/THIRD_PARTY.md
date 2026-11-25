@@ -7,14 +7,13 @@ Research Companion 是独立的 macOS 软件。项目自身可授权的新增代
 | 内容 | 来源、许可及处理 |
 | --- | --- |
 | 原生桌宠窗口、动画协议、设置与科研桥的上游基础 | sundusk 的 DSH Pet v0.9.5，固定提交 `e5df49ae17008e1533cfd1bccbc67e22378dab77`，MIT。上游和本项目的修改均保留声明。[上游版本](https://github.com/sundusk/dsh-mac-pet/tree/e5df49ae17008e1533cfd1bccbc67e22378dab77) · [许可证副本](../Resources/LicenseNotices/dsh-mac-pet-MIT.txt) |
-| 菜单栏图形中的 FishLogo 路径 | 引自 DeepSeek Harness，MIT。具体 Git blob 和原始版权声明见包内通知。应用图标由单独的原创绘制脚本生成。[源文件](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/client/ui-primitives/src/FishLogo.tsx) · [随包通知](../Resources/ThirdPartyNotices.txt) |
 | KaTeX 0.19.1 的 JavaScript 和 CSS | 原样提供 npm 发布物中的指定文件，MIT。[上游版本](https://github.com/KaTeX/KaTeX/tree/v0.19.1) · [许可证](../Resources/Transcript/vendor/katex/LICENSE) |
 | KaTeX 数学字体 | TTF、WOFF 和 WOFF2 均为未经修改的原版。字体内嵌声明指明 Design Science 与 Khan Academy、SIL OFL 1.1 和各自保留的字体名称；字体单列许可。[字体来源](https://github.com/KaTeX/KaTeX/tree/v0.19.1/fonts) · [字体声明与 OFL 全文](../Resources/LicenseNotices/KaTeX-fonts-OFL.txt) |
 | markdown-it 15.0.3 浏览器构建 | MIT。随浏览器分发物保留 mdurl、entities、uc.micro、linkify-it 和 punycode.js 的通知，包括 entities 的 BSD-2-Clause。命令行解析器 argparse 和 KaTeX 命令行使用的 commander 均不作为应用运行组件打包。[上游版本](https://github.com/markdown-it/markdown-it/tree/15.0.3) · [主许可证](../Resources/Transcript/vendor/markdown-it/LICENSE) · [库内依赖声明](../Resources/LicenseNotices/markdown-it-dependencies.txt) |
 | PDFium 160.0.8165.0 | 通过固定架构及 SHA-256 的 macOS 发布档获取，PDFium 主体采用 BSD-3-Clause。分发器 MIT 声明和该发布档的全部第三方许可随包保存于 `Contents/Resources/LicenseNotices/PDFium`。在本机签入 App 的动态库只用于含图案和透明叠层的原页裁图。阅读顺序与来源坐标仍由系统 PDFKit 提取。[固定发布档](https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium%2F8165) · [PDFium 许可证](https://pdfium.googlesource.com/pdfium/+/refs/heads/main/LICENSE) |
 | Zotero 只读选区扩展 | 独立扩展，使用 Zotero 插件与阅读器 API。扩展自身由本项目源码构建。Zotero 程序、数据库、配对文件及插件授权由使用者自己管理。[扩展源码](../zotero-context-bridge/) · [Zotero 插件文档](https://www.zotero.org/support/dev/zotero_7_for_developers) |
 
-公开桌宠的轮廓、眼睛、书签和动作由 SwiftUI 几何图形直接绘制。公开包排除维护者环境中的所有角色图集、导入宠物和私人截图，原作者许可及角色权利未经独立确认的美术文件不进入版本历史。README 里的示例仅在离屏 WKWebView 加载本项目真实的对话界面，内容为合成的单摆练习。[桌宠绘制](../Sources/DSHPet/BookmarkPetArt.swift) · [图标绘制](../scripts/render-app-icon.swift) · [截图生成](../scripts/render-public-screenshot.swift)
+公开桌宠的轮廓、眼睛、书签和动作由 SwiftUI 几何图形直接绘制。公开包排除维护者环境中的所有角色图集、导入宠物和私人截图，原作者许可及角色权利未经独立确认的美术文件不进入版本历史。README 里的示例仅在离屏 WKWebView 加载本项目真实的对话界面，内容为合成的单摆练习。[桌宠绘制](../Sources/DSHPet/BookmarkPetArt.swift) · [图标母版](../Resources/AppIcon.png) · [截图生成](../scripts/render-public-screenshot.swift)
 
 选区程序使用 AppKit、Accessibility 与 Services。设计曾参考 SelectedTextKit 的取词思路，并比较 Easydict 的选区流程。该版本没有链接两个项目；本地实现与所查固定版本的相关源文件比较，未发现连续的实现代码复制。随包保留 SelectedTextKit 的 MIT 通知。Easydict 采用 GPL-3.0，后续如引入实现代码须重新审查整个分发方案。[SelectedTextKit 固定源码](https://github.com/tisfeng/SelectedTextKit/tree/93dc960a5ef8d52de98af41d4abd7a89576d091c) · [MIT 通知](../Resources/LicenseNotices/SelectedTextKit-MIT.txt) · [Easydict 固定源码](https://github.com/tisfeng/Easydict/tree/1613c54e15fef7e53818ebca2bcd0a50eb86110b)
 

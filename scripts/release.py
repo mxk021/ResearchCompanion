@@ -108,7 +108,8 @@ def verify_app(app, bridge_name, expected_arch, forbidden_paths):
         raise ValueError('Binary architecture does not match the DMG name')
     run('codesign', '--verify', '--strict', '--deep', app)
     listed = set((ROOT / 'Resources/PublicManifest.txt').read_text().splitlines())
-    listed |= {'SETUP.md', 'LICENSE', info['CFBundleIconFile'], bridge_name}
+    listed |= {'SETUP.md', 'LICENSE', info['CFBundleIconFile'], bridge_name,
+               'Transcript/ResearchCompanionMark.png'}
     listed |= PDFIUM_NOTICES
     actual = {p.relative_to(resources).as_posix() for p in resources.rglob('*') if p.is_file()}
     if actual != listed or any(p.is_symlink() for p in contents.rglob('*')):

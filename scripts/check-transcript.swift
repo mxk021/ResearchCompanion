@@ -114,6 +114,16 @@ private struct TranscriptCheck {
                 }
             }
         }
+        let guidance = try await evaluate("""
+            const empty = document.querySelector('#empty');
+            const mark = empty.querySelector('.empty-brand-mark');
+            const label = empty.querySelector('#empty-guidance');
+            const message = '材料已就绪。输入问题，或要求翻译、解释。';
+            window.ResearchTranscript.update({ session: 'fixture', jump: 1, rows: [], order: [], emptyGuidance: message });
+            return !empty.hidden && label.getAttribute('role') === 'status' && label.textContent === message &&
+              empty.querySelector('.empty-brand-mark') === mark;
+            """)
+        try check(guidance as? Bool == true, "Selection guidance must update without replacing the brand mark")
         let initial = try await evaluate("""
             window.ResearchTranscript.update({ session: 'fixture', jump: 1, rows, order: rows.map(row => row.id), busy: '' });
             \(layout)
@@ -347,17 +357,18 @@ private struct TranscriptCheck {
               busy: '' });
             const ready = matches.children[1];
             const directVisible = !openButton(ready).hidden && !ready.querySelector('.answer-source').hidden;
-            const partialCaptionVisible = ready.querySelector('.answer-source').textContent === '图注待核对' &&
+            const partialCaptionVisible = ready.querySelector('.answer-source').textContent === '证据待核对' &&
               ready.querySelector('.answer-source').title.includes('可能不完整');
             const hiddenDuringStream = openButton(matches.children[2]).hidden;
             const showsLabels = openButton(ready).getAttribute('aria-label').includes('PDF 文件第 8 页') &&
+              openButton(ready).querySelector('.source-open-label').textContent.startsWith('打开原文') &&
               openButton(ready).querySelector('.source-objects').textContent.includes('式 (5) · Fig. 1') &&
               openButton(ready).querySelector('.source-objects').getClientRects().length > 0 &&
               openButton(ready).title.endsWith('阅读器页标签 iv');
             const old = matches.children[3];
             const noFabricatedLink = openButton(old).hidden &&
               old.querySelector('.source-objects').hidden &&
-              old.querySelector('.answer-source').textContent.includes('网页乙 <记录>');
+              old.querySelector('.answer-source').textContent === '查看来源 · 网页乙 <记录>';
             openButton(ready).click();
             await new Promise(resolve => requestAnimationFrame(resolve));
             return { hiddenWithoutCapture, directVisible, partialCaptionVisible, hiddenDuringStream, showsLabels, noFabricatedLink };
@@ -409,7 +420,7 @@ private struct TranscriptCheck {
                        sourceObjects: '式 (2)', sourceDisplay: '式 (2) · 材料丙', canOpenSource: true }], busy: '' });
             const list = document.querySelector('#messages');
             const onlyCurrentSource = list.querySelector('.source-objects').textContent.includes('式 (2)') &&
-                !list.textContent.includes('Fig. 1') && !list.textContent.includes('图注待核对');
+                !list.textContent.includes('Fig. 1') && !list.textContent.includes('证据待核对');
             return list.children.length === 1 && list.textContent.includes('另一个会话') &&
               window.getSelection().isCollapsed && onlyCurrentSource &&
               window.ResearchTranscript.readingCommand === undefined;
@@ -434,8 +445,10 @@ private struct TranscriptCheck {
                     new Promise(resolve => setTimeout(resolve, 1500))
                   ]);
                 }
-                return query.matches === dark && getComputedStyle(document.documentElement).backgroundColor ===
-                   (dark ? 'rgb(35, 36, 39)' : 'rgb(252, 252, 253)');
+                const palette = getComputedStyle(document.documentElement);
+                return query.matches === dark && palette.backgroundColor ===
+                   (dark ? 'rgb(18, 24, 33)' : 'rgb(247, 249, 252)') &&
+                   palette.color === (dark ? 'rgb(231, 237, 246)' : 'rgb(24, 34, 53)');
                 """, arguments: ["dark": dark])
             try check(matched as? Bool == true, "WebKit did not apply the \(appearance.rawValue) palette")
             for width in [365, 625] {

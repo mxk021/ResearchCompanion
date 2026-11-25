@@ -1,15 +1,16 @@
+import AppKit
 import SwiftUI
 
 /// Native macOS settings window for Research Companion.
-///
-/// The view deliberately keeps the settings model as the source of truth. The
-/// preview only selects which real state to display; it does not create a
-/// second, mock settings model.
 struct SettingsPanelView: View {
+    static let initialSize = CGSize(width: 1040, height: 644)
+    static let minimumSize = CGSize(width: 740, height: 500)
+
     @ObservedObject var model: DSHPetModel
     @ObservedObject private var settings: PetSettings
     @ObservedObject private var connections: HarnessConnectionManager
     @ObservedObject private var petLibrary: CustomPetLibrary
+    @Environment(\.colorScheme) private var colorScheme
     @State private var page: SettingsPage = .appearance
 
     init(model: DSHPetModel) {
@@ -21,29 +22,44 @@ struct SettingsPanelView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            SettingsSidebar(page: $page, model: model)
-            Divider()
-            ScrollView {
-                pageView
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                    .padding(32)
+            SettingsSidebar(page: $page, connected: model.connected)
+            SettingsRule(vertical: true)
+            GeometryReader { geometry in
+                let inset: CGFloat = geometry.size.width >= 740 ? 36 : 24
+                let wide = geometry.size.width - inset * 2 >= 740
+                VStack(alignment: .leading, spacing: 0) {
+                    SettingsPageHeader(page: page)
+                        .padding(.horizontal, inset)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    SettingsRule()
+                    ScrollView {
+                        pageView(wide: wide)
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                            .padding(.horizontal, inset)
+                            .padding(.vertical, 24)
+                    }
+                    .id(page)
+                }
             }
-            .background(Color(nsColor: .windowBackgroundColor))
         }
-        .frame(minWidth: 980, idealWidth: 1060, minHeight: 520, idealHeight: 530)
-        .tint(.blue)
-        .environment(\.controlActiveState, .active)
+        .frame(minWidth: Self.minimumSize.width, idealWidth: Self.initialSize.width,
+               minHeight: Self.minimumSize.height, idealHeight: Self.initialSize.height)
+        .background(ResearchPalette(colorScheme).paper)
+        .foregroundStyle(ResearchPalette(colorScheme).ink)
+        .tint(ResearchPalette(colorScheme).accent)
+        .accessibilityIdentifier("research-settings")
     }
 
     @ViewBuilder
-    private var pageView: some View {
+    private func pageView(wide: Bool) -> some View {
         switch page {
-        case .appearance: AppearanceSettingsPage(settings: settings, library: petLibrary)
-        case .interaction: InteractionSettingsPage(settings: settings)
+        case .appearance: AppearanceSettingsPage(settings: settings, library: petLibrary, wide: wide)
+        case .interaction: InteractionSettingsPage(settings: settings, wide: wide)
         case .researchNotes: ResearchNotesSettingsPage(settings: .shared)
-        case .petManagement: PetManagementPage(settings: settings, library: petLibrary)
-        case .connection: HarnessConnectionSettingsPage(model: model, connections: connections, commandClient: model.commandClient)
-        case .about: AboutSettingsPage()
+        case .petManagement: PetManagementPage(settings: settings, library: petLibrary, wide: wide)
+        case .connection: HarnessConnectionSettingsPage(model: model, connections: connections,
+                                                        commandClient: model.commandClient, wide: wide)
+        case .about: AboutSettingsPage(wide: wide)
         }
     }
 }
@@ -53,149 +69,184 @@ private enum SettingsPage: String, CaseIterable, Identifiable {
     case interaction = "交互与提醒"
     case researchNotes = "科研笔记"
     case petManagement = "宠物管理"
-    case connection = "Harness 连接"
+    case connection = "DSH 连接"
     case about = "关于与更新"
     var id: String { rawValue }
 
     var icon: String {
         switch self {
-        case .appearance: return "paintbrush"
-        case .interaction: return "hand.tap"
-        case .researchNotes: return "note.text"
+        case .appearance: return "circle.lefthalf.filled"
+        case .interaction: return "slider.horizontal.3"
+        case .researchNotes: return "text.alignleft"
         case .petManagement: return "pawprint"
-        case .connection: return "point.3.connected.trianglepath.dotted"
+        case .connection: return "link"
         case .about: return "info.circle"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .appearance: return "设定桌宠形象、尺寸和状态颜色。"
+        case .interaction: return "管理桌宠位置、状态提醒和选区访问。"
+        case .researchNotes: return "选择「保存为笔记」使用的默认目录。"
+        case .petManagement: return "导入和管理兼容的 Codex 宠物包。"
+        case .connection: return "选择连接来源并检查消息与状态通道。"
+        case .about: return "查看版本、更新和使用帮助。"
         }
     }
 }
 
 private struct SettingsSidebar: View {
     @Binding var page: SettingsPage
-    @ObservedObject var model: DSHPetModel
+    let connected: Bool
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 10) {
-                    JingyuniangAvatar().frame(width: 52, height: 52)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Research Companion").font(.headline.weight(.semibold))
-                        Text("你的桌面伙伴").font(.caption).foregroundStyle(.secondary)
-                    }
-                }
+            HStack(spacing: 9) {
+                ResearchBrandMark(size: 38)
+                Text("科研助手")
+                    .font(.system(size: 14, weight: .semibold))
+                    .tracking(-0.25)
             }
-            .padding(.horizontal, 18).padding(.top, 22).padding(.bottom, 22)
+            .padding(.horizontal, 16)
+            .padding(.top, 24)
+            .padding(.bottom, 22)
 
-            VStack(spacing: 3) {
+            VStack(spacing: 4) {
                 ForEach(SettingsPage.allCases) { item in
                     if item == .connection {
-                        Divider().padding(.horizontal, 10).padding(.vertical, 8)
+                        SettingsRule().padding(.horizontal, 9).padding(.vertical, 7)
                     }
                     Button { page = item } label: {
-                        Label(item.rawValue, systemImage: item.icon)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
+                        HStack(spacing: 10) {
+                            Image(systemName: item.icon).frame(width: 17)
+                            Text(item.rawValue).lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(SettingsSidebarButtonStyle(selected: page == item))
+                    .accessibilityAddTraits(page == item ? .isSelected : [])
+                    .accessibilityIdentifier("research-settings.section.\(item.rawValue)")
                 }
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 12)
 
             Spacer()
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 7) {
-                    Circle()
-                        .fill(model.connected ? Color.green : Color.secondary.opacity(0.45))
-                        .frame(width: 8, height: 8)
-                    Text(model.connected ? "已连接" : "未连接")
-                        .font(.caption.weight(.medium))
-                }
-                Text(model.connected ? "连接 · \(model.transportKind.rawValue)" : "等待 Harness 连接")
-                    .font(.caption2).foregroundStyle(.secondary)
-                Text("Research Companion \(UpdateChecker.currentVersion)")
-                    .font(.caption2).foregroundStyle(.tertiary)
+            HStack(spacing: 8) {
+                ConnectionStatusDot(connected: connected)
+                    .accessibilityHidden(true)
+                Text(connected ? "DSH 已连接" : "DSH 未连接")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(ResearchPalette(colorScheme).secondary)
             }
-            .padding(.horizontal, 18).padding(.bottom, 18)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 19)
         }
-        .frame(width: 200)
-        .background(Color(nsColor: .underPageBackgroundColor))
-    }
-}
-
-private struct JingyuniangAvatar: View {
-    private static let atlas = try? CodexSpriteAtlas(builtIn: .jingyuniang)
-
-    var body: some View {
-        GeometryReader { geometry in
-            if FloatingPetSkin.publicDistribution {
-                BookmarkPetArt(phase: 0, mood: "idle", lean: 0)
-            } else if let frame = Self.atlas?.frame(for: .idle, elapsed: 0) {
-                Image(decorative: frame, scale: 1)
-                    .resizable().interpolation(.none).scaledToFit()
-                    .frame(width: geometry.size.width * 2.1, height: geometry.size.height * 2.3)
-                    .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
-            }
-        }
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .accessibilityHidden(true)
+        .frame(width: 176)
+        .background(ResearchPalette(colorScheme).rail)
     }
 }
 
 private struct SettingsSidebarButtonStyle: ButtonStyle {
     let selected: Bool
+    @Environment(\.colorScheme) private var colorScheme
+
     func makeBody(configuration: Configuration) -> some View {
+        let accent = ResearchPalette(colorScheme).accent
         configuration.label
-            .font(.body)
-            .foregroundStyle(selected ? Color.white : .primary)
-            .padding(.horizontal, 11).padding(.vertical, 8)
-            .background(selected ? Color.accentColor : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: 7))
-            .opacity(configuration.isPressed ? 0.7 : 1)
+            .font(.system(size: 13, weight: selected ? .semibold : .medium))
+            .foregroundStyle(selected ? accent : ResearchPalette(colorScheme).secondary)
+            .padding(.horizontal, 11)
+            .frame(height: 36)
+            .background(
+                accent.opacity(configuration.isPressed ? 0.19 : (selected ? 0.12 : 0)),
+                in: RoundedRectangle(cornerRadius: 8)
+            )
+            .overlay(alignment: .leading) {
+                if selected {
+                    Capsule().fill(accent)
+                        .frame(width: 2, height: 14)
+                        .padding(.leading, 2)
+                }
+            }
     }
 }
 
 private struct SettingsPageHeader: View {
-    let title: String
-    let subtitle: String
-    let bottomPadding: CGFloat
-
-    init(title: String, subtitle: String, bottomPadding: CGFloat = 24) {
-        self.title = title
-        self.subtitle = subtitle
-        self.bottomPadding = bottomPadding
-    }
+    let page: SettingsPage
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title).font(.system(size: 26, weight: .semibold))
-            Text(subtitle).font(.subheadline).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 7) {
+            Text(page.rawValue)
+                .font(.system(size: 29, weight: .semibold))
+                .tracking(-0.65)
+                .accessibilityAddTraits(.isHeader)
+                .accessibilityIdentifier("research-settings.section-title")
+            Text(page.subtitle)
+                .font(.system(size: 13))
+                .foregroundStyle(ResearchPalette(colorScheme).secondary)
         }
-        .padding(.bottom, bottomPadding)
+        .padding(.top, 22)
+        .padding(.bottom, 19)
     }
 }
 
-private struct SettingsCard<Content: View>: View {
-    let title: String?
-    let verticalPadding: CGFloat
-    @ViewBuilder let content: Content
+struct SettingsRule: View {
+    var vertical = false
+    @Environment(\.colorScheme) private var colorScheme
 
-    init(title: String? = nil, verticalPadding: CGFloat = 18, @ViewBuilder content: () -> Content) {
+    var body: some View {
+        Rectangle().fill(ResearchPalette(colorScheme).rule)
+            .frame(width: vertical ? 1 : nil, height: vertical ? nil : 1)
+            .accessibilityHidden(true)
+    }
+}
+
+struct SettingsColumns<Main: View, Detail: View>: View {
+    let wide: Bool
+    @ViewBuilder let main: () -> Main
+    @ViewBuilder let detail: () -> Detail
+
+    var body: some View {
+        let layout = wide
+            ? AnyLayout(HStackLayout(alignment: .top, spacing: 18))
+            : AnyLayout(VStackLayout(alignment: .leading, spacing: 16))
+        layout {
+            main().frame(maxWidth: .infinity, alignment: .topLeading)
+            detail().frame(width: wide ? 280 : nil)
+                .frame(maxWidth: wide ? 280 : .infinity, alignment: .topLeading)
+        }
+    }
+}
+
+struct SettingsCard<Content: View>: View {
+    let title: String?
+    @ViewBuilder let content: Content
+    @Environment(\.colorScheme) private var colorScheme
+
+    init(title: String? = nil, @ViewBuilder content: () -> Content) {
         self.title = title
-        self.verticalPadding = verticalPadding
         self.content = content()
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if let title { Text(title).font(.headline).padding(.bottom, 12) }
+        VStack(alignment: .leading, spacing: 13) {
+            if let title {
+                Text(title).font(.system(size: 14, weight: .semibold))
+                    .accessibilityAddTraits(.isHeader)
+            }
             content
         }
-        .padding(.vertical, verticalPadding)
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(Color(nsColor: .separatorColor).opacity(0.55))
-                .frame(height: 0.5)
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(ResearchPalette(colorScheme).raised, in: RoundedRectangle(cornerRadius: 14))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(ResearchPalette(colorScheme).rule, lineWidth: 1)
+                .allowsHitTesting(false)
         }
     }
 }
@@ -204,6 +255,7 @@ private struct SettingRow<Content: View>: View {
     let title: String
     let detail: String?
     @ViewBuilder let content: Content
+    @Environment(\.colorScheme) private var colorScheme
 
     init(_ title: String, detail: String? = nil, @ViewBuilder content: () -> Content) {
         self.title = title
@@ -212,12 +264,16 @@ private struct SettingRow<Content: View>: View {
     }
 
     var body: some View {
-        HStack(alignment: .center, spacing: 20) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                if let detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
+        HStack(alignment: .center, spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.system(size: 13, weight: .medium))
+                if let detail {
+                    Text(detail).font(.caption)
+                        .foregroundStyle(ResearchPalette(colorScheme).secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
-            Spacer(minLength: 12)
+            Spacer(minLength: 8)
             content
         }
     }
@@ -229,17 +285,12 @@ private struct ToggleSettingRow: View {
     @Binding var isOn: Bool
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                Text(detail).font(.caption).foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 12)
+        SettingRow(title, detail: detail) {
             Toggle(title, isOn: $isOn)
                 .labelsHidden()
                 .toggleStyle(.switch)
         }
-        .padding(.vertical, 14)
+        .padding(.vertical, 11)
     }
 }
 
@@ -248,6 +299,7 @@ private struct PetSelectionButton: View {
     let title: String
     let selected: Bool
     let action: () -> Void
+    @Environment(\.colorScheme) private var colorScheme
 
     init(skin: FloatingPetSkin, title: String? = nil, selected: Bool, action: @escaping () -> Void) {
         self.skin = skin
@@ -257,25 +309,33 @@ private struct PetSelectionButton: View {
     }
 
     var body: some View {
+        let accent = ResearchPalette(colorScheme).accent
         Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: selected ? "circle.inset.filled" : "circle")
-                    .font(.system(size: 19))
-                    .foregroundStyle(selected ? Color.accentColor : Color.secondary.opacity(0.55))
+            HStack(spacing: 8) {
                 Text(title)
-                    .foregroundStyle(.primary)
-                Spacer(minLength: 0)
+                    .font(.system(size: 13, weight: selected ? .semibold : .medium))
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if selected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(accent)
+                }
             }
-            .padding(.horizontal, 12)
-            .frame(height: 42)
-            .background(selected ? Color.accentColor.opacity(0.13) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
+            .padding(.horizontal, 11)
+            .frame(height: 38)
+            .background(selected ? accent.opacity(0.10) : ResearchPalette(colorScheme).paper,
+                        in: RoundedRectangle(cornerRadius: 8))
             .overlay {
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(selected ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.10), lineWidth: 1)
+                    .strokeBorder(selected ? accent.opacity(0.52) : ResearchPalette(colorScheme).rule, lineWidth: 1)
+                    .allowsHitTesting(false)
             }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .help(title)
     }
 }
 
@@ -284,30 +344,32 @@ private struct ResearchNotesSettingsPage: View {
     @State private var directoryProblem: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            SettingsPageHeader(title: "科研笔记", subtitle: "选择单击「保存为笔记」时使用的目录。")
-            SettingsCard(title: "默认 Markdown 笔记目录") {
+        SettingsCard(title: "默认 Markdown 笔记目录") {
+            Label {
                 Text(settings.directory?.path ?? "尚未选择目录")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 12, design: .monospaced))
+                    .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
-                    .padding(.bottom, 12)
-                if let directoryProblem {
-                    Text(directoryProblem)
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .padding(.bottom, 12)
+            } icon: {
+                Image(systemName: "folder")
+            }
+            .foregroundStyle(.secondary)
+            if let directoryProblem {
+                Label(directoryProblem, systemImage: "exclamationmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            HStack(spacing: 8) {
+                Button("选择目录…") {
+                    guard let window = NSApp.keyWindow else { return }
+                    ResearchNoteActions.chooseDefaultDirectory(in: window) { result in
+                        if case .failure(let error) = result { directoryProblem = error.localizedDescription }
+                    }
                 }
-                HStack {
-                    Button("选择目录…") {
-                        guard let window = NSApp.keyWindow else { return }
-                        ResearchNoteActions.chooseDefaultDirectory(in: window) { result in
-                            if case .failure(let error) = result { directoryProblem = error.localizedDescription }
-                        }
-                    }
-                    if settings.directory != nil {
-                        Button("取消默认目录") { settings.clearDirectory() }
-                    }
+                .buttonStyle(.borderedProminent)
+                if settings.directory != nil {
+                    Button("取消默认目录") { settings.clearDirectory() }
+                        .buttonStyle(.bordered)
                 }
             }
         }
@@ -328,28 +390,17 @@ private struct ResearchNotesSettingsPage: View {
 private struct AppearanceSettingsPage: View {
     @ObservedObject var settings: PetSettings
     @ObservedObject var library: CustomPetLibrary
+    let wide: Bool
     @State private var previewMood = "idle"
     @State private var showingColors = false
     @State private var showingDSHPetDetails = false
     @State private var showingStatePreview = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            SettingsPageHeader(title: "桌宠外观", subtitle: "让桌面伙伴更合你的习惯。")
-
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: 0) {
-                    appearanceControls.frame(width: 440)
-                    Divider().padding(.horizontal, 18)
-                    appearancePreview
-                        .frame(width: 300)
-                }
-                VStack(alignment: .leading, spacing: 0) {
-                    appearanceControls
-                    appearancePreview
-                }
-            }
-
+        SettingsColumns(wide: wide) {
+            appearanceControls
+        } detail: {
+            appearancePreview
         }
         .sheet(isPresented: $showingColors) {
             StatusColorsSheet(settings: settings)
@@ -362,134 +413,159 @@ private struct AppearanceSettingsPage: View {
         }
     }
 
-    @ViewBuilder
     private var appearanceControls: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("选择桌宠").font(.headline)
-                .padding(.bottom, 10)
-            LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) {
-                ForEach(FloatingPetSkin.allCases) { skin in
-                    PetSelectionButton(skin: skin, selected: settings.skin == skin) {
-                        settings.skin = skin
-                    }
-                }
-                ForEach(library.pets) { pet in
-                    PetSelectionButton(skin: pet.skin, title: pet.displayName, selected: settings.skin == pet.skin) {
-                        settings.skin = pet.skin
-                    }
-                }
-            }
-            .padding(.bottom, 16)
-
-            Divider()
-            SettingRow("桌宠大小") {
-                HStack(spacing: 8) {
-                    Slider(value: Binding(
-                        get: { settings.ballSize },
-                        set: { settings.ballSize = ($0 / 4).rounded() * 4 }
-                    ), in: 60...200)
-                    TextField("", text: Binding(
-                        get: { String(Int(settings.ballSize)) },
-                        set: { if let value = Double($0) { settings.ballSize = min(max(CGFloat(value), 60), 200) } }
-                    ))
-                    .textFieldStyle(.roundedBorder)
-                    .multilineTextAlignment(.trailing)
-                    .frame(width: 64)
-                    Text("px").foregroundStyle(.secondary)
-                }
-                .frame(width: 310)
-            }
-            .padding(.vertical, 15)
-
-            Divider()
-            ToggleSettingRow(title: "显示状态气泡", detail: "在思考、等待操作和完成时显示提醒。", isOn: $settings.showStatusBubble)
-            Divider()
-            ToggleSettingRow(title: "桌宠发光", detail: "为桌宠添加随状态变化的柔和光晕。", isOn: $settings.glowEnabled)
-            Divider()
-
-            Button {
-                showingColors = true
-            } label: {
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("状态配色")
-                        Text("调整气泡与光晕的状态颜色。")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    HStack(spacing: 5) {
-                        ForEach(moodColorConfigs.prefix(5), id: \.mood) { config in
-                            RoundedRectangle(cornerRadius: 4)
-                                .fill(settings.moodColors[config.mood] ?? Color(hex: config.defaultHex))
-                                .frame(width: 18, height: 18)
-                                .padding(3)
-                                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
-                                .overlay { RoundedRectangle(cornerRadius: 6).stroke(.gray.opacity(0.18)) }
+        VStack(alignment: .leading, spacing: 16) {
+            SettingsCard(title: "选择桌宠") {
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) {
+                    ForEach(FloatingPetSkin.allCases) { skin in
+                        PetSelectionButton(skin: skin, selected: settings.skin == skin) {
+                            settings.skin = skin
                         }
                     }
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.tertiary)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .padding(.vertical, 15)
-
-            if settings.skin == .classic {
-                Divider()
-                Button {
-                    showingDSHPetDetails = true
-                } label: {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("心情球专属设置")
-                            Text("眼睛、颜色与呼吸速度")
-                                .font(.caption).foregroundStyle(.secondary)
+                    ForEach(library.pets) { pet in
+                        PetSelectionButton(skin: pet.skin, title: pet.displayName, selected: settings.skin == pet.skin) {
+                            settings.skin = pet.skin
                         }
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                            .font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
                     }
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .padding(.vertical, 15)
             }
 
-            Divider()
-            Label("更改会自动保存", systemImage: "checkmark.square.fill")
-                .font(.caption).foregroundStyle(.secondary)
-                .padding(.top, 14)
+            SettingsCard(title: "显示与状态") {
+                VStack(alignment: .leading, spacing: 0) {
+                    SettingRow("桌宠大小") {
+                        HStack(spacing: 8) {
+                            Slider(value: Binding(
+                                get: { settings.ballSize },
+                                set: { settings.ballSize = ($0 / 4).rounded() * 4 }
+                            ), in: 60...200)
+                            .accessibilityLabel("桌宠大小")
+                            TextField("桌宠大小", text: Binding(
+                                get: { String(Int(settings.ballSize)) },
+                                set: { if let value = Double($0) { settings.ballSize = min(max(CGFloat(value), 60), 200) } }
+                            ))
+                            .labelsHidden()
+                            .textFieldStyle(.roundedBorder)
+                            .multilineTextAlignment(.trailing)
+                            .monospacedDigit()
+                            .frame(width: 48)
+                            Text("px").font(.caption).foregroundStyle(.secondary)
+                        }
+                        .frame(width: 232)
+                    }
+                    .padding(.bottom, 11)
+                    SettingsRule()
+                    ToggleSettingRow(title: "显示状态气泡", detail: "在思考、等待操作和完成时显示提醒。", isOn: $settings.showStatusBubble)
+                    SettingsRule()
+                    ToggleSettingRow(title: "桌宠发光", detail: "随状态变化显示光晕。", isOn: $settings.glowEnabled)
+                    SettingsRule()
+                    Button {
+                        showingColors = true
+                    } label: {
+                        SettingRow("状态配色") {
+                            HStack(spacing: 8) {
+                                ForEach(moodColorConfigs.prefix(5), id: \.mood) { config in
+                                    Circle()
+                                        .fill(settings.moodColors[config.mood] ?? Color(hex: config.defaultHex))
+                                        .frame(width: 12, height: 12)
+                                }
+                                SettingsChevron()
+                            }
+                            .accessibilityHidden(true)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.vertical, 8)
+                    if settings.skin == .classic {
+                        SettingsRule()
+                        Button {
+                            showingDSHPetDetails = true
+                        } label: {
+                            SettingRow("心情球专属设置", detail: "眼睛、颜色与呼吸速度") {
+                                SettingsChevron()
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.top, 11)
+                    }
+                }
+            }
         }
     }
 
-    @ViewBuilder
     private var appearancePreview: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("效果预览").font(.headline)
-                Spacer()
-                Button("放大 / 导出…") { showingStatePreview = true }
-                    .buttonStyle(.link).font(.caption)
-            }
-            VStack(spacing: 12) {
+        SettingsCard(title: "效果预览") {
+            SettingsPreviewField {
                 PetPreview(settings: settings, library: library, mood: previewMood)
-                    .frame(height: 218).frame(maxWidth: .infinity)
+                    .frame(height: 196)
+            }
+            HStack {
                 Picker("预览状态", selection: $previewMood) {
                     ForEach(moodColorConfigs, id: \.mood) { config in Text(config.label).tag(config.mood) }
                     Text("未连接").tag("disconnected")
                 }
-                .labelsHidden().frame(width: 160)
-                Text("仅预览，不影响正在运行的任务。")
-                    .font(.caption2).foregroundStyle(.secondary)
-                Button("重置桌宠位置") {
-                    NotificationCenter.default.post(name: .dshPetResetPosition, object: nil)
-                }
-                .frame(maxWidth: .infinity)
+                .labelsHidden()
+                .frame(maxWidth: 116)
+                Spacer(minLength: 5)
+                Button("放大 / 导出…") { showingStatePreview = true }
+                    .buttonStyle(.link)
             }
-            .padding(14)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+            SettingsRule()
+            Button("重置桌宠位置") {
+                NotificationCenter.default.post(name: .dshPetResetPosition, object: nil)
+            }
+            .buttonStyle(.bordered)
+        }
+    }
+}
+
+private struct SettingsChevron: View {
+    var body: some View {
+        Image(systemName: "chevron.right")
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .accessibilityHidden(true)
+    }
+}
+
+struct SettingsPreviewField<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+    @Environment(\.colorScheme) private var colorScheme
+
+    init(@ViewBuilder content: @escaping () -> Content) {
+        self.content = content
+    }
+
+    var body: some View {
+        ZStack {
+            let accent = ResearchPalette(colorScheme).accent
+            let rim = ResearchPalette(colorScheme).rule
+            RadialGradient(colors: [accent.opacity(0.11), ResearchPalette(colorScheme).paper], center: .center,
+                           startRadius: 0, endRadius: 145)
+            Canvas { context, size in
+                let middle = CGPoint(x: size.width / 2, y: size.height / 2)
+                let radius = min(size.width, size.height) * 0.40
+                for scale in [CGFloat(0.45), 0.73, 1.0] {
+                    let r = radius * scale
+                    context.stroke(Path(ellipseIn: CGRect(x: middle.x - r, y: middle.y - r, width: r * 2, height: r * 2)),
+                                   with: .color(rim.opacity(0.8)), lineWidth: 1)
+                }
+                var axes = Path()
+                axes.move(to: CGPoint(x: middle.x - radius - 8, y: middle.y))
+                axes.addLine(to: CGPoint(x: middle.x + radius + 8, y: middle.y))
+                axes.move(to: CGPoint(x: middle.x, y: middle.y - radius - 8))
+                axes.addLine(to: CGPoint(x: middle.x, y: middle.y + radius + 8))
+                context.stroke(axes, with: .color(rim.opacity(0.7)), style: StrokeStyle(lineWidth: 1, dash: [2, 5]))
+            }
+            .accessibilityHidden(true)
+            content().frame(maxWidth: .infinity)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(ResearchPalette(colorScheme).rule, lineWidth: 1)
+                .allowsHitTesting(false)
         }
     }
 }
@@ -592,113 +668,44 @@ private struct DSHPetPreview: View {
 
 private struct InteractionSettingsPage: View {
     @ObservedObject var settings: PetSettings
+    let wide: Bool
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            SettingsPageHeader(title: "交互与提醒", subtitle: "让桌宠随时可用，也不过分打扰。", bottomPadding: 14)
-            SettingsCard(title: "鼠标交互", verticalPadding: 8) {
+        SettingsColumns(wide: wide) {
+            SettingsCard(title: "桌宠显示与位置") {
                 VStack(alignment: .leading, spacing: 0) {
-                    WideControlRow(title: "点击穿透", detail: "平时让鼠标穿过，移到桌宠上时可恢复交互。") {
-                        Picker("点击穿透", selection: $settings.clickThroughMode) {
-                            ForEach(ClickThroughMode.allCases) { mode in Text(mode.label).tag(mode) }
-                        }.labelsHidden().frame(width: 200)
-                    }
-                    Divider().opacity(0.45)
-                    WideToggleRow(title: "显示桌宠", detail: "同时显示桌宠和下方操作栏。", isOn: $settings.isPetVisible)
-                }
-            }
-            SettingsCard(title: "位置", verticalPadding: 8) {
-                VStack(alignment: .leading, spacing: 0) {
-                    WideToggleRow(title: "记住拖拽位置", detail: "下次启动时恢复上次停留的位置。", isOn: $settings.rememberPosition)
-                    Divider().opacity(0.45)
-                    WideToggleRow(title: "锁定位置", detail: "关闭拖拽移动，保留其他桌宠交互。", isOn: $settings.lockPosition)
-                    Divider().opacity(0.45)
-                    HStack {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("恢复默认位置")
-                            Text("将桌宠移回屏幕右下角。")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
+                    ToggleSettingRow(title: "显示桌宠", detail: "同时显示桌宠及其操作栏。", isOn: $settings.isPetVisible)
+                    SettingsRule()
+                    ToggleSettingRow(title: "记住拖拽位置", detail: "启动时恢复上次停留的位置。", isOn: $settings.rememberPosition)
+                    SettingsRule()
+                    ToggleSettingRow(title: "锁定位置", detail: "停用桌宠拖拽。", isOn: $settings.lockPosition)
+                    SettingsRule()
+                    SettingRow("恢复默认位置", detail: "将桌宠移回屏幕右下角。") {
                         Button("重置位置") {
                             NotificationCenter.default.post(name: .dshPetResetPosition, object: nil)
                         }
+                        .buttonStyle(.bordered)
                     }
-                    .padding(.vertical, 13)
+                    .padding(.top, 11)
                 }
             }
-            SettingsCard(title: "选取文字", verticalPadding: 8) {
-                VStack(alignment: .leading, spacing: 8) {
+        } detail: {
+            VStack(alignment: .leading, spacing: 16) {
+                SettingsCard(title: "选取文字") {
                     Text("读取其他应用的选区需要辅助功能授权。也可从原应用的「服务」菜单选择「选取文字（科研助手）」。")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                     SelectionAuthorizationView()
                 }
-            }
-            SettingsCard(title: "状态提醒", verticalPadding: 8) {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack(alignment: .top, spacing: 12) {
-                        Image(systemName: "bubble.left")
-                            .font(.system(size: 24))
-                            .foregroundStyle(.primary)
-                            .frame(width: 38)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("通过桌宠气泡和任务卡片了解进度")
-                            Text("需要授权、回答或任务完成时，可以从桌宠查看状态。")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Text("可在“桌宠外观”中调整")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Text("状态提醒会跟随 Harness 状态显示；状态颜色和气泡开关可在“桌宠外观”中调整。")
-                        .font(.caption).foregroundStyle(.secondary)
+                SettingsCard(title: "状态提醒") {
+                    Text("桌宠气泡和任务卡片显示 DSH 的进度与授权请求。气泡开关与颜色可在「桌宠外观」中调整。")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
-    }
-}
-
-private struct WideToggleRow: View {
-    let title: String
-    let detail: String
-    @Binding var isOn: Bool
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 16) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                Text(detail).font(.caption).foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 16)
-            Toggle(title, isOn: $isOn)
-                .labelsHidden()
-                .toggleStyle(.switch)
-        }
-        .padding(.vertical, 10)
-    }
-}
-
-private struct WideControlRow<Content: View>: View {
-    let title: String
-    let detail: String
-    @ViewBuilder let content: Content
-
-    init(title: String, detail: String, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.detail = detail
-        self.content = content()
-    }
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 16) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                Text(detail).font(.caption).foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 16)
-            content
-        }
-        .padding(.vertical, 10)
     }
 }
 
@@ -804,99 +811,92 @@ private struct HarnessConnectionSettingsPage: View {
     @ObservedObject var model: DSHPetModel
     @ObservedObject var connections: HarnessConnectionManager
     @ObservedObject var commandClient: DSHPetCommandClient
+    let wide: Bool
 
     private var targetBinding: Binding<String> { Binding(get: { connections.selectionID }, set: { model.selectHarnessTarget($0) }) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            SettingsPageHeader(title: "Harness 连接", subtitle: "先确认连接来源，再检查桌宠能够使用的功能。")
-            HStack(alignment: .top, spacing: 24) {
-                VStack(alignment: .leading, spacing: 0) {
-                    SettingsCard(title: "当前连接") {
-                        VStack(alignment: .leading, spacing: 0) {
-                            SettingRow("连接目标", detail: "自动识别；首次检测到多个实例时请选择目标") {
-                                Picker("连接目标", selection: targetBinding) {
-                                    Text("自动识别").tag("auto")
-                                    ForEach(connections.instances) { instance in
-                                        Text(instance.displayName).tag(instance.id)
-                                    }
-                                    if connections.selectionID != "auto",
-                                       !connections.instances.contains(where: { $0.id == connections.selectionID }) {
-                                        Text("选定目标（未运行）").tag(connections.selectionID)
-                                    }
-                                }
-                                .labelsHidden()
-                                .frame(width: 245)
-                            }
-                            Divider().opacity(0.45)
-                            HStack(spacing: 12) {
-                                Image(systemName: connectionIcon).font(.system(size: 26)).frame(width: 42)
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(connectionDetail).font(.headline)
-                                    Text(model.connected ? "通过当前通道通信" : "尚未建立可用连接")
-                                        .font(.caption).foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                ConnectionStatusDot(connected: model.connected)
-                                Text(model.connected ? "已连接" : "未连接")
-                                    .foregroundStyle(model.connected ? Color.primary : Color.secondary)
-                            }
-                            .padding(.vertical, 10)
-                            Divider().opacity(0.45)
-                            ConnectionFactRow(label: "状态通道", value: model.connected ? "可用" : "不可用")
-                            Divider().opacity(0.45)
-                            ConnectionFactRow(label: "消息通道", value: commandConnectionLabel)
-                            Divider().opacity(0.45)
-                            ConnectionFactRow(label: "连接方式", value: model.transportKind.rawValue)
-                            HStack(spacing: 10) {
-                                Button { model.openHarness() } label: {
-                                    Label(openButtonTitle, systemImage: "arrow.up.right.square")
-                                        .frame(maxWidth: .infinity)
-                                }
-                                .buttonStyle(.borderedProminent).disabled(connections.isDiscovering)
-                                Button { model.refreshHarnessConnections() } label: {
-                                    Label(connections.isDiscovering ? "扫描中…" : "重新检测", systemImage: "arrow.clockwise")
-                                }
-                                .disabled(connections.isDiscovering)
-                            }
-                            .padding(.top, 14)
-                            if let message = connections.message {
-                                Label(message, systemImage: "info.circle")
-                                    .font(.caption).foregroundStyle(.secondary).padding(.top, 10)
-                            }
-                            if let error = connections.openingError {
-                                Label(error, systemImage: "exclamationmark.triangle")
-                                    .font(.caption).foregroundStyle(.orange).padding(.top, 5)
-                            }
-                        }
-                    }
-                    .padding(.top, 14)
+        SettingsColumns(wide: wide) {
+            SettingsCard(title: "当前连接") {
+                HStack(alignment: .center, spacing: 11) {
+                    Image(systemName: connectionIcon)
+                        .font(.system(size: 23, weight: .medium))
+                        .foregroundStyle(.tint)
+                        .frame(width: 34)
+                        .accessibilityHidden(true)
+                    Text(connectionDetail)
+                        .font(.system(size: 15, weight: .semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 6)
+                    ConnectionStatusDot(connected: model.connected).accessibilityHidden(true)
+                    Text(model.connected ? "已连接" : "未连接")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .fixedSize()
                 }
-                .frame(width: 440, alignment: .leading)
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 0) {
-                    SettingsCard(title: "功能检查") {
-                        VStack(alignment: .leading, spacing: 0) {
-                            CapabilityStatusRow(icon: "list.bullet.rectangle", title: "任务状态", detail: "接收思考、等待操作与完成状态", available: model.connected)
-                            Divider().opacity(0.45)
-                            CapabilityStatusRow(icon: "paperplane", title: "发送消息", detail: "发送到选定工作区和会话", available: commandClient.capabilitiesAvailable)
+                SettingsRule()
+                SettingRow("连接目标", detail: "若检测到多个实例，可在此指定目标。") {
+                    Picker("连接目标", selection: targetBinding) {
+                        Text("自动识别").tag("auto")
+                        ForEach(connections.instances) { instance in
+                            Text(instance.displayName).tag(instance.id)
+                        }
+                        if connections.selectionID != "auto",
+                           !connections.instances.contains(where: { $0.id == connections.selectionID }) {
+                            Text("选定目标（未运行）").tag(connections.selectionID)
                         }
                     }
-                    SettingsCard(title: "安装与连接") {
-                        VStack(alignment: .leading, spacing: 9) {
-                            ConnectionHelpStep(number: "1", text: "打开桌面版 Harness，进入「插件」页面。")
-                            ConnectionHelpStep(number: "2", text: "搜索 dsh-mac-pet，按需安装并启用。")
-                            ConnectionHelpStep(number: "3", text: "如 Harness 提示需要重启，请在任务结束后重启。")
-                            ConnectionHelpStep(number: "4", text: "回到此处选择连接目标，点击「重新检测」。")
-                            Text("如果插件已经启用，请确认 Harness 正在运行；消息不可用时检查命令通道。")
-                                .font(.caption).foregroundStyle(.secondary).padding(.top, 5)
-                        }
-                    }
-                    .padding(.top, 14)
+                    .labelsHidden()
+                    .frame(width: 180)
                 }
-                .frame(width: 290, alignment: .leading)
+                VStack(alignment: .leading, spacing: 0) {
+                    SettingsRule()
+                    ConnectionFactRow(label: "状态通道", value: model.connected ? "可用" : "不可用")
+                    SettingsRule()
+                    ConnectionFactRow(label: "消息通道", value: commandConnectionLabel)
+                    SettingsRule()
+                    ConnectionFactRow(label: "连接方式", value: model.transportKind.rawValue)
+                    SettingsRule()
+                }
+                HStack(spacing: 8) {
+                    Button { model.openHarness() } label: {
+                        Label(openButtonTitle, systemImage: "arrow.up.right.square")
+                    }
+                    .buttonStyle(.borderedProminent).disabled(connections.isDiscovering)
+                    Button { model.refreshHarnessConnections() } label: {
+                        Label(connections.isDiscovering ? "扫描中…" : "重新检测", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered).disabled(connections.isDiscovering)
+                    Spacer(minLength: 0)
+                }
+                if let message = connections.message {
+                    Label(message, systemImage: "info.circle")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if let error = connections.openingError {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+            }
+        } detail: {
+            VStack(alignment: .leading, spacing: 16) {
+                SettingsCard(title: "功能检查") {
+                    VStack(alignment: .leading, spacing: 0) {
+                        CapabilityStatusRow(icon: "list.bullet.rectangle", title: "任务状态", detail: "接收任务进度", available: model.connected)
+                        SettingsRule()
+                        CapabilityStatusRow(icon: "paperplane", title: "发送消息", detail: "发送到选定会话", available: commandClient.capabilitiesAvailable)
+                    }
+                }
+                SettingsCard(title: "安装与连接") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ConnectionHelpStep(number: "1", text: "打开 DSH 桌面版的「插件」页。")
+                        ConnectionHelpStep(number: "2", text: "安装并启用 dsh-research-companion。")
+                        ConnectionHelpStep(number: "3", text: "如需重启，请等待正在运行的任务结束。")
+                        ConnectionHelpStep(number: "4", text: "回到此处，选择连接目标并重新检测。")
+                        Text("如果消息通道不可用，请确认 DSH 正在运行。")
+                            .font(.caption).foregroundStyle(.secondary).padding(.top, 3)
+                    }
+                }
             }
         }
     }
@@ -910,25 +910,34 @@ private struct HarnessConnectionSettingsPage: View {
     }
 
     private var connectionDetail: String {
-        connections.effectiveInstance?.displayName ?? "等待发现 Harness 实例"
+        connections.effectiveInstance?.displayName ?? "等待发现 DSH 实例"
     }
     private var commandConnectionLabel: String {
         switch commandClient.connection { case .connected: return "已连接"; case .connecting: return "连接中"; case .disconnected: return "未连接" }
     }
     private var openButtonTitle: String {
-        switch connections.effectiveInstance?.kind.rawValue { case "desktop": return "打开桌面版 Harness"; case "web": return "打开网页版 Harness"; default: return "打开 Harness" }
+        switch connections.effectiveInstance?.kind.rawValue { case "desktop": return "打开 DSH 桌面版"; case "web": return "打开 DSH 网页版"; default: return "打开 DSH" }
     }
 }
 
 private struct ConnectionStatusDot: View {
     let connected: Bool
-    var body: some View { Circle().fill(connected ? Color.green : Color.secondary.opacity(0.45)).frame(width: 10, height: 10) }
+    var body: some View { Circle().fill(connected ? Color.green : Color.secondary.opacity(0.55)).frame(width: 7, height: 7) }
 }
 
 private struct ConnectionFactRow: View {
     let label: String
     let value: String
-    var body: some View { HStack { Text(label).foregroundStyle(.secondary); Spacer(); Text(value).monospaced() } }
+
+    var body: some View {
+        HStack {
+            Text(label).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).monospaced()
+        }
+        .font(.system(size: 12))
+        .padding(.vertical, 8)
+    }
 }
 
 private struct CapabilityStatusRow: View {
@@ -938,19 +947,23 @@ private struct CapabilityStatusRow: View {
     let available: Bool
 
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: icon).font(.system(size: 23)).frame(width: 32)
+        HStack(spacing: 9) {
+            Image(systemName: icon)
+                .font(.system(size: 15))
+                .foregroundStyle(.tint)
+                .frame(width: 20)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
-                Text(title)
+                Text(title).font(.system(size: 13, weight: .medium))
                 Text(detail).font(.caption).foregroundStyle(.secondary)
             }
             Spacer(minLength: 8)
-            Image(systemName: available ? "checkmark.circle.fill" : "minus.circle")
-                .foregroundStyle(available ? Color.green : Color.orange)
-            Text(available ? "可用" : "待验证")
-                .foregroundStyle(available ? Color.primary : Color.secondary)
+            Label(available ? "可用" : "待验证", systemImage: available ? "checkmark.circle" : "minus.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize()
         }
-        .padding(.vertical, 12)
+        .padding(.vertical, 9)
     }
 }
 
@@ -959,122 +972,129 @@ private struct ConnectionHelpStep: View {
     let text: String
 
     var body: some View {
-        HStack(spacing: 10) {
-            Text(number)
-                .font(.caption.weight(.semibold))
+        HStack(alignment: .firstTextBaseline, spacing: 9) {
+            Text(number + ".")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.tint)
+            Text(text)
+                .font(.system(size: 12))
                 .foregroundStyle(.secondary)
-                .frame(width: 23, height: 23)
-                .background(Color.secondary.opacity(0.14), in: Circle())
-            Text(text).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .accessibilityElement(children: .combine)
     }
 }
 
 // MARK: - About and updates
 
 private struct AboutSettingsPage: View {
+    let wide: Bool
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var detailInk: Color {
+        colorScheme == .dark ? ResearchPalette(colorScheme).secondary : .secondary
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            SettingsPageHeader(title: "关于与更新", subtitle: "查看版本、获取更新与使用帮助。")
+        VStack(alignment: .leading, spacing: 16) {
             SettingsCard {
                 HStack(spacing: 16) {
-                    XiaoyuSpriteView(
-                        skin: .defaultSkin,
-                        mood: "idle",
-                        color: Color(hex: 0x60a5fa),
-                        size: 58,
-                        glowEnabled: false,
-                        interactionTriggeredAt: nil,
-                        dragDirection: nil
-                    )
-                    .frame(width: 60, height: 60)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Research Companion").font(.title2.weight(.semibold))
-                        Text("DeepSeek Harness 的 macOS 桌面伴侣").foregroundStyle(.secondary)
-                        Text("读取文献、核对出处，保存 Markdown 科研笔记。")
-                            .font(.caption).foregroundStyle(.secondary)
+                    ResearchBrandMark(size: 68)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("科研助手")
+                            .font(.system(size: 23, weight: .semibold))
+                            .tracking(-0.4)
+                        Text("连接 DSH，读取文献、核对出处并保存 Markdown 笔记。")
+                            .font(.system(size: 13))
+                            .foregroundStyle(detailInk)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer()
                 }
             }
-            HStack(alignment: .top, spacing: 24) {
-                UpdateSection().frame(width: 440)
-                Divider()
-                SettingsCard(title: "帮助与反馈") {
-                    VStack(alignment: .leading, spacing: 0) {
-                        if let guide = Bundle.main.url(forResource: "SETUP", withExtension: "md") {
-                            Button {
-                                NSWorkspace.shared.open(guide)
-                            } label: {
-                                Label("打开安装与使用说明", systemImage: "doc.text")
-                            }
-                        } else {
-                            Text("安装与使用说明见发行包内的指南。")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+            SettingsColumns(wide: wide) {
+                SettingsCard(title: "版本与更新") {
+                    SettingRow("当前版本") {
+                        Text(UpdateChecker.currentVersion)
+                            .font(.system(size: 13, weight: .medium, design: .monospaced))
+                            .foregroundStyle(detailInk)
+                    }
+                    SettingsRule()
+                    Text("科研助手采用手动更新。版本信息请查看发行说明。")
+                        .font(.caption)
+                        .foregroundStyle(detailInk)
+                }
+            } detail: {
+                SettingsCard(title: "使用帮助") {
+                    if let guide = Bundle.main.url(forResource: "SETUP", withExtension: "md") {
+                        Button {
+                            NSWorkspace.shared.open(guide)
+                        } label: {
+                            Label("打开安装与使用说明", systemImage: "doc.text")
                         }
+                        .buttonStyle(.bordered)
+                    } else {
+                        Text("安装与使用说明见发行包内的指南。")
+                            .font(.caption)
+                            .foregroundStyle(detailInk)
                     }
                 }
-                .frame(width: 290)
-            }
-            .padding(.top, 18)
-        }
-    }
-}
-
-private struct UpdateSection: View {
-    var body: some View {
-        SettingsCard(title: "版本与更新") {
-            VStack(alignment: .leading, spacing: 12) {
-                AboutValueRow(label: "当前版本", value: UpdateChecker.currentVersion)
-                Text("科研助手采用手动更新。版本信息请查看发行说明。")
-                    .font(.caption).foregroundStyle(.secondary)
             }
         }
-    }
-}
-
-private struct AboutValueRow: View {
-    let label: String
-    let value: String
-
-    var body: some View {
-        HStack {
-            Text(label)
-            Spacer()
-            Text(value).foregroundStyle(.secondary)
-        }
-        .padding(.vertical, 9)
     }
 }
 
 private struct SelectionAuthorizationView: View {
     @State private var trusted = ResearchSelectionCapture.accessibilityAvailable
     @Environment(\.openURL) private var openURL
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack {
-                Text(trusted ? "本进程已获辅助功能授权" : "本进程尚未获辅助功能授权")
-                Button(trusted ? "重新检查" : "检查授权…") {
-                    trusted = ResearchSelectionCapture.accessibilityAvailable
-                    if !trusted { trusted = ResearchSelectionCapture.requestAccessibility() }
-                }.controlSize(.small)
-                if !trusted {
-                    Button("打开辅助功能设置") {
-                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") { openURL(url) }
-                    }.controlSize(.small)
-                }
+        VStack(alignment: .leading, spacing: 9) {
+            SettingsRule()
+            Label(trusted ? "本进程已获辅助功能授权" : "本进程尚未获辅助功能授权",
+                  systemImage: trusted ? "checkmark.circle" : "exclamationmark.circle")
+                .font(.caption.weight(.medium))
+                .fixedSize(horizontal: false, vertical: true)
+            ViewThatFits(in: .horizontal) {
+                HStack { actions }
+                VStack(alignment: .leading, spacing: 6) { actions }
             }
             if !trusted, ResearchSelectionCapture.identity.isAdHoc {
-                Text("如果系统设置里的旧条目已经开启，请移除该条目，重新添加下方路径的应用并启用。")
+                Text("若旧授权仍在系统设置里，请展开代码签名详情核对路径，再移除旧条目并添加当前应用。")
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Text(ResearchSelectionCapture.identity.description).textSelection(.enabled)
+            DisclosureGroup("代码签名详情") {
+                Text(ResearchSelectionCapture.identity.description)
+                    .font(.system(size: 11, design: .monospaced))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .padding(.top, 6)
+            }
         }
-        .font(.caption).foregroundStyle(.secondary)
+        .font(.caption)
+        .foregroundStyle(.secondary)
         .onAppear { trusted = ResearchSelectionCapture.accessibilityAvailable }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             trusted = ResearchSelectionCapture.accessibilityAvailable
+        }
+    }
+
+    @ViewBuilder
+    private var actions: some View {
+        Button(trusted ? "重新检查" : "检查授权…") {
+            trusted = ResearchSelectionCapture.accessibilityAvailable
+            if !trusted { trusted = ResearchSelectionCapture.requestAccessibility() }
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        if !trusted {
+            Button("打开辅助功能设置") {
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                    openURL(url)
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
         }
     }
 }

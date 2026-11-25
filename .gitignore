@@ -17,6 +17,7 @@
 !/Resources/
 /Resources/*
 !/Resources/PublicManifest.txt
+!/Resources/AppIcon.png
 !/Resources/ThirdPartyNotices.txt
 !/Resources/Transcript/
 !/Resources/LicenseNotices/

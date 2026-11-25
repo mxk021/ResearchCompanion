@@ -142,7 +142,7 @@ struct DSHPetComposerView: View {
             HStack(spacing: 7) {
                 Menu {
                     if command.workspaces.isEmpty {
-                        Text("请先在 Harness 中添加工作区")
+                        Text("请先在 DSH 中添加工作区")
                     } else {
                         ForEach(command.workspaces) { workspace in
                             Button {
@@ -259,7 +259,7 @@ struct DSHPetComposerView: View {
             }
 
             if command.submissionStatus == .unconfirmed {
-                submissionStatusRow("提交结果未确认，请在 Harness 中检查", canDiscard: command.hasPendingSubmission)
+                submissionStatusRow("提交结果未确认，请在 DSH 中检查", canDiscard: command.hasPendingSubmission)
             } else if case .failed(let message) = command.submissionStatus {
                 submissionStatusRow(message, canDiscard: command.hasPendingSubmission)
             } else if command.connection != .connected || !command.capabilitiesAvailable {
@@ -268,7 +268,7 @@ struct DSHPetComposerView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else if command.workspaces.isEmpty {
-                Text("没有可用工作区，请先在 Harness 中添加")
+                Text("没有可用工作区，请先在 DSH 中添加")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)

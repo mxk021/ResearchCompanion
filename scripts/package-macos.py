@@ -47,7 +47,7 @@ if app.suffix != '.app' or app.exists():
 
 info = dict(CFBundleDisplayName='科研助手', CFBundleExecutable='ResearchCompanion',
             CFBundleIdentifier=release['bundleIdentifier'], CFBundleName='Research Companion',
-            CFBundleIconFile='ResearchCompanionPage.icns', CFBundlePackageType='APPL',
+            CFBundleIconFile='ResearchCompanionWormhole.icns', CFBundlePackageType='APPL',
             CFBundleShortVersionString=version, CFBundleVersion=version,
             LSMinimumSystemVersion=release['minimumMacOS'], NSHighResolutionCapable=True)
 
@@ -64,9 +64,11 @@ def install_icon(directory, resources):
     cache = str(Path(directory) / 'icon-module-cache')
     subprocess.run([
         '/usr/bin/swift', '-module-cache-path', cache,
-        str(root / 'scripts/render-app-icon.swift'), str(directory),
+        str(root / 'scripts/render-app-icon.swift'), str(root / 'Resources/AppIcon.png'), str(directory),
         *(str(pixels) for pixels in sizes),
     ], env={**os.environ, 'CLANG_MODULE_CACHE_PATH': cache}, check=True)
+    shutil.copyfile(Path(directory) / 'ResearchCompanionMark.png',
+                    resources / 'Transcript' / 'ResearchCompanionMark.png')
     iconset = Path(directory) / 'ResearchCompanion.iconset'
     iconset.mkdir()
     for p in points:
@@ -151,12 +153,24 @@ with tempfile.TemporaryDirectory(prefix='.companion-package-', dir=app.parent) a
             if not source.is_dir() or source.is_symlink():
                 raise SystemExit(f'Unexpected installed app {name} directory.')
             subprocess.run(['/usr/bin/ditto', str(source), str(contents / name)], check=True)
+        resources = contents / 'Resources'
+        shutil.rmtree(resources / 'Transcript')
+        shutil.copytree(root / 'Resources' / 'Transcript', resources / 'Transcript',
+                        ignore=shutil.ignore_patterns('.DS_Store'))
+        shutil.copyfile(root / 'Resources' / 'PublicManifest.txt', resources / 'PublicManifest.txt')
+        shutil.copyfile(root / 'Resources' / 'ThirdPartyNotices.txt', resources / 'ThirdPartyNotices.txt')
+        legacy_brand = resources / 'Brand'
+        if legacy_brand.exists():
+            shutil.rmtree(legacy_brand)
+        for name in ('ResearchCompanion.icns', 'ResearchCompanionPage.icns', 'ResearchCompanionContour.icns'):
+            (resources / name).unlink(missing_ok=True)
     else:
-        shutil.copytree(root / 'Resources', contents / 'Resources', ignore=shutil.ignore_patterns('.DS_Store'))
+        shutil.copytree(root / 'Resources', contents / 'Resources',
+                        ignore=shutil.ignore_patterns('.DS_Store', 'AppIcon.png'))
     if not options.reuse_installed_resources:
         pdfium_identity = '-' if options.local_signing_keychain else options.sign_identity
         install_pdfium(contents, contents / 'MacOS/ResearchCompanion', options.pdfium_archive, pdfium_identity)
-        install_icon(directory, contents / 'Resources')
+    install_icon(directory, contents / 'Resources')
     with (contents / 'Info.plist').open('wb') as file:
         plistlib.dump(info, file)
     if options.local_signing_keychain:

@@ -36,8 +36,8 @@ enum SelectionCaptureError: String, LocalizedError {
         case .protectedContent: return "此控件包含受保护内容，无法读取选区。"
         case .timedOut: return "原应用读取选区超时，请返回原窗口再试一次。"
         case .sourceChanged: return "前台应用、窗口或选区已切换。请回到原窗口重新选取。"
-        case .tooLarge: return "选区超过本地 1,048,576 个 UTF‑16 字符的读取上限。请分段选取。"
-        case .zoteroTooLarge: return "Zotero 当前选区接口最多传回 24,000 个 UTF‑16 字符。请分段选取。"
+        case .tooLarge: return "这段选区超过本机读取上限，请分段选取。"
+        case .zoteroTooLarge: return "这段选区超过 Zotero 的读取上限，请分段选取。"
         case .zoteroBridge: return "Zotero 当前阅读器未提供可核对的实时选区接口。请启用科研助手只读扩展 0.1.5 或更新版本。"
         case .zoteroUnverified: return "无法核对本次 Zotero 选区的原文范围。请在阅读器正文中重新选取，或主动复制后粘贴。"
         }

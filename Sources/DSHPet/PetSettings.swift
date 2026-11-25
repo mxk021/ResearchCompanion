@@ -104,22 +104,6 @@ enum FloatingPetSkin: RawRepresentable, CaseIterable, Identifiable, Hashable {
     }
 }
 
-enum ClickThroughMode: String, CaseIterable, Identifiable {
-    case hover
-    case always
-    case never
-
-    var id: String { rawValue }
-
-    var label: String {
-        switch self {
-        case .hover: return "悬停时恢复响应"
-        case .always: return "永远点击穿透"
-        case .never: return "永不穿透"
-        }
-    }
-}
-
 enum EyeColor: String, CaseIterable, Identifiable {
     case white
     case black
@@ -162,7 +146,6 @@ final class PetSettings: ObservableObject {
         static let skin = "dsh-pet.skin"
         static let ballSize = "dsh-pet.ballSize"
         static let breathingSpeed = "dsh-pet.breathingSpeed"
-        static let clickThrough = "dsh-pet.clickThrough"
         static let rememberPosition = "dsh-pet.rememberPosition"
         static let showEyes = "dsh-pet.showEyes"
         static let eyeColor = "dsh-pet.eyeColor"
@@ -209,10 +192,6 @@ final class PetSettings: ObservableObject {
         didSet { defaults.set(eyeColor.rawValue, forKey: Key.eyeColor) }
     }
 
-    @Published var clickThroughMode: ClickThroughMode {
-        didSet { defaults.set(clickThroughMode.rawValue, forKey: Key.clickThrough) }
-    }
-
     @Published var rememberPosition: Bool {
         didSet { defaults.set(rememberPosition, forKey: Key.rememberPosition) }
     }
@@ -239,7 +218,6 @@ final class PetSettings: ObservableObject {
         }
         ballSize = CGFloat(clamp(Self.number(defaults, for: Key.ballSize) ?? 120, 60, 200))
         breathingSpeed = clamp(Self.number(defaults, for: Key.breathingSpeed) ?? 2, 0.5, 5)
-        clickThroughMode = ClickThroughMode(rawValue: Self.string(defaults, for: Key.clickThrough) ?? "") ?? .hover
         rememberPosition = Self.bool(defaults, for: Key.rememberPosition) ?? true
         showEyes = Self.bool(defaults, for: Key.showEyes) ?? true
         eyeColor = EyeColor(rawValue: Self.string(defaults, for: Key.eyeColor) ?? "") ?? .black

@@ -16,37 +16,34 @@ final class ResearchWindowController: NSObject, NSWindowDelegate {
         override func cancelOperation(_ sender: Any?) { requestClose?() }
     }
 
-    private enum Interaction: String {
-        case normal
-        case pinned
-        case pinnedClickThrough
-    }
-
     private static let frameKey = "research-companion.chatWindowFrame"
     private static let interactionKey = "research-companion.chatWindowInteraction"
-    private static let defaultSize = NSSize(width: 620, height: 710)
+    private static let defaultSize = NSSize(width: 740, height: 760)
     private let chat: ChatWindow
     private let close: () -> Void
     private let presentation = ResearchWindowPresentation()
-    private var interaction: Interaction
+    private(set) var isPinned: Bool
     private var settingFrame = false
     private var frameSaveTask: Task<Void, Never>?
     private(set) var isKeepingSelectionVisible = false
     var visibilityDidChange: (() -> Void)?
 
     init(model: DSHPetModel, command: DSHPetCommandClient) {
-        interaction = UserDefaults.standard.string(forKey: Self.interactionKey)
-            .flatMap(Interaction.init(rawValue:)) ?? .normal
+        let saved = UserDefaults.standard.string(forKey: Self.interactionKey)
+        isPinned = saved == "pinned" || saved == "pinnedClickThrough"
+        if saved == "pinnedClickThrough" {
+            UserDefaults.standard.set("pinned", forKey: Self.interactionKey)
+        }
         chat = ChatWindow(contentRect: NSRect(origin: .zero, size: Self.defaultSize),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         close = { [weak model] in model?.collapseComposer(reason: .closeButton) }
         super.init()
-        chat.title = "科研伙伴"
+        chat.title = "科研助手"
         chat.setAccessibilityIdentifier("research-companion.chat")
         chat.isReleasedWhenClosed = false
         chat.isMovableByWindowBackground = false
-        applyInteraction()
+        updateLevel()
         chat.delegate = self
         chat.requestClose = { [weak model] in model?.collapseComposer(reason: .panelCancel) }
         let hosting = NSHostingView(rootView: ResearchComposerView(model: model, command: command, presentation: presentation))
@@ -56,30 +53,16 @@ final class ResearchWindowController: NSObject, NSWindowDelegate {
     }
 
     var window: NSWindow { chat }
-    var isPinned: Bool { interaction != .normal }
-    var allowsClickThrough: Bool { interaction == .pinnedClickThrough }
 
     func togglePinned() {
-        setInteraction(isPinned ? .normal : .pinned)
+        isPinned.toggle()
+        UserDefaults.standard.set(isPinned ? "pinned" : "normal", forKey: Self.interactionKey)
+        updateLevel()
     }
 
-    func toggleClickThrough() {
-        guard isPinned else { return }
-        setInteraction(allowsClickThrough ? .pinned : .pinnedClickThrough)
-    }
-
-    private func setInteraction(_ value: Interaction) {
-        interaction = value
-        UserDefaults.standard.set(value.rawValue, forKey: Self.interactionKey)
-        applyInteraction()
-    }
-
-    private func applyInteraction() {
+    private func updateLevel() {
         let level: NSWindow.Level = isPinned || isKeepingSelectionVisible ? .floating : .normal
         if chat.level != level { chat.level = level }
-        if chat.ignoresMouseEvents != allowsClickThrough {
-            chat.ignoresMouseEvents = allowsClickThrough
-        }
     }
 
     func present() {
@@ -111,14 +94,14 @@ final class ResearchWindowController: NSObject, NSWindowDelegate {
               !chat.isMiniaturized, !chat.styleMask.contains(.fullScreen), chat.attachedSheet == nil,
               !isKeepingSelectionVisible else { return }
         isKeepingSelectionVisible = true
-        applyInteraction()
+        updateLevel()
     }
 
     @discardableResult
     func endSelectionVisibility() -> Bool {
         guard isKeepingSelectionVisible else { return false }
         isKeepingSelectionVisible = false
-        applyInteraction()
+        updateLevel()
         return true
     }
 

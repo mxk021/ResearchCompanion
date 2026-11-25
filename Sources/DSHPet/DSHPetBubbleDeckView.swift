@@ -96,12 +96,12 @@ struct DSHPetBubbleDeckView: View {
         var parts = [presentation.title]
         if let pageNumber = presentation.pageNumber { parts.append("第 \(pageNumber) 页") }
         if presentation.interactive { parts.append("点击切换") }
-        parts.append(presentation.taskID != nil ? "双击打开 Harness 会话" : "双击打开 Harness")
+        parts.append(presentation.taskID != nil ? "双击打开 DSH 会话" : "双击打开 DSH")
         return parts.joined(separator: "，")
     }
 
     private var helpText: String {
-        let doubleTap = presentation.taskID != nil ? "双击打开 Harness 会话" : "双击打开 Harness"
+        let doubleTap = presentation.taskID != nil ? "双击打开 DSH 会话" : "双击打开 DSH"
         return presentation.interactive ? "单击切换任务气泡，\(doubleTap)" : doubleTap
     }
 }

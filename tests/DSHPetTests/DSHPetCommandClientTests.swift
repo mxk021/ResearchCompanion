@@ -576,7 +576,7 @@ final class DSHPetCommandClientTests: XCTestCase {
 
         XCTAssertFalse(client.configure(instance: second))
         XCTAssertEqual(client.draft, "尚未发送")
-        XCTAssertEqual(client.lastError, "请先处理当前草稿或未确认请求，再切换 Harness 来源")
+        XCTAssertEqual(client.lastError, "请先处理当前草稿或未确认请求，再切换 DSH 来源")
         XCTAssertEqual(client.targetBindingKey, first.bindingKey)
     }
 
@@ -590,7 +590,7 @@ final class DSHPetCommandClientTests: XCTestCase {
         XCTAssertTrue(client.configure(instance: instance))
         XCTAssertEqual(client.draft, "旧来源草稿")
         XCTAssertNil(client.selectedWorkspaceID)
-        XCTAssertEqual(client.continuationWarning, "Harness 来源已更新，请重新选择工作区")
+        XCTAssertEqual(client.continuationWarning, "DSH 来源已更新，请重新选择工作区")
     }
 
     @MainActor

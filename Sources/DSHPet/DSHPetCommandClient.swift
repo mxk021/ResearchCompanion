@@ -523,7 +523,7 @@ final class DSHPetCommandClient: ObservableObject {
     var busyMessage: String? {
         guard let snapshot = sessionSnapshot, snapshot.taskRunning else { return nil }
         if snapshot.message == "无法确认任务状态，暂不可发送" { return snapshot.message }
-        if snapshot.waitingForUser { return "请在 Harness 中完成当前操作" }
+        if snapshot.waitingForUser { return "请在 DSH 中完成当前操作" }
         return "当前会话正在执行，请稍候"
     }
 
@@ -554,7 +554,7 @@ final class DSHPetCommandClient: ObservableObject {
             && submissionStatus != .submitting
             && submissionStatus != .unconfirmed
         if changed && targetSwitchBlocked && !canAdoptUnidentifiedTarget {
-            lastError = "请先处理当前草稿或未确认请求，再切换 Harness 来源"
+            lastError = "请先处理当前草稿或未确认请求，再切换 DSH 来源"
             return false
         }
 
@@ -578,7 +578,7 @@ final class DSHPetCommandClient: ObservableObject {
         if hadUnidentifiedHistory {
             selectedWorkspaceID = nil
             defaults.removeObject(forKey: Keys.workspaceID)
-            continuationWarning = "Harness 来源已更新，请重新选择工作区"
+            continuationWarning = "DSH 来源已更新，请重新选择工作区"
         }
 
         sourceEnabled = instance != nil
@@ -1093,7 +1093,7 @@ final class DSHPetCommandClient: ObservableObject {
         }
         guard let workspace = workspaces.first(where: { $0.id == task.workspaceID }),
               workspace.sessionIds.contains(task.sessionID) else {
-            taskOpenError = "该任务已不属于当前 Harness 工作区"
+            taskOpenError = "该任务已不属于当前 DSH 工作区"
             lastError = taskOpenError
             return
         }
@@ -1114,7 +1114,7 @@ final class DSHPetCommandClient: ObservableObject {
             } catch {
                 guard self.connectionGeneration == generation, taskOpenGeneration == openGeneration else { return }
                 if case DSHPetCommandError.timedOut = error {
-                    taskOpenError = "打开会话超时，请确认 Harness 客户端已加载"
+                    taskOpenError = "打开会话超时，请确认 DSH 客户端已加载"
                 } else {
                     taskOpenError = errorMessage(error)
                 }
@@ -1132,12 +1132,12 @@ final class DSHPetCommandClient: ObservableObject {
         candidatesError = nil
         guard connection == .connected, capabilitiesValidated else {
             candidatesLoading = false
-            candidatesError = "请先连接 Harness"
+            candidatesError = "请先连接 DSH"
             return
         }
         guard kind == .file ? fileCandidatesAvailable : skillCandidatesAvailable else {
             candidatesLoading = false
-            candidatesError = "当前 Harness 不支持此功能"
+            candidatesError = "当前 DSH 不支持此功能"
             return
         }
         guard let workspaceID = selectedWorkspaceID, hasWorkspace else {
@@ -1201,7 +1201,7 @@ final class DSHPetCommandClient: ObservableObject {
                 let insert = quoted ? "@\"\(fullPath)\"" : "@\(fullPath)"
                 return DSHPetInputCandidate(id: "\(type):\(path)", label: fullPath,
                     insertText: insert, detail: type == "directory" ? "目录" : "文件",
-                    disabledReason: invalid ? "此路径无法用 Harness 引用格式表示" : nil)
+                    disabledReason: invalid ? "此路径无法用 DSH 引用格式表示" : nil)
             }
         }
         guard let rows = response["skills"] as? [[String: Any]] else { throw DSHPetCommandError.malformed }
@@ -1210,7 +1210,7 @@ final class DSHPetCommandClient: ObservableObject {
                   query.isEmpty || name.localizedCaseInsensitiveContains(query) else { return nil }
             return DSHPetInputCandidate(id: name, label: name, insertText: "/\(name) ",
                 detail: row["description"] as? String,
-                disabledReason: row["conflict"] as? Bool == false ? nil : "无法确认是否与 Harness 命令同名")
+                disabledReason: row["conflict"] as? Bool == false ? nil : "无法确认是否与 DSH 命令同名")
         }
     }
 
@@ -1220,7 +1220,7 @@ final class DSHPetCommandClient: ObservableObject {
         previewTask?.cancel()
         taskPreview = nil
         guard taskPreviewAvailable else {
-            taskPreviewStatus = "当前 Harness 不支持回复预览"
+            taskPreviewStatus = "当前 DSH 不支持回复预览"
             return
         }
         taskPreviewStatus = "正在加载回复预览…"
@@ -1245,7 +1245,7 @@ final class DSHPetCommandClient: ObservableObject {
                     case "empty":
                         taskPreviewStatus = "暂无回复预览"
                         if attempt < (retryEmpty ? 2 : 0) { continue }
-                    case "unsupported": taskPreviewStatus = "当前 Harness 不支持回复预览"
+                    case "unsupported": taskPreviewStatus = "当前 DSH 不支持回复预览"
                     case "migration-required": taskPreviewStatus = "会话需要迁移，暂无法显示回复预览"
                     default: throw DSHPetCommandError.malformed
                     }
@@ -2513,12 +2513,6 @@ final class DSHPetCommandClient: ObservableObject {
         catch { return error.localizedDescription }
         if includePaperContext, capturingSelection, scope != .file { return "等待本次选区" }
         let activeSelection = availableResearchSelection
-        let source: String
-        if let selection = activeSelection {
-            source = "\(selection.source) · \(selection.text.utf16.count) 个 UTF‑16 字符"
-        } else {
-            source = ""
-        }
         if scope == .selection || scope == .combined, (activeSelection?.text.utf16.count ?? 0) > ResearchMaterial.maximumLength {
             return "选区超出带入上限，请缩小后再发送。"
         }
@@ -2528,13 +2522,13 @@ final class DSHPetCommandClient: ObservableObject {
                 return "会话文件不可用，请重试读取或重新选择"
             }
             let fileLabel = file.pdfIndex == nil ? "当前文件" : "当前 PDF"
-            if scope == .combined { return "完整选区（\(source)）＋\(fileLabel)相关摘录" }
+            if scope == .combined { return "将带入完整选区和\(fileLabel)的相关摘录" }
             if scope == .automatic, activeSelection != nil {
-                return "按问题选用\(fileLabel)与当前选区（\(source)）"
+                return "将按问题选用\(fileLabel)和当前选区"
             }
             return file.pdfIndex == nil ? "将带入当前文件的已读范围" : "当前 PDF · 根据问题检索原文"
         }
-        if scope == .selection { return "将带入完整选区（\(source)）" }
+        if scope == .selection { return "将带入完整选区" }
         return includePaperContext ? "当前无附带材料" : "带入已关闭 · 本轮只发送问题"
     }
 
@@ -3030,7 +3024,7 @@ final class DSHPetCommandClient: ObservableObject {
         previewTask?.cancel()
         previewTask = nil
         taskPreview = nil
-        taskPreviewStatus = focusedTaskID == nil ? nil : "Harness 连接已断开"
+        taskPreviewStatus = focusedTaskID == nil ? nil : "DSH 连接已断开"
         connectionHandle?.cancel()
         connectionHandle = nil
         reconnectTask?.cancel()
@@ -3074,7 +3068,7 @@ final class DSHPetCommandClient: ObservableObject {
         previewTask = nil
         if focusedTaskID != nil {
             taskPreview = nil
-            taskPreviewStatus = "Harness 连接已断开"
+            taskPreviewStatus = "DSH 连接已断开"
         }
         resetBubbleDeckState()
     }
@@ -3354,7 +3348,7 @@ final class DSHPetCommandClient: ObservableObject {
               descriptor["instanceId"] as? String == targetInstance.instanceId,
               descriptor["statusSocketPath"] as? String == targetInstance.statusSocketPath,
               descriptor["commandSocketPath"] as? String == targetInstance.commandSocketPath else {
-            lastError = "Harness 来源身份校验失败，已停止发送"
+            lastError = "DSH 来源身份校验失败，已停止发送"
             return false
         }
         return true
@@ -3382,17 +3376,17 @@ final class DSHPetCommandClient: ObservableObject {
         if let limits = imageLimits {
             guard draftImages.count < limits.maxImagesPerMessage else {
                 try? FileManager.default.removeItem(at: url)
-                lastError = "图片数量超过 Harness 限制（最多 \(limits.maxImagesPerMessage) 张）"
+                lastError = "图片数量超过 DSH 限制（最多 \(limits.maxImagesPerMessage) 张）"
                 return
             }
             guard data.count <= limits.maxImageBytes else {
                 try? FileManager.default.removeItem(at: url)
-                lastError = "图片超过 Harness 单张大小限制（\(Self.byteLabel(limits.maxImageBytes))）"
+                lastError = "图片超过 DSH 单张大小限制（\(Self.byteLabel(limits.maxImageBytes))）"
                 return
             }
             guard draftImages.reduce(0, { $0 + $1.bytes }) + data.count <= limits.maxMessageImageBytes else {
                 try? FileManager.default.removeItem(at: url)
-                lastError = "图片总大小超过 Harness 限制（\(Self.byteLabel(limits.maxMessageImageBytes))）"
+                lastError = "图片总大小超过 DSH 限制（\(Self.byteLabel(limits.maxMessageImageBytes))）"
                 return
             }
         }

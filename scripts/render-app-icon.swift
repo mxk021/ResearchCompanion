@@ -3,84 +3,110 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
-// Original Research Companion artwork. Coordinates are in a bottom-up
-// 1024-point design space. Every icon representation is drawn at its own size.
-private let palette = CGColorSpace(name: CGColorSpace.sRGB)!
-
-private func color(_ rgb: UInt32, alpha: CGFloat = 1) -> CGColor {
-    CGColor(
-        srgbRed: CGFloat((rgb >> 16) & 0xff) / 255,
-        green: CGFloat((rgb >> 8) & 0xff) / 255,
-        blue: CGFloat(rgb & 0xff) / 255,
-        alpha: alpha
-    )
-}
-
-private func shape(_ points: [CGPoint]) -> CGPath {
-    let path = CGMutablePath()
-    path.addLines(between: points)
-    path.closeSubpath()
-    return path
-}
-
-private func fill(_ context: CGContext, _ path: CGPath, _ rgb: UInt32) {
-    context.setFillColor(color(rgb))
-    context.addPath(path)
-    context.fillPath()
-}
-
-private func render(_ pixels: Int) -> CGImage? {
-    guard let context = CGContext(
-        data: nil, width: pixels, height: pixels, bitsPerComponent: 8, bytesPerRow: 0,
-        space: palette, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-    ) else { return nil }
-    let scale = CGFloat(pixels) / 1024
-    context.scaleBy(x: scale, y: scale)
-    let tile = CGPath(roundedRect: CGRect(x: 74, y: 74, width: 876, height: 876),
-                      cornerWidth: 210, cornerHeight: 210, transform: nil)
-    context.saveGState()
-    context.addPath(tile)
-    context.clip()
-    let tint = CGGradient(colorsSpace: palette, colors: [color(0x284c68), color(0x142639)] as CFArray,
-                          locations: [0, 1])!
-    context.drawLinearGradient(tint, start: CGPoint(x: 200, y: 950), end: CGPoint(x: 790, y: 170),
-                               options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
-    context.restoreGState()
-    context.addPath(tile)
-    context.setStrokeColor(color(0x93b0c6, alpha: 0.40))
-    context.setLineWidth(8)
-    context.strokePath()
-
-    // A page with a large fold and one marked passage. The silhouette and the
-    // accent carry the design at 16 px, where fine details disappear.
-    fill(context, shape([
-        CGPoint(x: 310, y: 251), CGPoint(x: 718, y: 251), CGPoint(x: 718, y: 658),
-        CGPoint(x: 583, y: 793), CGPoint(x: 310, y: 793),
-    ]), 0xf4f5ee)
-    fill(context, shape([
-        CGPoint(x: 583, y: 793), CGPoint(x: 718, y: 658), CGPoint(x: 583, y: 658),
-    ]), 0x9ab6c3)
-    for (bounds, rgb) in [
-        (CGRect(x: 366, y: 550, width: 175, height: 42), UInt32(0x547588)),
-        (CGRect(x: 280, y: 442, width: 369, height: 70), UInt32(0x62c9b3)),
-        (CGRect(x: 366, y: 341, width: 229, height: 42), UInt32(0x547588)),
-    ] {
-        fill(context, CGPath(roundedRect: bounds, cornerWidth: bounds.height / 2,
-                            cornerHeight: bounds.height / 2, transform: nil), rgb)
-    }
-    return context.makeImage()
-}
-
-let arguments = CommandLine.arguments.dropFirst()
-guard let directory = arguments.first, arguments.count > 1 else {
-    fputs("Usage: render-app-icon.swift output-directory pixel-size ...\n", stderr)
+let arguments = Array(CommandLine.arguments.dropFirst())
+guard arguments.count > 2,
+      let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: arguments[0]) as CFURL, nil),
+      let master = CGImageSourceCreateImageAtIndex(source, 0, nil),
+      master.width == 1024, master.height == 1024 else {
+    fputs("Usage: render-app-icon.swift 1024px-master.png output-directory pixel-size ...\n", stderr)
     exit(2)
 }
-for argument in arguments.dropFirst() {
-    guard let size = Int(argument), (16...1024).contains(size), let image = render(size) else { exit(2) }
-    let output = URL(fileURLWithPath: directory).appendingPathComponent("icon-\(size).png")
-    guard let destination = CGImageDestinationCreateWithURL(output as CFURL, UTType.png.identifier as CFString,
-                                                          1, nil) else { exit(1) }
+
+let directory = URL(fileURLWithPath: arguments[1], isDirectory: true)
+let space = CGColorSpace(name: CGColorSpace.sRGB)!
+
+func writePNG(_ image: CGImage, named name: String) -> Bool {
+    let url = directory.appendingPathComponent(name)
+    guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)
+    else { return false }
     CGImageDestinationAddImage(destination, image, nil)
-    guard CGImageDestinationFinalize(destination) else { exit(1) }
+    return CGImageDestinationFinalize(destination)
+}
+
+/// Derive the chrome glyph from the approved Dock art. Keep the original silhouette
+/// and antialiased edges while turning the white tile and the two openings transparent.
+func monochromeMark(from master: CGImage) -> CGImage? {
+    let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+    let width = master.width
+    let height = master.height
+    guard let bitmap = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                 bytesPerRow: 0, space: space, bitmapInfo: bitmapInfo),
+          let pixels = bitmap.data?.assumingMemoryBound(to: UInt8.self)
+    else { return nil }
+    bitmap.draw(master, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+    var minX = width, minY = height, maxX = -1, maxY = -1
+    for y in 0..<height {
+        for x in 0..<width {
+            let pixel = pixels + y * bitmap.bytesPerRow + x * 4
+            let luminance = 0.2126 * Double(pixel[0]) + 0.7152 * Double(pixel[1]) + 0.0722 * Double(pixel[2])
+            let ink = (Double(pixel[3]) - luminance) / 255
+            // Premultiplied colour makes the transparent corners contribute no ink.
+            // A short soft threshold removes near-white tile noise and keeps the waist solid.
+            let t = min(1, max(0, (ink - 0.04) / 0.55))
+            let coverage = UInt8((255 * t * t * (3 - 2 * t)).rounded())
+            pixel[0] = 0
+            pixel[1] = 0
+            pixel[2] = 0
+            pixel[3] = coverage
+            if coverage > 0 {
+                minX = min(minX, x)
+                minY = min(minY, y)
+                maxX = max(maxX, x)
+                maxY = max(maxY, y)
+            }
+        }
+    }
+
+    let size = 256
+    let edgeRadius = 5
+    let glyphSide = CGFloat(210 - 2 * edgeRadius)
+    guard minX < maxX, minY < maxY,
+          let silhouette = bitmap.makeImage()?.cropping(to: CGRect(x: minX, y: minY, width: maxX - minX + 1,
+                                                                     height: maxY - minY + 1)),
+          let output = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8,
+                                 bytesPerRow: 0, space: space, bitmapInfo: bitmapInfo)
+    else { return nil }
+    let scale = glyphSide / CGFloat(max(silhouette.width, silhouette.height))
+    let glyphWidth = CGFloat(silhouette.width) * scale
+    let glyphHeight = CGFloat(silhouette.height) * scale
+    output.interpolationQuality = .high
+    output.draw(silhouette, in: CGRect(x: (CGFloat(size) - glyphWidth) / 2, y: (CGFloat(size) - glyphHeight) / 2,
+                                      width: glyphWidth, height: glyphHeight))
+
+    // Five 256px template pixels add less than half a point at 22pt and keep
+    // the narrow inner edges connected in 1× menu-bar rasterization.
+    guard let outputPixels = output.data?.assumingMemoryBound(to: UInt8.self) else { return nil }
+    let rowBytes = output.bytesPerRow
+    let original = Array(UnsafeBufferPointer(start: outputPixels, count: rowBytes * size))
+    var neighbours: [Int] = []
+    for dy in -edgeRadius...edgeRadius {
+        for dx in -edgeRadius...edgeRadius where dx * dx + dy * dy <= edgeRadius * edgeRadius {
+            neighbours.append(dy * rowBytes + dx * 4)
+        }
+    }
+    for y in edgeRadius..<(size - edgeRadius) {
+        for x in edgeRadius..<(size - edgeRadius) {
+            let index = y * rowBytes + x * 4 + 3
+            var coverage = original[index]
+            for offset in neighbours {
+                if coverage == 255 { break }
+                coverage = max(coverage, original[index + offset])
+            }
+            outputPixels[index] = coverage
+        }
+    }
+    return output.makeImage()
+}
+
+guard let mark = monochromeMark(from: master), writePNG(mark, named: "ResearchCompanionMark.png") else { exit(1) }
+
+for argument in arguments.dropFirst(2) {
+    guard let size = Int(argument), (16...1024).contains(size),
+          let context = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+    else { exit(2) }
+    context.interpolationQuality = .high
+    context.draw(master, in: CGRect(x: 0, y: 0, width: size, height: size))
+    guard let image = context.makeImage(), writePNG(image, named: "icon-\(size).png") else { exit(1) }
 }

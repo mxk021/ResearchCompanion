@@ -11,6 +11,7 @@ struct ResearchTranscript: NSViewRepresentable {
     let stream: ResearchChatMessage?
     let sessionID: String?
     let jump: Int
+    let emptyGuidance: String
     var didDisplay: ((String, ResearchChatMessage?, ResearchChatMessage?) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -40,7 +41,7 @@ struct ResearchTranscript: NSViewRepresentable {
             return
         }
         context.coordinator.update(messages, historyRevision: historyRevision, stream: stream,
-                                   sessionID: sessionID, jump: jump, didDisplay: didDisplay)
+                                   sessionID: sessionID, jump: jump, emptyGuidance: emptyGuidance, didDisplay: didDisplay)
     }
 
     static func dismantleNSView(_ view: NSView, coordinator: Coordinator) { coordinator.detach() }
@@ -53,6 +54,7 @@ struct ResearchTranscript: NSViewRepresentable {
             let stream: ResearchChatMessage?
             let session: String
             let jump: Int
+            let emptyGuidance: String
 
             static func id(_ row: ResearchChatMessage) -> String { "\(row.role):\(row.id)" }
 
@@ -79,7 +81,8 @@ struct ResearchTranscript: NSViewRepresentable {
                 let reset = earlier?.session != session
                 let historyChanged = reset || earlier?.historyRevision != historyRevision
                 let streamChanged = reset || earlier?.stream != stream
-                guard historyChanged || streamChanged || earlier?.jump != jump else { return nil }
+                let guidanceChanged = earlier?.emptyGuidance != emptyGuidance
+                guard historyChanged || streamChanged || guidanceChanged || earlier?.jump != jump else { return nil }
 
                 var rows: [[String: Any]] = []
                 if historyChanged {
@@ -106,6 +109,7 @@ struct ResearchTranscript: NSViewRepresentable {
                 }
 
                 var data: [String: Any] = ["session": session, "jump": jump, "rows": rows]
+                if guidanceChanged { data["emptyGuidance"] = emptyGuidance }
                 let activeID = stream.map(Self.id)
                 if historyChanged || earlier?.stream.map(Self.id) != activeID {
                     data["order"] = messages.map(Self.id) + (activeID.map { [$0] } ?? [])
@@ -152,7 +156,7 @@ struct ResearchTranscript: NSViewRepresentable {
         }
 
         func update(_ messages: [ResearchChatMessage], historyRevision: Int, stream: ResearchChatMessage?,
-                    sessionID: String?, jump: Int,
+                    sessionID: String?, jump: Int, emptyGuidance: String,
                     didDisplay: ((String, ResearchChatMessage?, ResearchChatMessage?) -> Void)? = nil) {
             self.didDisplay = didDisplay
             let session = sessionID ?? ""
@@ -161,7 +165,7 @@ struct ResearchTranscript: NSViewRepresentable {
                 savedNote = nil
             }
             request = Snapshot(messages: messages, historyRevision: historyRevision, stream: stream,
-                               session: session, jump: jump)
+                               session: session, jump: jump, emptyGuidance: emptyGuidance)
             applyIfReady()
         }
 

@@ -6,14 +6,14 @@ import os
 
 private let appLog = Logger(subsystem: "com.local.research-companion", category: "app")
 
-/// 置顶悬浮窗：透明、无边框、不抢焦点、点击穿透。
+/// 透明、无边框的桌宠面板，只有可操作区域接收鼠标事件。
 /// 鼠标移入球体范围时恢复响应（可拖拽），移出后再次穿透。
 /// 拖拽由 SwiftUI 手势驱动（见 DSHPetView），位置持久化到 UserDefaults。
 final class DSHPetPanel: NSPanel {
     /// 供 SwiftUI 拖拽手势引用当前悬浮窗
     static weak var current: DSHPetPanel?
 
-    /// 拖拽进行中（悬停检测据此保持响应，避免拖到一半变成点击穿透）
+    /// 拖拽进行中，无论指针位置都继续接收拖拽事件。
     var isDragging = false
     var onRightClick: ((NSPoint) -> Void)?
 
@@ -183,7 +183,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         NSApp.setActivationPolicy(.regular)
 
-        // 菜单栏彩色图标（NSStatusItem 非模板渲染）+ 标准主菜单
+        // 菜单栏品牌符号与标准主菜单
         setupStatusItem()
         setupMainMenu()
         recordSelectionForeground(NSWorkspace.shared.frontmostApplication)
@@ -208,7 +208,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         observeComposer()
         ResearchLaunchLog.write("panels-created")
         showComposer()
-        ResearchLaunchLog.write("first-panel-presented")
         // 显示器增删/分辨率变化时，把球收回可视区（避免被 macOS 甩到屏幕外）
         NotificationCenter.default.addObserver(
             self,
@@ -311,14 +310,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             defer: false
         )
         panel.isOpaque = false
-        panel.title = "科研伙伴 · 角色"
-        panel.setAccessibilityLabel("科研伙伴角色")
+        panel.title = "科研助手 · 角色"
+        panel.setAccessibilityLabel("科研助手角色")
         panel.setAccessibilityIdentifier("research-companion.character")
         panel.backgroundColor = .clear
         panel.hasShadow = false
         panel.level = .floating                       // 置顶
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        panel.ignoresMouseEvents = true               // 默认点击穿透（悬停时由 updateHover 恢复响应）
+        panel.ignoresMouseEvents = true               // 由 updateHover 根据角色的可见区域更新
         panel.isReleasedWhenClosed = false
         panel.hidesOnDeactivate = false
         panel.animationBehavior = .none
@@ -422,7 +421,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             defer: false
         )
         p.isOpaque = false
-        p.title = "科研伙伴 · 操作栏"
+        p.title = "科研助手 · 操作栏"
         p.setAccessibilityIdentifier("research-companion.pet-toolbar")
         p.onExplicitClose = { [weak self] in self?.model.collapseComposer(reason: .panelCancel) }
         p.backgroundColor = .clear
@@ -439,8 +438,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         hosting.layer?.backgroundColor = NSColor.clear.cgColor
         p.contentView = hosting
         self.composerPanel = p
-        researchWindow = ResearchWindowController(model: model, command: model.commandClient)
-        researchWindow?.visibilityDidChange = { [weak self] in self?.updateResearchForeground() }
         updateComposerPanel()
     }
 
@@ -569,13 +566,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             }
     }
 
-    // MARK: - 悬停检测（穿透 ↔ 可拖拽）
+    // MARK: - 桌宠可操作区域
 
     private func startHoverMonitor() {
         // 事件驱动：鼠标移动/拖拽时才检测，鼠标不动时零唤醒（取代固定频率轮询定时器）。
         // 本地监视器：本 app 活跃时（拖拽中、设置面板开着）触发；
-        // 全局监视器：其它 app 前台时触发（球默认点击穿透，鼠标事件不派发给本 app，
-        //   只有全局监视器能看到光标移动）。
+        // 全局监视器也观察其他窗口前台时的指针位置。
         // 全局监视器回调在后台线程，统一跳回主线程再更新。
         let events: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
         let local = NSEvent.addLocalMonitorForEvents(matching: events) { [weak self] event in
@@ -643,8 +639,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             }
         }
 
-        if settings.clickThroughMode != .always,
-            model.barPhase != .composer {
+        if model.barPhase != .composer {
             let controlFrame = composerPanel?.frame.insetBy(dx: -14, dy: -18)
             let insideTaskPanel = taskPanel?.isVisible == true && taskPanel?.frame.contains(mouse) == true
             model.setComposerHovering(
@@ -657,20 +652,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         updateComposerPanel()
 
         guard let panel, panel.isVisible else { return }
-        switch settings.clickThroughMode {
-        case .always:
-            // 永远穿透：常驻忽略鼠标事件（不可拖拽）
-            if !panel.ignoresMouseEvents { panel.ignoresMouseEvents = true }
-        case .never:
-            // 永不穿透：常驻响应（无穿透）
-            if panel.ignoresMouseEvents { panel.ignoresMouseEvents = false }
-        case .hover:
-            // 气泡和透明光晕不参与宠物拖拽命中；多任务气泡可点击。
-            let shouldIgnore = !panel.isDragging && !insidePet && !insideBubble
-            if panel.ignoresMouseEvents != shouldIgnore {
-                panel.ignoresMouseEvents = shouldIgnore
-                appLog.info("hover -> ignoresMouseEvents=\(shouldIgnore)")
-            }
+        let outsideControls = !panel.isDragging && !insidePet && !insideBubble
+        if panel.ignoresMouseEvents != outsideControls {
+            panel.ignoresMouseEvents = outsideControls
         }
     }
 
@@ -689,7 +673,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                     self.model.commandClient.flushDraftPersistence()
                     self.researchWindow?.hide()
                     self.updateResearchForeground()
-                } else if let window = self.researchWindow?.window, !window.isVisible, !window.isMiniaturized {
+                } else if self.researchWindow?.window.isVisible != true,
+                          self.researchWindow?.window.isMiniaturized != true {
                     self.focusResearchPanel()
                 }
                 self.updateComposerPanel()
@@ -725,17 +710,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         )
         let frame = composerFrame(size: size)
         if !frame.equalTo(composerPanel.frame) { composerPanel.setFrame(frame, display: true) }
-        if phase == .composer {
-            composerPanel.ignoresMouseEvents = false
-        } else {
-            composerPanel.ignoresMouseEvents = settings.clickThroughMode != .never
-                && phase != .hovering
-        }
+        composerPanel.ignoresMouseEvents = phase != .composer && phase != .hovering
         if !composerPanel.isVisible { composerPanel.orderFrontRegardless() }
     }
 
     private func focusResearchPanel() {
         guard model.isResearchPanelOpen else { return }
+        let firstPresentation = researchWindow == nil
+        if firstPresentation {
+            let controller = ResearchWindowController(model: model, command: model.commandClient)
+            controller.visibilityDidChange = { [weak self] in self?.updateResearchForeground() }
+            researchWindow = controller
+        }
         cancelSelectionCapture()
         if let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid(),
            app.activationPolicy == .regular {
@@ -745,6 +731,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if NSApp.isHidden { NSApp.unhide(nil) }
         if !NSApp.isActive { NSApp.activate() }
         researchWindow?.present()
+        if firstPresentation { ResearchLaunchLog.write("first-panel-presented") }
     }
 
     private func updateResearchForeground() {
@@ -980,7 +967,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private func setupStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem = item
-        item.button?.image = Self.makeStatusIcon()
+        item.button?.image = ResearchBrandMark.statusImage()
         item.button?.imagePosition = .imageOnly
 
         // 菜单内容：状态行 + 显示/隐藏 + 设置… + 退出
@@ -996,7 +983,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             title: "打开科研对话",
             selector: #selector(showComposer)
         ))
-        addWindowInteractionItems(to: menu)
+        menu.addItem(makeMenuItem(title: "固定窗口", selector: #selector(toggleResearchWindowPin)))
 
         togglePetMenuItem = makeMenuItem(
             title: PetSettings.shared.isPetVisible ? "隐藏宠物" : "显示宠物",
@@ -1052,30 +1039,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return item
     }
 
-    private func addWindowInteractionItems(to menu: NSMenu) {
-        menu.addItem(makeMenuItem(title: "固定窗口", selector: #selector(toggleResearchWindowPin)))
-        menu.addItem(makeMenuItem(title: "点击穿透", selector: #selector(toggleResearchWindowClickThrough)))
-    }
-
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        switch menuItem.action {
-        case #selector(toggleResearchWindowPin):
-            menuItem.state = researchWindow?.isPinned == true ? .on : .off
-            return researchWindow != nil
-        case #selector(toggleResearchWindowClickThrough):
-            menuItem.state = researchWindow?.allowsClickThrough == true ? .on : .off
-            return researchWindow?.isPinned == true
-        default:
-            return true
-        }
+        guard menuItem.action == #selector(toggleResearchWindowPin) else { return true }
+        menuItem.state = researchWindow?.isPinned == true ? .on : .off
+        return researchWindow != nil
     }
 
     @objc private func toggleResearchWindowPin() {
         researchWindow?.togglePinned()
-    }
-
-    @objc private func toggleResearchWindowClickThrough() {
-        researchWindow?.toggleClickThrough()
     }
 
     @objc private func togglePetVisibility() {
@@ -1446,105 +1417,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         activateResearchComposer()
     }
 
-    /// Official DeepSeek Harness FishLogo geometry (MIT); see ThirdPartyNotices.txt.
-    /// Source blob: 8621f17273c0d192feb14a988816c8052360b908
-    static func makeStatusIcon() -> NSImage {
-        let image = NSImage(size: NSSize(width: 22, height: 22), flipped: false) { rect in
-            let path = NSBezierPath()
-            path.move(to: NSPoint(x: 22.9168, y: 1.43018))
-            path.curve(to: NSPoint(x: 22.4223, y: 1.65519), controlPoint1: NSPoint(x: 22.6713, y: 1.31018), controlPoint2: NSPoint(x: 22.5658, y: 1.53918))
-            path.curve(to: NSPoint(x: 22.2903, y: 1.78669), controlPoint1: NSPoint(x: 22.3733, y: 1.69269), controlPoint2: NSPoint(x: 22.3318, y: 1.74169))
-            path.curve(to: NSPoint(x: 20.9657, y: 2.39121), controlPoint1: NSPoint(x: 21.9317, y: 2.1697), controlPoint2: NSPoint(x: 21.5127, y: 2.42121))
-            path.curve(to: NSPoint(x: 18.8787, y: 3.20973), controlPoint1: NSPoint(x: 20.1657, y: 2.34621), controlPoint2: NSPoint(x: 19.4827, y: 2.59771))
-            path.curve(to: NSPoint(x: 17.6746, y: 1.71569), controlPoint1: NSPoint(x: 18.7502, y: 2.45521), controlPoint2: NSPoint(x: 18.3236, y: 2.0047))
-            path.curve(to: NSPoint(x: 16.7536, y: 1.08867), controlPoint1: NSPoint(x: 17.3351, y: 1.56568), controlPoint2: NSPoint(x: 16.9916, y: 1.41518))
-            path.curve(to: NSPoint(x: 16.4591, y: 0.341647), controlPoint1: NSPoint(x: 16.5876, y: 0.856163), controlPoint2: NSPoint(x: 16.5421, y: 0.597155))
-            path.curve(to: NSPoint(x: 16.1761, y: 0.00363739), controlPoint1: NSPoint(x: 16.4061, y: 0.187643), controlPoint2: NSPoint(x: 16.3536, y: 0.0301382))
-            path.curve(to: NSPoint(x: 15.8326, y: 0.270145), controlPoint1: NSPoint(x: 15.9836, y: -0.0263635), controlPoint2: NSPoint(x: 15.9081, y: 0.135141))
-            path.curve(to: NSPoint(x: 15.4251, y: 2.0462), controlPoint1: NSPoint(x: 15.5306, y: 0.822162), controlPoint2: NSPoint(x: 15.4136, y: 1.43018))
-            path.curve(to: NSPoint(x: 17.1991, y: 5.3203), controlPoint1: NSPoint(x: 15.4516, y: 3.43174), controlPoint2: NSPoint(x: 16.0366, y: 4.53527))
-            path.curve(to: NSPoint(x: 17.3236, y: 5.63181), controlPoint1: NSPoint(x: 17.3311, y: 5.4103), controlPoint2: NSPoint(x: 17.3651, y: 5.5003))
-            path.curve(to: NSPoint(x: 17.0671, y: 6.43533), controlPoint1: NSPoint(x: 17.2441, y: 5.90231), controlPoint2: NSPoint(x: 17.1501, y: 6.16482))
-            path.curve(to: NSPoint(x: 16.7501, y: 6.57033), controlPoint1: NSPoint(x: 17.0141, y: 6.60784), controlPoint2: NSPoint(x: 16.9351, y: 6.64584))
-            path.curve(to: NSPoint(x: 15.074, y: 5.4328), controlPoint1: NSPoint(x: 16.1121, y: 6.30383), controlPoint2: NSPoint(x: 15.5611, y: 5.90931))
-            path.curve(to: NSPoint(x: 12.568, y: 3.05973), controlPoint1: NSPoint(x: 14.2475, y: 4.63328), controlPoint2: NSPoint(x: 13.5, y: 3.75075))
-            path.curve(to: NSPoint(x: 11.9034, y: 2.60522), controlPoint1: NSPoint(x: 12.349, y: 2.89822), controlPoint2: NSPoint(x: 12.13, y: 2.74822))
-            path.curve(to: NSPoint(x: 12.277, y: 0.833162), controlPoint1: NSPoint(x: 10.9524, y: 1.68169), controlPoint2: NSPoint(x: 12.028, y: 0.923165))
-            path.curve(to: NSPoint(x: 11.5259, y: 0.42015), controlPoint1: NSPoint(x: 12.5375, y: 0.739159), controlPoint2: NSPoint(x: 12.3675, y: 0.41615))
-            path.curve(to: NSPoint(x: 8.93286, y: 1.08117), controlPoint1: NSPoint(x: 10.6844, y: 0.42365), controlPoint2: NSPoint(x: 9.91439, y: 0.705658))
-            path.curve(to: NSPoint(x: 8.48384, y: 1.21267), controlPoint1: NSPoint(x: 8.78935, y: 1.13767), controlPoint2: NSPoint(x: 8.63835, y: 1.17867))
-            path.curve(to: NSPoint(x: 5.70226, y: 1.11517), controlPoint1: NSPoint(x: 7.59332, y: 1.04367), controlPoint2: NSPoint(x: 6.66829, y: 1.00617))
-            path.curve(to: NSPoint(x: 1.36213, y: 3.64575), controlPoint1: NSPoint(x: 3.88321, y: 1.31768), controlPoint2: NSPoint(x: 2.43016, y: 2.1777))
-            path.curve(to: NSPoint(x: 0.146595, y: 9.50642), controlPoint1: NSPoint(x: 0.0790928, y: 5.4103), controlPoint2: NSPoint(x: -0.222916, y: 7.41536))
-            path.curve(to: NSPoint(x: 3.38869, y: 14.9616), controlPoint1: NSPoint(x: 0.535106, y: 11.7105), controlPoint2: NSPoint(x: 1.66014, y: 13.535))
-            path.curve(to: NSPoint(x: 9.60138, y: 17.0266), controlPoint1: NSPoint(x: 5.18125, y: 16.4406), controlPoint2: NSPoint(x: 7.24581, y: 17.1657))
-            path.curve(to: NSPoint(x: 14.421, y: 15.2321), controlPoint1: NSPoint(x: 11.0319, y: 16.9441), controlPoint2: NSPoint(x: 12.6245, y: 16.7526))
-            path.curve(to: NSPoint(x: 16.1381, y: 15.6151), controlPoint1: NSPoint(x: 14.874, y: 15.4576), controlPoint2: NSPoint(x: 15.3496, y: 15.5476))
-            path.curve(to: NSPoint(x: 17.7836, y: 15.4911), controlPoint1: NSPoint(x: 16.7456, y: 15.6716), controlPoint2: NSPoint(x: 17.3306, y: 15.5851))
-            path.curve(to: NSPoint(x: 18.1876, y: 14.5636), controlPoint1: NSPoint(x: 18.4931, y: 15.3411), controlPoint2: NSPoint(x: 18.4441, y: 14.6841))
-            path.curve(to: NSPoint(x: 16.1496, y: 13.67), controlPoint1: NSPoint(x: 16.1081, y: 13.595), controlPoint2: NSPoint(x: 16.5646, y: 13.9891))
-            path.curve(to: NSPoint(x: 19.3182, y: 7.17235), controlPoint1: NSPoint(x: 17.2061, y: 12.42), controlPoint2: NSPoint(x: 18.8202, y: 10.1979))
-            path.curve(to: NSPoint(x: 19.4222, y: 6.09732), controlPoint1: NSPoint(x: 19.3672, y: 6.83834), controlPoint2: NSPoint(x: 19.4297, y: 6.36783))
-            path.curve(to: NSPoint(x: 19.6447, y: 5.84931), controlPoint1: NSPoint(x: 19.4182, y: 5.93231), controlPoint2: NSPoint(x: 19.4562, y: 5.86831))
-            path.curve(to: NSPoint(x: 21.1357, y: 5.3913), controlPoint1: NSPoint(x: 20.1657, y: 5.78931), controlPoint2: NSPoint(x: 20.6712, y: 5.64681))
-            path.curve(to: NSPoint(x: 23.1548, y: 1.9972), controlPoint1: NSPoint(x: 22.4833, y: 4.65528), controlPoint2: NSPoint(x: 23.0268, y: 3.44624))
-            path.curve(to: NSPoint(x: 22.9168, y: 1.43018), controlPoint1: NSPoint(x: 23.1738, y: 1.77569), controlPoint2: NSPoint(x: 23.1508, y: 1.54668))
-            path.close()
-            path.move(to: NSPoint(x: 11.1749, y: 14.4736))
-            path.curve(to: NSPoint(x: 7.77832, y: 12.39), controlPoint1: NSPoint(x: 9.15936, y: 12.889), controlPoint2: NSPoint(x: 8.18184, y: 12.3675))
-            path.curve(to: NSPoint(x: 7.55182, y: 13.126), controlPoint1: NSPoint(x: 7.40081, y: 12.4125), controlPoint2: NSPoint(x: 7.46881, y: 12.8445))
-            path.curve(to: NSPoint(x: 7.91033, y: 13.8396), controlPoint1: NSPoint(x: 7.63882, y: 13.404), controlPoint2: NSPoint(x: 7.75182, y: 13.5955))
-            path.curve(to: NSPoint(x: 7.80083, y: 14.4216), controlPoint1: NSPoint(x: 8.01983, y: 14.0011), controlPoint2: NSPoint(x: 8.09533, y: 14.2411))
-            path.curve(to: NSPoint(x: 5.97027, y: 14.2601), controlPoint1: NSPoint(x: 7.15181, y: 14.8231), controlPoint2: NSPoint(x: 6.02327, y: 14.2866))
-            path.curve(to: NSPoint(x: 2.78467, y: 11.069), controlPoint1: NSPoint(x: 4.65673, y: 13.4865), controlPoint2: NSPoint(x: 3.5587, y: 12.4655))
-            path.curve(to: NSPoint(x: 1.53164, y: 6.74384), controlPoint1: NSPoint(x: 2.03715, y: 9.72493), controlPoint2: NSPoint(x: 1.60314, y: 8.28289))
-            path.curve(to: NSPoint(x: 1.99215, y: 6.17332), controlPoint1: NSPoint(x: 1.51264, y: 6.37233), controlPoint2: NSPoint(x: 1.62214, y: 6.24082))
-            path.curve(to: NSPoint(x: 3.46769, y: 6.13582), controlPoint1: NSPoint(x: 2.47916, y: 6.08332), controlPoint2: NSPoint(x: 2.98118, y: 6.06432))
-            path.curve(to: NSPoint(x: 8.74385, y: 8.8129), controlPoint1: NSPoint(x: 5.52476, y: 6.43633), controlPoint2: NSPoint(x: 7.27581, y: 7.35586))
-            path.curve(to: NSPoint(x: 10.8689, y: 11.6025), controlPoint1: NSPoint(x: 9.58188, y: 9.64243), controlPoint2: NSPoint(x: 10.2159, y: 10.634))
-            path.curve(to: NSPoint(x: 13.262, y: 14.4146), controlPoint1: NSPoint(x: 11.5634, y: 12.631), controlPoint2: NSPoint(x: 12.3105, y: 13.611))
-            path.curve(to: NSPoint(x: 14.1225, y: 15.0681), controlPoint1: NSPoint(x: 13.598, y: 14.6961), controlPoint2: NSPoint(x: 13.866, y: 14.9101))
-            path.curve(to: NSPoint(x: 11.1749, y: 14.4746), controlPoint1: NSPoint(x: 13.349, y: 15.1546), controlPoint2: NSPoint(x: 12.058, y: 15.1731))
-            path.line(to: NSPoint(x: 11.1749, y: 14.4736))
-            path.close()
-            path.move(to: NSPoint(x: 12.141, y: 8.25988))
-            path.curve(to: NSPoint(x: 12.439, y: 7.96338), controlPoint1: NSPoint(x: 12.141, y: 8.09488), controlPoint2: NSPoint(x: 12.273, y: 7.96338))
-            path.curve(to: NSPoint(x: 12.541, y: 7.98188), controlPoint1: NSPoint(x: 12.4765, y: 7.96338), controlPoint2: NSPoint(x: 12.5105, y: 7.97088))
-            path.curve(to: NSPoint(x: 12.6505, y: 8.05338), controlPoint1: NSPoint(x: 12.5825, y: 7.99688), controlPoint2: NSPoint(x: 12.6205, y: 8.01938))
-            path.curve(to: NSPoint(x: 12.7335, y: 8.25988), controlPoint1: NSPoint(x: 12.7035, y: 8.10588), controlPoint2: NSPoint(x: 12.7335, y: 8.18088))
-            path.curve(to: NSPoint(x: 12.4355, y: 8.55639), controlPoint1: NSPoint(x: 12.7335, y: 8.42489), controlPoint2: NSPoint(x: 12.6015, y: 8.55639))
-            path.curve(to: NSPoint(x: 12.141, y: 8.25988), controlPoint1: NSPoint(x: 12.2695, y: 8.55639), controlPoint2: NSPoint(x: 12.141, y: 8.42489))
-            path.close()
-            path.move(to: NSPoint(x: 15.1415, y: 9.79893))
-            path.curve(to: NSPoint(x: 14.5715, y: 9.95294), controlPoint1: NSPoint(x: 14.949, y: 9.87793), controlPoint2: NSPoint(x: 14.7565, y: 9.94544))
-            path.curve(to: NSPoint(x: 13.8015, y: 9.70893), controlPoint1: NSPoint(x: 14.2845, y: 9.96794), controlPoint2: NSPoint(x: 13.9715, y: 9.85143))
-            path.curve(to: NSPoint(x: 13.2695, y: 8.97691), controlPoint1: NSPoint(x: 13.5375, y: 9.48742), controlPoint2: NSPoint(x: 13.3485, y: 9.36342))
-            path.curve(to: NSPoint(x: 13.2845, y: 8.40989), controlPoint1: NSPoint(x: 13.2355, y: 8.8119), controlPoint2: NSPoint(x: 13.2545, y: 8.55639))
-            path.curve(to: NSPoint(x: 13.0545, y: 7.70787), controlPoint1: NSPoint(x: 13.3525, y: 8.09438), controlPoint2: NSPoint(x: 13.277, y: 7.89187))
-            path.curve(to: NSPoint(x: 12.39, y: 7.51636), controlPoint1: NSPoint(x: 12.8735, y: 7.55786), controlPoint2: NSPoint(x: 12.643, y: 7.51636))
-            path.curve(to: NSPoint(x: 12.1445, y: 7.44136), controlPoint1: NSPoint(x: 12.2955, y: 7.51636), controlPoint2: NSPoint(x: 12.209, y: 7.47486))
-            path.curve(to: NSPoint(x: 12.035, y: 7.09585), controlPoint1: NSPoint(x: 12.039, y: 7.38886), controlPoint2: NSPoint(x: 11.9519, y: 7.25735))
-            path.curve(to: NSPoint(x: 12.22, y: 6.89334), controlPoint1: NSPoint(x: 12.0615, y: 7.04335), controlPoint2: NSPoint(x: 12.19, y: 6.91584))
-            path.curve(to: NSPoint(x: 13.326, y: 6.90834), controlPoint1: NSPoint(x: 12.5635, y: 6.69784), controlPoint2: NSPoint(x: 12.9595, y: 6.76184))
-            path.curve(to: NSPoint(x: 14.292, y: 7.66287), controlPoint1: NSPoint(x: 13.6655, y: 7.04735), controlPoint2: NSPoint(x: 13.9225, y: 7.30236))
-            path.curve(to: NSPoint(x: 14.9525, y: 8.54539), controlPoint1: NSPoint(x: 14.6695, y: 8.09838), controlPoint2: NSPoint(x: 14.7375, y: 8.21838))
-            path.curve(to: NSPoint(x: 15.3831, y: 9.36392), controlPoint1: NSPoint(x: 15.1225, y: 8.8009), controlPoint2: NSPoint(x: 15.277, y: 9.06341))
-            path.curve(to: NSPoint(x: 15.1415, y: 9.79893), controlPoint1: NSPoint(x: 15.4471, y: 9.55142), controlPoint2: NSPoint(x: 15.3641, y: 9.70493))
-            path.close()
-            let scale = (rect.width - 2) / 23.16
-            var transform = AffineTransform()
-            transform.translate(x: rect.midX - 23.16 * scale / 2, y: rect.midY + 17.04 * scale / 2)
-            transform.scale(x: scale, y: -scale)
-            path.transform(using: transform)
-            path.windingRule = .nonZero
-            NSColor.black.setFill()
-            path.fill()
-            return true
-        }
-        image.isTemplate = true
-        return image
-    }
-
     /// 菜单头部的状态色点：纯色实心圆，颜色跟随 mood。
     private static func makeColoredDot(color: Color, size: CGFloat = 10) -> NSImage {
         NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
@@ -1578,7 +1450,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             selector: #selector(selectWorkspaceFromMenu)
         ))
         appMenu.addItem(makeMenuItem(
-            title: "打开 Harness",
+            title: "打开 DSH",
             selector: #selector(openHarnessFromMenu)
         ))
         appMenu.addItem(.separator())
@@ -1611,7 +1483,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         windowMenu.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         windowMenu.addItem(withTitle: "缩放", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
         windowMenu.addItem(.separator())
-        addWindowInteractionItems(to: windowMenu)
+        windowMenu.addItem(makeMenuItem(title: "固定窗口", selector: #selector(toggleResearchWindowPin)))
         windowMenuItem.submenu = windowMenu
         mainMenu.addItem(windowMenuItem)
 
@@ -1652,7 +1524,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             panel = existing
         } else {
             let p = NSPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 1060, height: 530),
+                contentRect: NSRect(origin: .zero, size: SettingsPanelView.initialSize),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered,
                 defer: false
@@ -1660,9 +1532,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             p.title = "科研助手设置"
             p.isReleasedWhenClosed = false
             p.hidesOnDeactivate = false
-            p.contentMinSize = NSSize(width: 980, height: 520)
+            p.contentMinSize = SettingsPanelView.minimumSize
             p.setFrameAutosaveName("DSHPetSettingsSidebar")
-            p.contentView = NSHostingView(rootView: SettingsPanelView(model: model))
+            let hosting = NSHostingView(rootView: SettingsPanelView(model: model))
+            hosting.sizingOptions = []
+            p.contentView = hosting
             p.center()
             settingsPanel = p
             panel = p
