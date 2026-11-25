@@ -1,6 +1,6 @@
 # 构建与发布
 
-在 Git 的干净检出目录运行以下命令。从源码重建 v0.3.0 时先检出 `v0.3.0` 标签，开发分支可运行同一脚本。需要 macOS、完整 Xcode（含 SwiftPM、XCTest 和当前 macOS SDK）、Python 3.9 或更新版本、Node 和 pnpm。版本要求见 `package.json`，依赖按 `pnpm-lock.yaml` 安装。首次安装锁定依赖需要访问 npm。构建与测试不需要 DSH 登录或模型额度。
+在 Git 的干净检出目录运行以下命令。从源码重建 v0.3.1 时先检出 `v0.3.1` 标签，开发分支可运行同一脚本。需要 macOS、完整 Xcode（含 SwiftPM、XCTest 和当前 macOS SDK）、Python 3.9 或更新版本、Node 和 pnpm。版本要求见 `package.json`，依赖按 `pnpm-lock.yaml` 安装。首次安装锁定依赖需要访问 npm。构建与测试不需要 DSH 登录或模型额度。
 
 ```sh
 python3 scripts/release.py
@@ -51,11 +51,11 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 
 ## 发布版本
 
-v0.3.0 采用 App 版本号及构建号 `0.3.0`。公开包内的 App 采用 ad hoc 签名，未经 Apple 公证。常规 CI 只做构建和校验，发布由维护者在仓库中操作。
+v0.3.1 采用 App 版本号及构建号 `0.3.1`。公开包内的 App 采用 ad hoc 签名，未经 Apple 公证。常规 CI 只做构建和校验，发布由维护者在仓库中操作。
 
 1. 核对候选提交、版本标签和构建输入。在审核过的干净检出目录运行 `python3 scripts/audit-source.py --history`，检查暂存区与本地引用可达的提交。另行复核截图、第三方声明，以及 GitHub 上的附件、Actions 日志和产物。
 2. 核对标签指向实际构建提交，并验证原始镜像。脚本的 `--tag` 只检查版本字符串。已有标签的版本保留原提交和原附件，软件实现变更应更新版本并打新标签。
-3. 将通过验证的 DMG 和 `.sha256` 上传到对应 Release。发行说明列出测试环境、签名和公证状态、需另装的宿主、账号要求与实机验收范围。[v0.3.0 发行页](https://github.com/mxk021/ResearchCompanion/releases/tag/v0.3.0)
+3. 将通过验证的 DMG 和 `.sha256` 上传到对应 Release。发行说明列出测试环境、签名和公证状态、需另装的宿主、账号要求与实机验收范围。[v0.3.1 发行页](https://github.com/mxk021/ResearchCompanion/releases/tag/v0.3.1)
 4. 发布后以该仓库可见性允许的权限重新下载附件。核对 SHA-256，挂载镜像并验证 App 的版本、架构、签名和安装内容。[GitHub Releases](https://github.com/mxk021/ResearchCompanion/releases)
 
 ## 可选的 Developer ID 签名与 Apple 公证

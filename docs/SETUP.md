@@ -1,10 +1,10 @@
 # 安装和首次使用
 
-v0.3.0 的公开安装包适用于 Apple Silicon Mac（arm64），最低部署目标为 macOS 14.0。实机验收范围见发行说明。[v0.3.0 发行页](https://github.com/mxk021/ResearchCompanion/releases/tag/v0.3.0)
+v0.3.1 的公开安装包适用于 Apple Silicon Mac（arm64），最低部署目标为 macOS 14.0。实机验收范围见发行说明。[v0.3.1 发行页](https://github.com/mxk021/ResearchCompanion/releases/tag/v0.3.1)
 
 ## 下载与首次打开
 
-1. 从发行页的 **Assets** 下载 `ResearchCompanion-0.3.0-arm64.dmg` 和 `ResearchCompanion-0.3.0-arm64.dmg.sha256`。在两者所在的目录运行 `shasum -a 256 -c ResearchCompanion-0.3.0-arm64.dmg.sha256`，确认输出为 `OK`。如果摘要不符，请丢弃该副本，从同一发行页重新下载。[v0.3.0 发行页](https://github.com/mxk021/ResearchCompanion/releases/tag/v0.3.0)
+1. 从发行页的 **Assets** 下载 `ResearchCompanion-0.3.1-arm64.dmg` 和 `ResearchCompanion-0.3.1-arm64.dmg.sha256`。在两者所在的目录运行 `shasum -a 256 -c ResearchCompanion-0.3.1-arm64.dmg.sha256`，确认输出为 `OK`。如果摘要不符，请丢弃该副本，从同一发行页重新下载。[v0.3.1 发行页](https://github.com/mxk021/ResearchCompanion/releases/tag/v0.3.1)
 2. 打开 DMG，把 **Research Companion** 拖进「应用程序」。从「应用程序」双击打开。升级时，先退出正在运行的科研助手，再在同一位置替换应用，打开后通过菜单 **关于科研助手** 核对版本。
 3. 公开包采用 ad hoc 签名，未经 Apple 公证。若 macOS 提示无法验证开发者，请先核实下载来源和摘要。仅在你信任来源且摘要一致时，尝试打开应用，再进入 **系统设置 → 隐私与安全性**，对本次拦截点「仍要打开」，按系统提示确认。如果系统提示 App 已损坏或会损坏电脑，请停止安装。受组织管理的 Mac 可能需要联系管理员。[Apple 官方说明](https://support.apple.com/zh-cn/102445)
 
@@ -22,6 +22,10 @@ v0.3.0 的公开安装包适用于 Apple Silicon Mac（arm64），最低部署�
 3. 用 **选取文字** 或原应用的 **服务 → 选取文字（科研助手）** 取得选区。核对预览后可在输入框要求翻译或解释。重新取词失败时，可选择 **使用上次选区**。系统服务只交付正文，出处无法核对时会注明。没有可用选区时，仍可提问已关联的文件。
 4. 在回答中点 **打开原文**，核对原文件版本、页位和高亮标注。回答用了多个位置时，可点 **上一处** 或 **下一处**。复杂版式可能造成图注边界、公式或阅读顺序识别不完整，遇到「待核对」提示时可在原页确认。使用了背景论文时，也可从 **来源 → 打开背景文件原文** 查看。
 5. 点回答旁的 **保存为笔记**，或在其菜单选择 **另存为…**。Markdown 保存回答、所选公式和可核对的文字摘录。原页裁图保留在会话来源中供查看。
+
+## 固定科研窗口
+
+从应用的 **窗口** 菜单或系统菜单栏的科研助手图标开启 **固定窗口**，科研对话会显示在其他普通窗口上方。固定后可开启 **点击穿透**，让鼠标点击落到下方的阅读器。要重新操作科研对话，从任一菜单关闭 **点击穿透**。取消固定也会关闭穿透。两项设置在重启后恢复。
 
 ## 可选的系统权限和 Zotero
 

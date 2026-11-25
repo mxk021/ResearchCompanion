@@ -110,7 +110,7 @@ private struct PetContextView: View {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private let model = DSHPetModel.shared
     private var panel: DSHPetPanel?
     private var composerPanel: DSHPetComposerPanel?
@@ -996,6 +996,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             title: "打开科研对话",
             selector: #selector(showComposer)
         ))
+        addWindowInteractionItems(to: menu)
 
         togglePetMenuItem = makeMenuItem(
             title: PetSettings.shared.isPetVisible ? "隐藏宠物" : "显示宠物",
@@ -1049,6 +1050,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let item = NSMenuItem(title: title, action: selector, keyEquivalent: keyEquivalent)
         item.target = self
         return item
+    }
+
+    private func addWindowInteractionItems(to menu: NSMenu) {
+        menu.addItem(makeMenuItem(title: "固定窗口", selector: #selector(toggleResearchWindowPin)))
+        menu.addItem(makeMenuItem(title: "点击穿透", selector: #selector(toggleResearchWindowClickThrough)))
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(toggleResearchWindowPin):
+            menuItem.state = researchWindow?.isPinned == true ? .on : .off
+            return researchWindow != nil
+        case #selector(toggleResearchWindowClickThrough):
+            menuItem.state = researchWindow?.allowsClickThrough == true ? .on : .off
+            return researchWindow?.isPinned == true
+        default:
+            return true
+        }
+    }
+
+    @objc private func toggleResearchWindowPin() {
+        researchWindow?.togglePinned()
+    }
+
+    @objc private func toggleResearchWindowClickThrough() {
+        researchWindow?.toggleClickThrough()
     }
 
     @objc private func togglePetVisibility() {
@@ -1583,6 +1610,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowMenu.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         windowMenu.addItem(withTitle: "缩放", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        windowMenu.addItem(.separator())
+        addWindowInteractionItems(to: windowMenu)
         windowMenuItem.submenu = windowMenu
         mainMenu.addItem(windowMenuItem)
 
