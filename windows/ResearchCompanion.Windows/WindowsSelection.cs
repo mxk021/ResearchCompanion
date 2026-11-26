@@ -25,6 +25,12 @@ public sealed record WindowsSelectionResult(
     string Text, string Application, string? Title, string? Url,
     bool ProvenanceVerified, bool ClipboardWasReplaced);
 
+internal sealed class WindowsSelectionCaptureException(string message, bool canTryNativeCopy = false)
+    : InvalidOperationException(message)
+{
+    internal bool CanTryNativeCopy { get; } = canTryNativeCopy;
+}
+
 /// <summary>Tracks window identity only. Selection and clipboard reads require an explicit capture.</summary>
 public sealed class WindowsSelection : IDisposable
 {
@@ -49,6 +55,8 @@ public sealed class WindowsSelection : IDisposable
     private Task<DirectRead>? _directRead;
     private long _copyIssuedAt;
     private bool _disposed;
+
+    internal string? ZoteroPairingFile { get; set; }
 
     public WindowsSelection()
     {
@@ -99,7 +107,9 @@ public sealed class WindowsSelection : IDisposable
             }
 
             if (!allowCopy || !source.CopyAllowed)
-                throw Failure("当前控件未提供可读选区。请在原应用手动复制，再粘贴选区。");
+                throw new WindowsSelectionCaptureException(
+                    "当前控件未提供可读选区。可以在原应用复制后粘贴选区。",
+                    canTryNativeCopy: !allowCopy && source.CopyAllowed);
             return await CopyAsync(attempt, cancellationToken);
         }
         finally
@@ -352,7 +362,7 @@ public sealed class WindowsSelection : IDisposable
             else if (sequence != 0 && sequence != initial && Stopwatch.GetElapsedTime(lastChange) >= ClipboardSettle)
             {
                 var owner = Native.GetClipboardOwner();
-                if (owner == 0 || ProcessId(owner) != attempt.Source.Pid)
+                if (!ClipboardSourceMatches(owner, attempt.Source))
                     throw Failure("无法确认剪贴板由原窗口更新。请选择手动复制。");
                 string? text;
                 try
@@ -373,6 +383,31 @@ public sealed class WindowsSelection : IDisposable
             await Task.Delay(20, cancellationToken);
         } while (Stopwatch.GetElapsedTime(_copyIssuedAt) < CopyTimeout);
         throw Failure("未确认本次复制的选区。请手动复制；自动复制可能已改变剪贴板。");
+    }
+
+    private static bool ClipboardSourceMatches(nint owner, SourceWindow source)
+    {
+        int writerPid = ProcessId(owner);
+        if (writerPid == source.Pid) return true;
+        if (writerPid == 0 || source.Application != "WPS") return false;
+
+        // WPS hosts the document window in wps.exe and uses a sibling PDF process
+        // to own the clipboard. Other applications must still match the original PID.
+        try
+        {
+            using var windowProcess = Process.GetProcessById(source.Pid);
+            using var writerProcess = Process.GetProcessById(writerPid);
+            var windowPath = windowProcess.MainModule?.FileName;
+            var writerPath = writerProcess.MainModule?.FileName;
+            return windowProcess.SessionId == writerProcess.SessionId &&
+                string.Equals(Path.GetFileName(windowPath), "wps.exe", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(Path.GetFileName(writerPath), "wpspdf.exe", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(Path.GetDirectoryName(windowPath), Path.GetDirectoryName(writerPath), StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception error) when (error is InvalidOperationException or ArgumentException or System.ComponentModel.Win32Exception)
+        {
+            return false;
+        }
     }
 
     private async Task<WindowsSelectionResult?> ReadZoteroAsync(Attempt attempt, CancellationToken cancellationToken)
@@ -440,10 +475,11 @@ public sealed class WindowsSelection : IDisposable
         catch (JsonException) { return null; }
     }
 
-    private static Pairing? ZoteroPairing()
+    private Pairing? ZoteroPairing()
     {
         try
         {
+            if (ZoteroPairingFile is { Length: > 0 } chosen) return ReadZoteroPairing(chosen);
             var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Zotero", "Zotero");
             var ini = ReadSafeFile(Path.Combine(root, "profiles.ini"), 64 * 1024);
             var profiles = new List<Dictionary<string, string>>();
@@ -470,20 +506,35 @@ public sealed class WindowsSelection : IDisposable
             }
             else if (active.GetValueOrDefault("IsRelative") != "0" || !Path.IsPathFullyQualified(profilePath) ||
                      profilePath.StartsWith(@"\\", StringComparison.Ordinal)) return null;
-            using var json = JsonDocument.Parse(ReadSafeFile(Path.Combine(profilePath, "dsh-companion-bridge", "pairing.json"), 4096));
-            var token = GetString(json.RootElement, "token");
-            var endpoint = GetString(json.RootElement, "endpoint") ?? "http://127.0.0.1:23119/dsh-companion/context";
-            if (token is null || !Regex.IsMatch(token, "\\A[a-f0-9]{64}\\z") ||
-                !Uri.TryCreate(endpoint, UriKind.Absolute, out var location) || location.Scheme != "http" ||
-                location.Host != "127.0.0.1" || location.AbsolutePath != "/dsh-companion/context" ||
-                location.UserInfo.Length != 0 || location.Query.Length != 0 || location.Fragment.Length != 0)
-                return null;
-            return new Pairing(token, location);
+            return ReadZoteroPairing(Path.Combine(profilePath, "dsh-companion-bridge", "pairing.json"));
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException or ArgumentException or NotSupportedException)
         {
             return null;
         }
+    }
+
+    internal static bool IsZoteroPairingFile(string path)
+    {
+        try { return ReadZoteroPairing(path) != null; }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException or ArgumentException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private static Pairing? ReadZoteroPairing(string path)
+    {
+        if (!Path.IsPathFullyQualified(path) || path.StartsWith(@"\\", StringComparison.Ordinal)) return null;
+        using var json = JsonDocument.Parse(ReadSafeFile(path, 4096));
+        var token = GetString(json.RootElement, "token");
+        var endpoint = GetString(json.RootElement, "endpoint") ?? "http://127.0.0.1:23119/dsh-companion/context";
+        if (token is null || !Regex.IsMatch(token, "\\A[a-f0-9]{64}\\z") ||
+            !Uri.TryCreate(endpoint, UriKind.Absolute, out var location) || location.Scheme != "http" ||
+            location.Host != "127.0.0.1" || location.AbsolutePath != "/dsh-companion/context" ||
+            location.UserInfo.Length != 0 || location.Query.Length != 0 || location.Fragment.Length != 0)
+            return null;
+        return new Pairing(token, location);
     }
 
     private static byte[] ReadSafeFile(string path, int limit)

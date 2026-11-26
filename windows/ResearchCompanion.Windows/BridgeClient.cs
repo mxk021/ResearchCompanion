@@ -45,6 +45,12 @@ public sealed class BridgeClient : IAsyncDisposable
     }
 
     public JsonElement Capabilities { get; private set; }
+    public JsonElement AttachmentLimits => Capabilities.TryGetProperty("attachmentLimits", out var limits) ? limits : default;
+    public bool SupportsDocumentImages => Supports("researchDocumentImages");
+
+    private bool Supports(string feature) =>
+        Capabilities.TryGetProperty("supports", out var supports) && supports.ValueKind == JsonValueKind.Array &&
+        supports.EnumerateArray().Any(item => item.ValueKind == JsonValueKind.String && item.GetString() == feature);
 
     public static async Task<BridgeClient> ConnectAsync(CancellationToken ct = default)
     {
@@ -132,6 +138,51 @@ public sealed class BridgeClient : IAsyncDisposable
         return InvokeAsync(action, fields, timeout, ct);
     }
 
+    public async Task SubscribeResearchAsync(string sessionId, Func<JsonElement, Task> onStream, CancellationToken ct = default)
+    {
+        if (!Supports("researchStream") || !Supports("subscribe")) return;
+        using var pipe = CreatePipe();
+        using var handshake = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        handshake.CancelAfter(TimeSpan.FromSeconds(5));
+        var lines = await ConnectPipeAsync(pipe, handshake.Token).ConfigureAwait(false);
+        string id = Guid.NewGuid().ToString();
+        await lines.WriteAsync(EncodeRequest(id, "subscribe", new { sessionId }), handshake.Token).ConfigureAwait(false);
+        bool subscribed = false;
+        while (!ct.IsCancellationRequested)
+        {
+            JsonElement item = await lines.ReadAsync(MaxResponseBytes, subscribed ? ct : handshake.Token).ConfigureAwait(false);
+            if (StringValue(item, "id") == id)
+            {
+                if (!item.TryGetProperty("ok", out var ok) || ok.ValueKind != JsonValueKind.True)
+                    throw new IOException("科研桥未能订阅该会话的流式回复。");
+                handshake.CancelAfter(Timeout.InfiniteTimeSpan);
+                subscribed = true;
+            }
+            else if (subscribed && StringValue(item, "event") == "researchStream" &&
+                StringValue(item, "sessionId") == sessionId && item.TryGetProperty("state", out var state) &&
+                state.ValueKind == JsonValueKind.Object)
+            {
+                await onStream(state).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private NamedPipeClientStream CreatePipe() => new(".", endpoint.PipeName, PipeDirection.InOut,
+        PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly, TokenImpersonationLevel.Anonymous);
+
+    private async Task<PipeLines> ConnectPipeAsync(NamedPipeClientStream pipe, CancellationToken ct)
+    {
+        var secret = credential ?? throw new ObjectDisposedException(nameof(BridgeClient));
+        await pipe.ConnectAsync(ct).ConfigureAwait(false);
+        if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle, out uint pid) || pid != (uint)endpoint.Pid
+            || !GetNamedPipeServerSessionId(pipe.SafePipeHandle, out uint session) || session != (uint)endpoint.SessionId)
+            throw new IOException("科研桥的进程或会话身份已变化。");
+
+        var lines = new PipeLines(pipe);
+        await AuthenticateAsync(lines, secret, ct).ConfigureAwait(false);
+        return lines;
+    }
+
     public ValueTask DisposeAsync()
     {
         var secret = Interlocked.Exchange(ref credential, null);
@@ -142,20 +193,12 @@ public sealed class BridgeClient : IAsyncDisposable
 
     private async Task<JsonElement> InvokeAsync(string action, object? fields, int timeout, CancellationToken ct)
     {
-        var secret = credential ?? throw new ObjectDisposedException(nameof(BridgeClient));
         using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(ct);
         lifetime.CancelAfter(timeout);
         try
         {
-            using var pipe = new NamedPipeClientStream(".", endpoint.PipeName, PipeDirection.InOut,
-                PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly, TokenImpersonationLevel.Anonymous);
-            await pipe.ConnectAsync(lifetime.Token).ConfigureAwait(false);
-            if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle, out uint pid) || pid != (uint)endpoint.Pid
-                || !GetNamedPipeServerSessionId(pipe.SafePipeHandle, out uint session) || session != (uint)endpoint.SessionId)
-                throw new IOException("科研桥的进程或会话身份已变化。");
-
-            var lines = new PipeLines(pipe);
-            await AuthenticateAsync(lines, secret, lifetime.Token).ConfigureAwait(false);
+            using var pipe = CreatePipe();
+            var lines = await ConnectPipeAsync(pipe, lifetime.Token).ConfigureAwait(false);
 
             string id = Guid.NewGuid().ToString();
             await lines.WriteAsync(EncodeRequest(id, action, fields), lifetime.Token).ConfigureAwait(false);

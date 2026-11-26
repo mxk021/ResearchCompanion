@@ -22,6 +22,8 @@ internal sealed partial class ResearchWindow
     private string? session;
     private string? blockedSession;
     private JsonElement lastConversation;
+    private JsonElement activeStream;
+    private int streamRevision = -1;
     private ModelChoice? chosenModel;
     private List<ModelChoice> models = new();
     private readonly Dictionary<string, SourceReceipt> receipts = new(StringComparer.Ordinal);
@@ -29,7 +31,7 @@ internal sealed partial class ResearchWindow
     private readonly Dictionary<string, ReplyNote> notes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> savedNotes = new(StringComparer.Ordinal);
 
-    private sealed record ModelChoice(string Name, string Provider, string Model, string? Effort)
+    private sealed record ModelChoice(string Name, string Provider, string Model, string? Effort, bool SupportsImages)
     {
         internal Dictionary<string, string> Wire()
         {
@@ -42,7 +44,15 @@ internal sealed partial class ResearchWindow
 
     private sealed record SourceReceipt(string RequestId, string Title, string Text, string Scope,
         string? Url, IReadOnlyList<DocumentExcerpt> Pages, bool DispatchVerified = false,
-        string? AppSourceLink = null, bool PositionVerified = false);
+        string? AppSourceLink = null, bool PositionVerified = false, IReadOnlyList<CropReceipt>? Crops = null);
+    private sealed record CropReceipt(int Page, string Sha256);
+    private sealed record SourceCrop(CropReceipt Receipt, byte[] Bytes)
+    {
+        internal object Wire() => new
+        {
+            mediaType = "image/png", name = $"PDF-page-{Receipt.Page}.png", data = Convert.ToBase64String(Bytes)
+        };
+    }
     private sealed record ReplyNote(string Text, string? Question, SourceReceipt? Source);
 
     private async Task ConnectAsync()
@@ -67,6 +77,8 @@ internal sealed partial class ResearchWindow
                 session = null;
                 lastConversation = default;
                 receipts.Clear();
+                activeStream = default;
+                streamRevision = -1;
                 chosenModel = null;
                 models.Clear();
                 UpdateModelButton();
@@ -111,10 +123,11 @@ internal sealed partial class ResearchWindow
                 var name = Text(model, "name") ?? id;
                 if (provider == "deepseek-account") name += " · DeepSeek 账号";
                 var efforts = Array(Field(model, "reasoning"), "efforts").ToList();
-                if (efforts.Count == 0) result.Add(new(name, provider, id, null));
+                bool supportsImages = Array(model, "inputModalities").Any(item => item.ValueKind == JsonValueKind.String && item.GetString() == "image");
+                if (efforts.Count == 0) result.Add(new(name, provider, id, null, supportsImages));
                 foreach (var effort in efforts)
                     if (Text(effort, "id") is string value)
-                        result.Add(new(name + " · " + (Text(effort, "name") ?? value), provider, id, value));
+                        result.Add(new(name + " · " + (Text(effort, "name") ?? value), provider, id, value, supportsImages));
             }
         }
         models = result;
@@ -192,12 +205,27 @@ internal sealed partial class ResearchWindow
         }
         bool submitting = false;
         bool admitted = false;
+        using var streamCancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task? streamSubscription = null;
+        streamRevision = -1;
+        activeStream = default;
         SetBusy(true);
         try
         {
             status.Text = "正在核对材料…";
             string requestId = "dsh-pet-" + Guid.NewGuid();
             var source = include.IsChecked == true ? await PrepareSourceAsync(question, requestId, ct) : null;
+            IReadOnlyList<SourceCrop> crops = [];
+            if (source?.Pages.Any(page => page.VisualRegion != null) == true)
+            {
+                crops = await PrepareCropsAsync(document!, source, client, choice, ct);
+                source = source with
+                {
+                    Scope = (crops.Count > 0 ? "文档对象 · 原页裁图 · " : "文档对象 · 文字证据 · ") + source.Scope,
+                    Text = crops.Count > 0 ? source.Text : "【此轮仅附文字摘录。请说明无法从文字核对的原页图形或公式。】\n" + source.Text,
+                    Crops = crops.Select(crop => crop.Receipt).ToArray()
+                };
+            }
             if (session == null)
             {
                 var createdId = Guid.NewGuid().ToString();
@@ -213,6 +241,13 @@ internal sealed partial class ResearchWindow
                 if (Flag(current, "running")) throw new InvalidOperationException("此会话仍在运行，请等待当前任务完成。");
             }
             var id = session;
+            streamSubscription = client.SubscribeResearchAsync(id, state => Dispatcher.InvokeAsync(async () =>
+            {
+                // Keep the last visible text until the durable reply replaces it.
+                if (!streamCancellation.IsCancellationRequested && ReferenceEquals(connection, client) && session == id &&
+                    Field(state, "message").ValueKind == JsonValueKind.Object && MergeStream(state))
+                    await RenderAsync();
+            }).Task.Unwrap(), streamCancellation.Token);
             var modelRequest = Target(id);
             modelRequest["selection"] = choice.Wire();
             await client.RequestAsync("researchSelectModel", modelRequest, ct);
@@ -233,7 +268,7 @@ internal sealed partial class ResearchWindow
                 if (source.Pages.Count == 1) material["page"] = $"文件第 {source.Pages[0].Page} 页";
                 if (source.Url != null) material["url"] = source.Url;
                 request["material"] = material;
-                receipts[requestId] = source;
+                if (crops.Count > 0) request["images"] = crops.Select(crop => crop.Wire()).ToArray();
             }
             status.Text = "正在提交给 DSH…";
             submitting = true;
@@ -254,13 +289,15 @@ internal sealed partial class ResearchWindow
                 {
                     var verified = source with { DispatchVerified = true };
                     receipts[requestId] = verified;
-                    SaveReceipt(id, verified);
+                    SaveReceipt(id, verified, crops);
                     source = null;
                 }
                 lastConversation = reply;
-                await RenderAsync();
+                MergeStream(Field(reply, "stream"));
                 bool hasReply = Array(reply, "messages").Any(item =>
                     Text(item, "role") == "assistant" && Text(Field(item, "reply"), "requestId") == requestId);
+                if (hasReply) activeStream = default;
+                await RenderAsync();
                 if (!Flag(reply, "running") && hasReply)
                 {
                     status.Text = "回复完成";
@@ -292,9 +329,62 @@ internal sealed partial class ResearchWindow
         }
         finally
         {
-            waiting = null;
-            SetBusy(false);
+            streamCancellation.Cancel();
+            try
+            {
+                if (streamSubscription != null) await streamSubscription;
+            }
+            catch (Exception error) when (error is IOException or OperationCanceledException or TimeoutException or JsonException) { }
+            finally
+            {
+                waiting = null;
+                SetBusy(false);
+            }
         }
+    }
+
+    private bool MergeStream(JsonElement state)
+    {
+        int? revision = Field(state, "revision").TryReadInt();
+        if (revision == null || revision < streamRevision) return false;
+        var message = Field(state, "message");
+        if (revision == streamRevision && message.ValueKind != JsonValueKind.Null) return false;
+        streamRevision = revision.Value;
+        activeStream = message;
+        return true;
+    }
+
+    private static async Task<IReadOnlyList<SourceCrop>> PrepareCropsAsync(PdfEvidence file, SourceReceipt source,
+        BridgeClient client, ModelChoice choice, CancellationToken cancellationToken)
+    {
+        if (!choice.SupportsImages || !client.SupportsDocumentImages) return [];
+        var limits = client.AttachmentLimits;
+        if (!Array(limits, "mediaTypes").Any(item => item.ValueKind == JsonValueKind.String && item.GetString() == "image/png"))
+            return [];
+        int maxImages = Math.Min(4, Field(limits, "maxImagesPerMessage").TryReadInt() ?? 0);
+        int maxImageBytes = Field(limits, "maxImageBytes").TryReadInt() ?? 0;
+        int maxTotalBytes = Field(limits, "maxMessageImageBytes").TryReadInt() ?? 0;
+        var regions = source.Pages.Where(page => page.VisualRegion != null).ToList();
+        if (regions.Count > maxImages)
+            throw new InvalidDataException("本轮原页裁图超过模型限制，请缩小问题范围。");
+        var crops = new List<SourceCrop>();
+        long total = 0;
+        foreach (var page in regions)
+        {
+            var preview = await file.RenderCropAsync(page.Page, page.VisualRegion!.Value, cancellationToken);
+            var bitmap = BitmapSource.Create(preview.Width, preview.Height, 96, 96,
+                PixelFormats.Bgr32, null, preview.Pixels, preview.Stride);
+            var encoder = new PngBitmapEncoder();
+            encoder.Frames.Add(BitmapFrame.Create(bitmap));
+            using var encoded = new MemoryStream();
+            encoder.Save(encoded);
+            total += encoded.Length;
+            if (encoded.Length > maxImageBytes || total > maxTotalBytes)
+                throw new InvalidDataException("原页裁图超过 DSH 图像大小限制，请缩小问题范围。");
+            var bytes = encoded.ToArray();
+            crops.Add(new(new(page.Page, Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant()), bytes));
+        }
+        return crops;
     }
 
     private async Task<SourceReceipt?> PrepareSourceAsync(string question, string requestId, CancellationToken ct)
@@ -309,7 +399,9 @@ internal sealed partial class ResearchWindow
             throw new InvalidDataException("本轮请求限于选区，但当前没有可用选区。");
         IReadOnlyList<DocumentExcerpt> pages = currentDocument == null || useOnlySelection
             ? System.Array.Empty<DocumentExcerpt>() : await currentDocument.RetrieveAsync(question, ct);
-        var parts = pages.Select(page => $"【文件第 {page.Page} 页】\n{page.Text}").ToList();
+        var parts = pages.Select(page => page.Recognition is { Length: > 0 } recognized
+            ? $"【文件第 {page.Page} 页 · {recognized}】\n{page.Text}"
+            : $"【文件第 {page.Page} 页】\n{page.Text}").ToList();
         if (currentSelection != null)
             parts.Add((pages.Count == 0 ? "" : "【所选文字】\n") + currentSelection.Text);
         var text = string.Join("\n\n", parts);
@@ -332,13 +424,19 @@ internal sealed partial class ResearchWindow
         Field(proof, "utf16Length").TryReadInt() == source.Text.Length &&
         Text(Field(proof, "selection"), "provider") == choice.Provider &&
         Text(Field(proof, "selection"), "model") == choice.Model &&
-        Text(Field(proof, "selection"), "reasoningEffort") == choice.Effort;
+        Text(Field(proof, "selection"), "reasoningEffort") == choice.Effort &&
+        (source.Crops is not { Count: > 0 } crops ||
+            Array(proof, "sourceImages").Select(item => item.ValueKind == JsonValueKind.String ? item.GetString() : null)
+                .SequenceEqual(crops.Select(crop => crop.Sha256), StringComparer.OrdinalIgnoreCase) &&
+            Array(proof, "images").Count() == crops.Count);
 
     private async Task OpenSessionAsync(string? id)
     {
         if (busy) return;
         drafts[session ?? "empty"] = composer.Text;
         session = id;
+        activeStream = default;
+        streamRevision = -1;
         document = null;
         selection = null;
         chosenModel = null;
@@ -358,6 +456,7 @@ internal sealed partial class ResearchWindow
         if (session == null || connection == null) return;
         lastConversation = await connection.RequestAsync("conversation", Target(session), lifetime.Token);
         if (Text(lastConversation, "historyRevision") == null) throw new InvalidDataException("没有可用的会话数据。");
+        MergeStream(Field(lastConversation, "stream"));
         await RenderAsync();
     }
 
@@ -451,6 +550,9 @@ internal sealed partial class ResearchWindow
                 SourceDetails: scope, SourceWarning: contextTitle == null ? null : receipt?.DispatchVerified != true
                     ? "模型输入与出处未完整核验" : receipt.PositionVerified ? null : "出处未核验"));
         }
+        if (Text(activeStream, "role") == "assistant" && Text(activeStream, "id") is string streamId &&
+            Text(activeStream, "text") is { Length: > 0 } partial && !rows.Any(row => row.Id == "assistant:" + streamId))
+            rows.Add(new("assistant:" + streamId, "assistant", partial, Streaming: true));
         await transcript.PushAsync(session ?? "empty", rows, selection != null || document != null
             ? "材料已就绪。输入问题，或要求翻译、解释。" : "选取文字、选择文件，或直接输入问题。", jump);
     }
@@ -499,7 +601,36 @@ internal sealed partial class ResearchWindow
             IsReadOnly = true, Text = source.Scope + "\n\n" + source.Text, Margin = new Thickness(12),
             TextWrapping = TextWrapping.Wrap, VerticalScrollBarVisibility = ScrollBarVisibility.Auto
         };
-        Dialog(source.Title, area, 620, 525).ShowDialog();
+        var content = new DockPanel();
+        if (session != null && source.Crops is { Count: > 0 })
+        {
+            var toolbar = new WrapPanel { Margin = new Thickness(12, 8, 12, 0) };
+            foreach (var crop in source.Crops)
+            {
+                var button = new Button { Content = $"原页裁图 · 第 {crop.Page} 页", Margin = new Thickness(0, 0, 6, 0) };
+                string receiptPath = ReceiptPath(session, source.RequestId);
+                button.Click += async (_, _) => await RunUiAsync(() => ShowSavedCropAsync(source.Title, receiptPath, crop));
+                toolbar.Children.Add(button);
+            }
+            DockPanel.SetDock(toolbar, Dock.Top);
+            content.Children.Add(toolbar);
+        }
+        content.Children.Add(area);
+        Dialog(source.Title, content, 620, 525).ShowDialog();
+    }
+
+    private async Task ShowSavedCropAsync(string title, string receiptPath, CropReceipt crop)
+    {
+        var path = CropPath(receiptPath, crop);
+        if (!File.Exists(path) || new FileInfo(path).Length > 16 * 1024 * 1024)
+            throw new InvalidDataException("已核对的原页裁图不可用。");
+        var bytes = await File.ReadAllBytesAsync(path, lifetime.Token);
+        if (!string.Equals(Convert.ToHexString(SHA256.HashData(bytes)), crop.Sha256, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("本地裁图已变化，无法核对。");
+        using var data = new MemoryStream(bytes);
+        var decoder = new PngBitmapDecoder(data, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+        var preview = new Image { Source = decoder.Frames[0], Stretch = Stretch.Uniform, Margin = new Thickness(12) };
+        Dialog(title + $" · 文件第 {crop.Page} 页裁图", preview, 740, 660).ShowDialog();
     }
 
     private async Task OpenDocumentSourceAsync(SourceReceipt source)
@@ -509,43 +640,65 @@ internal sealed partial class ResearchWindow
         if (file.Fingerprint != excerpt.Fingerprint)
             throw new InvalidDataException("本地原文已变化，无法复用当时的页位。请查看已保存的摘录。");
         if (!file.IsPdf) { ShowSourceExcerpt(source); return; }
+        ShowDocumentPages(file, source.Pages);
+    }
 
-        var picker = new ComboBox { Margin = new Thickness(12), ItemsSource = source.Pages.Select(page => "文件第 " + page.Page + " 页").ToList() };
+    private void ShowDocumentPages(PdfEvidence file, IReadOnlyList<DocumentExcerpt>? excerpts)
+    {
+        IEnumerable<int> pages = excerpts == null
+            ? Enumerable.Range(1, file.PageCount) : excerpts.Select(excerpt => excerpt.Page);
+        var picker = new ComboBox
+        {
+            Margin = new Thickness(12), ItemsSource = pages.ToList(), ItemStringFormat = "文件第 {0} 页",
+            Foreground = ColorBrush("#182235")
+        };
+        AutoLabel(picker, "PDF 页码");
         var canvasHost = new ScrollViewer { HorizontalScrollBarVisibility = ScrollBarVisibility.Auto };
         var box = new DockPanel();
         DockPanel.SetDock(picker, Dock.Top);
         box.Children.Add(picker);
         box.Children.Add(canvasHost);
-        var dialog = Dialog(source.Title, box, 790, 790);
+        var dialog = Dialog(file.Title, box, 790, 790);
         using var closing = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
         int revision = 0;
         picker.SelectionChanged += async (_, _) =>
         {
-            if (picker.SelectedIndex < 0) return;
-            var requested = source.Pages[picker.SelectedIndex];
+            if (picker.SelectedItem is not int pageNumber) return;
+            var requested = excerpts?[picker.SelectedIndex];
             int attempt = ++revision;
             try
             {
-                var page = await file.RenderPageAsync(requested.Page, 1060, closing.Token);
+                var page = await file.RenderPageAsync(pageNumber, 1060, closing.Token);
                 if (closing.IsCancellationRequested || revision != attempt) return;
-                var canvas = new Canvas { Width = page.Width, Height = page.Height };
+                double width = Math.Min(page.Width, Math.Max(320, dialog.ActualWidth > 0 ? dialog.ActualWidth - 38 : 740));
+                double height = width * page.Height / page.Width;
+                var canvas = new Canvas { Width = width, Height = height };
                 canvas.Children.Add(new Image { Source = BitmapSource.Create(page.Width, page.Height, 96, 96,
-                    PixelFormats.Bgr32, null, page.Pixels, page.Stride), Width = page.Width, Height = page.Height });
-                foreach (var region in requested.Regions)
+                    PixelFormats.Bgr32, null, page.Pixels, page.Stride), Width = width, Height = height });
+                IReadOnlyList<PdfRegion> regions = requested?.VisualRegion is PdfRegion visual
+                    ? [visual] : requested?.Regions ?? [];
+                foreach (var region in regions)
                 {
                     var mark = new System.Windows.Shapes.Rectangle
                     {
                         Fill = new SolidColorBrush(Color.FromArgb(73, 255, 204, 64)),
-                        Width = region.Width * page.Width, Height = region.Height * page.Height
+                        Width = region.Width * width, Height = region.Height * height
                     };
-                    Canvas.SetLeft(mark, region.X * page.Width);
-                    Canvas.SetTop(mark, region.Y * page.Height);
+                    Canvas.SetLeft(mark, region.X * width);
+                    Canvas.SetTop(mark, region.Y * height);
                     canvas.Children.Add(mark);
                 }
                 canvasHost.Content = canvas;
+                canvasHost.ScrollToTop();
+                if (regions.Count > 0)
+                    canvasHost.ScrollToVerticalOffset(Math.Max(0, regions[0].Y * height - 100));
             }
             catch (OperationCanceledException) when (closing.IsCancellationRequested) { }
-            catch (Exception error) { canvasHost.Content = new TextBlock { Text = error.Message, TextWrapping = TextWrapping.Wrap }; }
+            catch (Exception error)
+            {
+                if (!closing.IsCancellationRequested && revision == attempt)
+                    canvasHost.Content = new TextBlock { Text = error.Message, TextWrapping = TextWrapping.Wrap };
+            }
         };
         picker.SelectedIndex = 0;
         dialog.Closed += (_, _) => closing.Cancel();
@@ -624,12 +777,26 @@ internal sealed partial class ResearchWindow
         catch (JsonException) { return null; }
     }
 
-    private void SaveReceipt(string id, SourceReceipt receipt)
+    private void SaveReceipt(string id, SourceReceipt receipt, IReadOnlyList<SourceCrop> crops)
     {
         string path = ReceiptPath(id, receipt.RequestId);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        foreach (var crop in crops)
+            WriteReceiptFile(CropPath(path, crop.Receipt), crop.Bytes);
+        WriteReceiptFile(path, JsonSerializer.SerializeToUtf8Bytes(receipt));
+    }
+
+    private static string CropPath(string receiptPath, CropReceipt crop)
+    {
+        if (crop.Sha256.Length != 64 || !crop.Sha256.All(Uri.IsHexDigit))
+            throw new InvalidDataException("原页裁图校验值无效。");
+        return Path.ChangeExtension(receiptPath, $"-{crop.Sha256.ToLowerInvariant()}.png");
+    }
+
+    private static void WriteReceiptFile(string path, byte[] bytes)
+    {
         string temporary = path + ".new";
-        File.WriteAllText(temporary, JsonSerializer.Serialize(receipt));
+        File.WriteAllBytes(temporary, bytes);
         File.Move(temporary, path, overwrite: true);
     }
 

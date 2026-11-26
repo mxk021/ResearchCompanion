@@ -19,7 +19,12 @@ internal readonly record struct PdfRegion(double X, double Y, double Width, doub
 }
 
 internal sealed record DocumentExcerpt(
-    string FilePath, string Title, int Page, string Text, IReadOnlyList<PdfRegion> Regions, string Fingerprint);
+    string FilePath, string Title, int Page, string Text, IReadOnlyList<PdfRegion> Regions, string Fingerprint,
+    PdfRegion? VisualRegion = null, string? Recognition = null);
+
+internal sealed record PdfOcrLine(string Text, PdfRegion Region);
+internal sealed record PdfOcrProgress(int Page, int PageCount);
+internal sealed record PdfOcrResult(int MissingPages, int RecognizedPages);
 
 internal sealed record PagePreview(int Page, int Width, int Height, int Stride, byte[] Pixels);
 
@@ -48,6 +53,10 @@ internal sealed class PdfEvidence
         """从[^\n。]{3,}(?:到|至)[^\n。]{3,}|\bfrom\s+.{3,}\s+(?:to|through)\s+.{3,}""");
     private static readonly Regex VisualObject = Pattern(
         """(?:图表|图注|子图|原图|公式|原式|数学式|方程)|(?:图|表|式)\s*[A-Za-z]?[（(]?\s*[\d一二三四五六七八九十]|\b(?:figure|fig\.|eq\.|equation|formula|table|caption)\s*[A-Za-z]?\s*[\d(]""");
+    private static readonly Regex NumberedObject = Pattern(
+        @"(?<type>\bfig(?:ure)?\.?|\btable|\beq(?:uation)?\.?|[图表式]|公式|方程)\s*[（(]?(?<id>[A-Za-z]?\d+(?:[.-]\d+)*)(?![A-Za-z0-9]|[.-]\d)");
+    private static readonly Regex EquationTag = Pattern(@"[（(]\s*(?<id>[A-Za-z]?\d+(?:[.-]\d+)*)\s*[)）]\s*$");
+    private static readonly Regex EquationInk = Pattern(@"[=≈≡≤≥∑∫√×÷]");
     private static readonly Regex LeftColumn = Pattern(@"左\s*(?:侧|边)?\s*栏|\bleft(?:[- ]hand)?\s+column\b");
     private static readonly Regex RightColumn = Pattern(@"右\s*(?:侧|边)?\s*栏|\bright(?:[- ]hand)?\s+column\b");
     private static readonly Regex Terms = Pattern(@"[\p{IsCJKUnifiedIdeographs}]+|[\p{L}\p{N}]{2,}");
@@ -63,6 +72,8 @@ internal sealed class PdfEvidence
     private readonly byte[] bytes;
     private readonly PageText?[] pages;
     private readonly object indexLock = new();
+    private readonly SemaphoreSlim recognitionLock = new(1, 1);
+    private Func<PagePreview, CancellationToken, Task<IReadOnlyList<PdfOcrLine>>>? recognizer;
     private int cachedCharacters;
 
     private PdfEvidence(string filePath, string title, byte[] bytes, int pageCount, bool isPdf)
@@ -81,8 +92,86 @@ internal sealed class PdfEvidence
     public int PageCount => pages.Length;
     public bool IsPdf { get; }
 
-    public static Task<PdfEvidence> OpenAsync(string path, CancellationToken cancellationToken = default) =>
-        Task.Run(() => Open(path, cancellationToken), cancellationToken);
+    public static async Task<PdfEvidence> OpenAsync(string path, CancellationToken cancellationToken = default,
+        Func<PagePreview, CancellationToken, Task<IReadOnlyList<PdfOcrLine>>>? recognize = null)
+    {
+        var file = await Task.Run(() => Open(path, cancellationToken), cancellationToken).ConfigureAwait(false);
+        file.recognizer = recognize;
+        return file;
+    }
+
+    public async Task<PdfOcrResult> RecognizeMissingPagesAsync(IProgress<PdfOcrProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (!IsPdf || recognizer == null) throw new InvalidDataException("没有可用的本机 PDF OCR。");
+        await recognitionLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await Task.Run(() => VerifyFile(cancellationToken), cancellationToken).ConfigureAwait(false);
+            int missing = 0;
+            int recognized = 0;
+            for (int number = 1; number <= PageCount; number++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var page = await Task.Run(() => ReadPages(number, number, cancellationToken)[0], cancellationToken).ConfigureAwait(false);
+                progress?.Report(new(number, PageCount));
+                if (page.Recognition != null)
+                {
+                    missing++;
+                    recognized++;
+                    continue;
+                }
+                if (page.Text.Any(char.IsLetterOrDigit)) continue;
+                missing++;
+                var bitmap = await Task.Run(() => WithPdf(bytes, pdf => Render(pdf, number, 2200, cancellationToken), cancellationToken),
+                    cancellationToken).ConfigureAwait(false);
+                var lines = await recognizer(bitmap, cancellationToken).ConfigureAwait(false);
+                var contents = lines.Where(line => !string.IsNullOrWhiteSpace(line.Text) && ValidRegion(line.Region))
+                    .Select(line => new LineContent(line.Text.Trim(), line.Region, false)).ToArray();
+                if (contents.Length == 0) continue;
+                var ocr = OrderPage(number, contents, false) with { Recognition = "本机 OCR，需核对原页" };
+                if (ocr.Text.Length is 0 or > MaxPageCharacters) continue;
+                lock (indexLock)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    int prior = pages[number - 1]?.Text.Length ?? 0;
+                    if (cachedCharacters - prior + ocr.Text.Length > MaxIndexedCharacters)
+                        throw new InvalidDataException("OCR 文本达到索引上限，请将材料拆分后重试。");
+                    pages[number - 1] = ocr;
+                    cachedCharacters += ocr.Text.Length - prior;
+                }
+                recognized++;
+            }
+            await Task.Run(() => VerifyFile(cancellationToken), cancellationToken).ConfigureAwait(false);
+            return new(missing, recognized);
+        }
+        finally { recognitionLock.Release(); }
+    }
+
+    public async Task<PagePreview> RenderCropAsync(int page, PdfRegion region, CancellationToken cancellationToken = default)
+    {
+        if (!ValidRegion(region)) throw new InvalidDataException("原页裁图区域无效。");
+        var preview = await RenderPageAsync(page, 1900, cancellationToken).ConfigureAwait(false);
+        return await Task.Run(() =>
+        {
+            int left = (int)Math.Floor(region.X * preview.Width);
+            int top = (int)Math.Floor(region.Y * preview.Height);
+            int width = Math.Min(preview.Width, (int)Math.Ceiling(region.Right * preview.Width)) - left;
+            int height = Math.Min(preview.Height, (int)Math.Ceiling(region.Bottom * preview.Height)) - top;
+            int stride = checked(width * 4);
+            var pixels = new byte[checked(stride * height)];
+            for (int y = 0; y < height; y++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Buffer.BlockCopy(preview.Pixels, (top + y) * preview.Stride + left * 4, pixels, y * stride, stride);
+            }
+            return new PagePreview(page, width, height, stride, pixels);
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static bool ValidRegion(PdfRegion region) =>
+        region.X >= 0 && region.Y >= 0 && region.Width > 0 && region.Height > 0 &&
+        region.Right <= 1.0000001 && region.Bottom <= 1.0000001;
 
     public Task<IReadOnlyList<DocumentExcerpt>> RetrieveAsync(
         string question, CancellationToken cancellationToken = default) =>
@@ -154,8 +243,7 @@ internal sealed class PdfEvidence
         var aliases = PageAliases.Matches(outsidePassage);
         var addressCount = requestedPages.Count + aliases.Count;
         var remainder = PageAliases.Replace(PageAddress.Replace(outsidePassage, string.Empty), string.Empty);
-        if (IsPdf && VisualObject.IsMatch(outsidePassage))
-            throw new InvalidDataException("Windows 候选版暂未核验图表、图注与公式的编号及像素。可先打开原 PDF，选择正文后提问。");
+        var wantsObject = IsPdf && (VisualObject.IsMatch(outsidePassage) || NumberedObject.IsMatch(outsidePassage));
         if (IsPdf && (addressCount > 1 || DisjointPages.IsMatch(outsidePassage) || UnsupportedAddress.IsMatch(remainder)))
             throw new InvalidDataException("无法核对多个页段、章节编号或该页码格式。请使用一个阿拉伯数字页码或连续页段，如第 2–4 页。");
 
@@ -182,13 +270,84 @@ internal sealed class PdfEvidence
             throw new InvalidDataException("无法确定起止原句。可改用从「起点原句」到「终点原句」，也可指定页码。");
 
         var indexed = ReadPages(first, last, cancellationToken);
-        IReadOnlyList<DocumentExcerpt> result = anchors.Count == 1
-            ? ExactPassage(indexed, anchors[0], column)
+        IReadOnlyList<DocumentExcerpt> result = wantsObject
+            ? LocateVisualObject(indexed, outsidePassage, column)
+            : anchors.Count == 1
+                ? ExactPassage(indexed, anchors[0], column)
             : addressCount > 0 && IsPdf
                 ? ExplicitPages(indexed, column)
                 : RelevantPassages(indexed, outsidePassage, column);
         VerifyFile(cancellationToken);
         return result;
+    }
+
+    private IReadOnlyList<DocumentExcerpt> LocateVisualObject(PageText[] indexed, string question, int column)
+    {
+        var requested = NumberedObject.Matches(question).Select(match =>
+            (Type: ObjectType(match.Groups["type"].Value), Id: match.Groups["id"].Value.ToLowerInvariant())).Distinct().ToArray();
+        if (requested.Length != 1)
+            throw new InvalidDataException("请指定一个图、表或公式的明确编号。可同时指定物理页码。");
+        var target = requested[0];
+        var matches = new List<DocumentExcerpt>();
+        foreach (var original in indexed)
+        {
+            var page = column == 0 ? original : original.ForColumn(column);
+            foreach (var line in page.Lines)
+            {
+                if (line.Content is not { Fault: false, Region: PdfRegion location }) continue;
+                string text = line.Content.Text.Trim();
+                var label = NumberedObject.Match(text);
+                var tag = target.Type == "equation" ? EquationTag.Match(text) : Match.Empty;
+                bool isLabel = label.Success && label.Index == 0 && ObjectType(label.Groups["type"].Value) == target.Type
+                    && label.Groups["id"].Value.Equals(target.Id, StringComparison.OrdinalIgnoreCase);
+                bool isEquation = tag.Success && tag.Groups["id"].Value.Equals(target.Id, StringComparison.OrdinalIgnoreCase)
+                    && EquationInk.IsMatch(text[..tag.Index]);
+                if (!isLabel && !isEquation) continue;
+                if (isLabel && target.Type == "equation" && !EquationInk.IsMatch(text)) continue;
+
+                var region = location;
+                if (target.Type != "equation")
+                {
+                    // Include the adjacent original-page area as well as its identified caption.
+                    // The page crop remains available for visual verification of the object's extent.
+                    var preceding = page.Lines.Select(item => item.Content.Region)
+                        .Where(item => item.HasValue && item.Value.Bottom <= location.Y - 0.025)
+                        .Select(item => item!.Value.Bottom).DefaultIfEmpty(0).Max();
+                    var top = Math.Max(preceding, location.Y - 0.48);
+                    var bottom = Math.Min(1, location.Bottom + 0.03);
+                    if (target.Type == "table" && location.Y < 0.85)
+                    {
+                        top = Math.Max(0, location.Y - 0.025);
+                        bottom = Math.Min(1, location.Bottom + 0.34);
+                    }
+                    region = new PdfRegion(column == 2 ? 0.47 : 0.02, top,
+                        column == 0 ? 0.96 : 0.51, bottom - top);
+                }
+                else
+                {
+                    var x = Math.Max(0, region.X - 0.025);
+                    var y = Math.Max(0, region.Y - 0.022);
+                    region = new PdfRegion(x, y, Math.Min(1, region.Right + 0.025) - x,
+                        Math.Min(1, region.Bottom + 0.022) - y);
+                }
+                var excerpt = VerifiedExcerpt(page, line.Start, line.End, mayUseIsolatedLine: true);
+                matches.Add(excerpt with { VisualRegion = region });
+            }
+        }
+        return matches.Count switch
+        {
+            1 => matches,
+            0 => throw new InvalidDataException("未能定位编号对应的图注、表注或公式。扫描页请先识别，或缩小页码范围后重试。"),
+            _ => throw new InvalidDataException("同一编号存在多个可能的位置，请指定物理页码后重试。")
+        };
+    }
+
+    private static string ObjectType(string label)
+    {
+        var value = label.ToLowerInvariant();
+        if (value == "图" || value.StartsWith("fig", StringComparison.Ordinal)) return "figure";
+        if (value == "表" || value == "table") return "table";
+        return "equation";
     }
 
     private PageText[] ReadPages(int first, int last, CancellationToken cancellationToken)
@@ -333,7 +492,7 @@ internal sealed class PdfEvidence
         if (page.Ambiguous && !mayUseIsolatedLine)
             throw new InvalidDataException($"第 {page.Number} 页的栏序或浮动区无法核对。可选取原文再提问。");
         if (end <= start || page.Text.AsSpan(start, end - start).Trim().IsEmpty)
-            throw new InvalidDataException($"第 {page.Number} 页没有可核验的文字层或目标栏。Windows 候选版尚未提供扫描页 OCR。");
+            throw new InvalidDataException($"第 {page.Number} 页没有可核验的文字层或目标栏。可先对扫描页执行本机 OCR。");
 
         var lines = page.Lines.Where(line => line.Start < end && line.End > start).ToArray();
         if (lines.Any(line => line.Content.Fault))
@@ -342,7 +501,8 @@ internal sealed class PdfEvidence
             .Select(region => region.GetValueOrDefault()).ToArray();
         if (IsPdf && regions.Length == 0)
             throw new InvalidDataException($"第 {page.Number} 页的摘录未取得可核验的页内位置。");
-        return new DocumentExcerpt(FilePath, Title, page.Number, page.Text[start..end].Trim(), regions, Fingerprint);
+        return new DocumentExcerpt(FilePath, Title, page.Number, page.Text[start..end].Trim(), regions, Fingerprint,
+            Recognition: page.Recognition);
     }
 
     private void VerifyFile(CancellationToken cancellationToken)
@@ -456,7 +616,7 @@ internal sealed class PdfEvidence
     private sealed record LineContent(string Text, PdfRegion? Region, bool Fault, int Column = 0);
     private sealed record TextLine(LineContent Content, int Start, int End);
 
-    private sealed record PageText(int Number, string Text, TextLine[] Lines, bool Ambiguous)
+    private sealed record PageText(int Number, string Text, TextLine[] Lines, bool Ambiguous, string? Recognition = null)
     {
         public static PageText Assemble(int number, IEnumerable<LineContent> contents, bool ambiguous)
         {
@@ -475,7 +635,7 @@ internal sealed class PdfEvidence
         public PageText ForColumn(int column)
         {
             var ordered = Lines.Where(line => line.Content.Column == column).Select(line => line.Content);
-            return Assemble(Number, ordered, Ambiguous);
+            return Assemble(Number, ordered, Ambiguous) with { Recognition = Recognition };
         }
     }
 

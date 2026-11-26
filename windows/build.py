@@ -21,6 +21,7 @@ WINDOWS = ROOT / "windows"
 APP = WINDOWS / "ResearchCompanion.Windows"
 PROJECT = APP / "ResearchCompanion.Windows.csproj"
 VERSION = json.loads((ROOT / "release.json").read_text(encoding="utf-8"))["version"]
+WINDOWS_BUILD = 1
 PDFIUM_SHA256 = "ca7338ae7779b8b1b82f4580305c4d762d214f8df1d54b47647fe3cc75989ded"
 RUNTIME_LICENSES = {
     "Microsoft.NETCore.App.Runtime.win-x64": ("LICENSE.TXT", "THIRD-PARTY-NOTICES.TXT"),
@@ -80,6 +81,12 @@ def build_brand(destination):
     mark = Image.new("RGBA", mask.size, (0, 0, 0, 0))
     mark.putalpha(expanded)
     mark.save(destination / "ResearchCompanionMark.png")
+
+    # WPF maps local transcript files to an isolated HTTPS origin.
+    entry = (ROOT / "Resources" / "Transcript" / "index.html").read_text(encoding="utf-8")
+    if entry.count("img-src file:;") != 1:
+        raise ValueError("The shared transcript image policy changed.")
+    (destination / "index.html").write_text(entry.replace("img-src file:;", "img-src 'self';"), encoding="utf-8")
 
 
 def pe_machine(path):
@@ -187,7 +194,7 @@ def package(args):
         env = {**os.environ, "NUGET_PACKAGES": str(args.nuget_cache.resolve())}
         run(args.dotnet, "publish", PROJECT, "--self-contained", "--no-restore", "--disable-build-servers",
             "-c", "Release", "-r", "win-x64", "-o", payload, f"-p:BrandDir={brand}",
-            "-p:DebugType=None", "-p:DebugSymbols=false", env=env)
+            f"-p:FileVersion={VERSION}.{WINDOWS_BUILD}", "-p:DebugType=None", "-p:DebugSymbols=false", env=env)
         shutil.copytree(ROOT / "Resources" / "LicenseNotices", payload / "LicenseNotices", dirs_exist_ok=True)
         shutil.copyfile(ROOT / "Resources" / "ThirdPartyNotices.txt", payload / "ThirdPartyNotices.txt")
         shutil.copyfile(ROOT / "LICENSE", payload / "LICENSE")
@@ -196,7 +203,7 @@ def package(args):
         copy_bridge(args.bridge_archive.resolve(), payload)
         addon = json.loads((ROOT / "zotero-context-bridge" / "manifest.json").read_text(encoding="utf-8"))
         xpi = payload / f"research-companion-context-{addon['version']}.xpi"
-        run(sys.executable, ROOT / "zotero-context-bridge" / "build.py", "--output", xpi)
+        run(sys.executable, "-X", "utf8", ROOT / "zotero-context-bridge" / "build.py", "--output", xpi)
         with zipfile.ZipFile(xpi) as distribution:
             if sorted(distribution.namelist()) != ["LICENSE", "bootstrap.js", "core.js", "manifest.json"] or distribution.testzip():
                 raise ValueError("Unexpected Zotero extension packaging.")
@@ -206,7 +213,9 @@ def package(args):
         verify_payload(payload)
         run(
             args.makensis, "-V2", "-WX", "-INPUTCHARSET", "UTF8",
-            f"-DVERSION={VERSION}", f"-DPAYLOAD={payload}", f"-DOUTPUT={installer}",
+            f"-DVERSION={VERSION}", f"-DWINDOWS_BUILD={WINDOWS_BUILD}",
+            f"-DPAYLOAD_RECEIPT={payload / 'InstallReceipt.txt'}",
+            f"-DPAYLOAD_FILES={payload / '*'}", f"-DOUTPUT={installer}",
             f"-DICON={brand / 'ResearchCompanion.ico'}", f"-DLICENSE={ROOT / 'LICENSE'}",
             WINDOWS / "installer" / "ResearchCompanion.nsi",
         )

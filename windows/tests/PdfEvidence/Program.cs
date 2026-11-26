@@ -37,7 +37,25 @@ try
     await Reject(() => document.RetrieveAsync("从「Golden lens.」到「Copper rotation.」"), "多个", "ambiguous anchor");
     await Reject(() => document.RetrieveAsync("从 Golden lens. 到 Copper rotation."), "起止原句", "unparsed range");
     await Reject(() => document.RetrieveAsync("读第 4 页"), "没有可核验", "page without readable text");
-    await Reject(() => document.RetrieveAsync("解释公式（1）"), "暂未核验", "unsupported visual target");
+    await Reject(() => document.RetrieveAsync("解释公式（1）"), "未能定位", "missing visual target");
+    var visual = Fixture("visual.pdf");
+    MakePdf(visual, [Sheet((60, 720, "Research fixture"), (55, 405, "Figure 1. Blue sample chart."),
+        (70, 280, @"y = 37x + 2        \(3\)"), (55, 170, "Table 2. Fixture results.")) + "0 0 0 rg 85 441 120 175 re f\n"]);
+    var figures = await PdfEvidence.OpenAsync(visual);
+    var figure = (await figures.RetrieveAsync("解释第 1 页 Figure 1"))[0];
+    Verify(figure.VisualRegion != null && figure.Text.Contains("Blue sample chart"), "unique numbered figure and crop");
+    var crop = await figures.RenderCropAsync(1, figure.VisualRegion!.Value);
+    Verify(crop.Width > 500 && crop.Height > 150 && DarkFraction(crop, new(0.15, 0.15, 0.2, 0.65)) > 0.05,
+        "figure crop contains original dark pixels");
+    var equation = (await figures.RetrieveAsync("说明公式（3）"))[0];
+    Verify(equation.VisualRegion is { Height: < 0.16 } && equation.Text.Contains("37x"), "equation region and exact registered text");
+    Verify((await figures.RetrieveAsync("解释 Table 2"))[0].VisualRegion != null, "numbered table region");
+    var recognized = await PdfEvidence.OpenAsync(passage, recognize: (preview, ct) =>
+        Task.FromResult<IReadOnlyList<PdfOcrLine>>([new("OCR orchard sample", new(0.14, 0.20, 0.56, 0.04))]));
+    var recognition = await recognized.RecognizeMissingPagesAsync();
+    var scanned = (await recognized.RetrieveAsync("读第 4 页"))[0];
+    Verify(recognition is { MissingPages: 1, RecognizedPages: 1 } && scanned.Recognition != null &&
+        scanned.Text == "OCR orchard sample" && scanned.Regions.Count == 1, "OCR source survives indexing and carries geometry");
     await Reject(() => document.RetrieveAsync("第 1 页和第 2 页"), "多个页段", "disjoint scope");
     await Reject(() => document.RetrieveAsync("读取第 1、3 页"), "多个页段", "compact disjoint scope");
     Verify((await document.RetrieveAsync("读取首页"))[0].Page == 1, "first page alias");

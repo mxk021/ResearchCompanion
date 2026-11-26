@@ -1,56 +1,43 @@
-# Windows x64 候选版验收
+# Research Companion Windows x64 实机验收报告
 
-基线为公开标签 v0.3.4，提交 e60a069d4ae5070438fe5ed9c73d90e1b0353e06。Windows 移植位于 windows/port-v0.3.4 与独立工作目录。主机只有 Apple Silicon macOS，没有可用的 Windows OS、虚拟机或远程运行器。
+2026-11-26（北京时间）。在本机 Windows x64（系统构建 26300.9818）执行。测试材料为两页合成 PDF、本地 HTML 和 Markdown。Windows 移植起点为 `windows/port-v0.3.4` 的 `6994d1b7100520ba000828fe7e40d8095ea371da`，功能和视觉基准为 macOS v0.3.4 的 `e60a069d4ae5070438fe5ed9c73d90e1b0353e06`。验收以实际观察到的结果为准。
 
-因此，下表的「已实现」是源代码状态。「已验证」仅表示指定的独立或构建检查。Windows 安装、运行、真实界面截图、性能和提供方请求均未在 Windows 验收。未合成应用截图代替实机证据。
+## 交付包
 
-| 对照项 | Windows 候选实现 | 证据与尚未覆盖 |
-| --- | --- | --- |
-| 图标和会话外观 | 复用定稿图标母版和 0.3.4 对话 HTML、CSS、Markdown、KaTeX，WPF 页头、材料区、对话区、输入区域，三种主题选项 | 交叉编译。DPI、明暗对比、字体、IME、拖动、滚动、实际视觉一致性待 Windows 验收 |
-| 启动、窗口和托盘 | 单实例、可选置顶及持久化、托盘唤回、退出，直接启动 | Windows 窗口、任务栏、多屏及睡眠唤回未实测。macOS 桌宠、自定义角色和阶段状态面板未移植 |
-| WPS、Edge、Chrome | UI Automation 文本选区，来源窗口和剪贴板写入核对后选择性自动复制，最后手动粘贴 | 三种真实阅读器均未实测。通用 UIA 没有可靠的浏览器文档 URL。权限隔离、快捷键注入、剪贴板竞争仍需压测 |
-| Zotero | HMAC 成对读取当前阅读器，记录附件源和可靠页码，生成受限 Zotero 回跳链接 | 既有扩展协议单测通过。Windows 配对存储、选区边界及回跳未实测 |
-| DSH 与模型 | 共享桥与账号模型协议，Windows 私有命名管道与 DPAPI 双向认证，按会话绑定确切提供方、模型和推理档 | 跨平台握手/拒绝单测及本机 macOS 真实 DSH 隔离检查通过。Windows DSH、DPAPI、命名管道、账号配置、真实模型执行均未实测。本版使用会话快照刷新，未达到 macOS 流式更新对等 |
-| PDF 解析和范围 | 同版本 PDFium 字形、页序、保守双栏、连续范围、文件内容指纹及行级区域。文件变动、歧义或不可靠布局会拦截 | 17 项合成文档检查使用 Mac 的同版 PDFium。静态核对 Windows x64 DLL 的函数导出。Windows DLL 运行、真实多版式论文及渲染未实测 |
-| OCR、图表、公式及证据补读 | Markdown 中的公式显示复用 KaTeX。缺少可靠文字证据的原图、编号公式或扫描页会说明缺口 | Windows OCR、原图和编号公式对象索引、变量定义、模型辅助分段与裁图发送尚未移植 |
-| 证据详情和回跳 | 核对实际发送哈希、原文件版本、页码和行位置。可打开本地原页并高亮，旧回答用持久化收据回看 | Windows 原页窗口、坐标、浏览器标签页复用未验收。缺失收据的历史消息不标为已核验 |
-| 历史及草稿 | 共享历史搜索、归档筛选、会话读取、草稿与窗口选项 | Windows 主机测试未执行。桌面收藏、归档写入、永久删除及跨启动的附件恢复未对等 |
-| 笔记 | 原文复制、公式 LaTeX、回答选段、带补充保存、原文出处 Markdown，不导出内部路径字段 | Windows 对话框、文件覆盖与资源管理器回跳未实测。本地笔记目录和全部 macOS 书签机制未移植 |
-| 安装与升级 | 当前用户安装，负载为 Windows x64，自包含 .NET，WebView2 Evergreen 另行提供 | NSIS 安装器已交叉构建，已核对校验和及 x64 应用负载。安装、覆盖升级、卸载、SmartScreen 和真实运行均需 Windows 实测 |
+- 安装器文件 `ResearchCompanion-0.3.4-win-x64-candidate-setup.exe`。Windows 应用文件版本及安装注册版本为 `0.3.4.1`。
+- 大小 59,969,429 字节。SHA-256 为 `8358d92305579fde2fdda39c676128767b7efd3d77466521e76067a600f55ebd`。
+- 当前用户 NSIS 安装器，负载为 x64、自包含 .NET 10、PDFium 8165 及 WebView2 组件。候选包未做 Authenticode 签名。实机使用现有 WebView2 Evergreen。
+- 交付为本地候选。复核时远端 `main`、Windows 分支和 `v0.3.4` 标签均与开始时一致。未推送或发布。
 
-## 已执行检查
+## 实机结果
 
-- 公共科研桥 TypeScript 构建及 85 项 Node 回归，含 Windows 管道认证和跨通道重放拒绝。Zotero 只读扩展另有 20 项通过。
-- Windows WPF 与独立选区、传输代码交叉编译。在 macOS 使用正式 DSH 0.2.2-rc.5 的隔离 HOME 验证了重建桥安装、旧 Unix socket、合成会话持久化和旧工作区身份。没有使用真实模型和用户资料。
-- NSIS 安装器使用 LZMA 压缩，Win32 引导程序内装独立的 x64 应用、PDFium、WebView2 Loader 与相应运行时。未签名。实测 56,317,572 字节，SHA‑256 为 3bf09af13d79ef5aa1756be4f645372ed446def8d6857affae8446cedc82fcc6。
-- PDF 逻辑 17 项复验覆盖双栏顺序、跨页原句、基本检索、重复锚点和扫描拒绝，以及旋转原页区域与同长度内容变更。Windows PDFium DLL 静态导出表包含全部 24 项所用入口。
+| 项目 | 结果与证据 |
+| --- | --- |
+| 安装、升级、卸载 | 通过。交付包干净安装 6,536 ms，从原移植提交构建的 Windows 0.3.4 覆盖升级 9,110 ms。卸载核对程序、开始菜单快捷方式及卸载注册项移除。窗口设置、收据和导出的 Markdown 保留。 |
+| Windows OCR | 通过两页 PDF 的扫描页测试。WinRT 在本机安装的简体中文识别语言下，从唯一无文字层页识别了 `314159`、`37` 和图注，返回 3 个区域。识别耗时 309 ms，标点存在 OCR 差异。窗口显示识别 1 页，原生栏位与来源位置可回核。 |
+| 图、表、公式和原页裁图 | PDFium 原生回归覆盖唯一图号、表号、带标号公式、未知对象、重复范围、裁图像素和旋转页面。实机问答界面分别提交文字页 Figure 1 和扫描页 Figure 2 的 PNG，来源收据验证文本和图像哈希。Figure 1 原页跳转高亮、三根柱和完整图注的独立裁图均已查看。 |
+| 文献问答和流式回复 | Windows 界面、DPAPI/HMAC 命名管道及本机合成协议服务端到端通过。Figure 2 用例在等待状态看到首段，约 316 ms，完整回复约 2,828 ms。时间含桌面验收工具取样开销，回包来源是合成服务。 |
+| DSH | 官方 Windows `0.2.2-rc.5` 在隔离 web profile 成功安装并加载生产科研桥 `0.2.6`。通过真实命名管道读取协议 v1、唯一科研工作区、流式及裁图能力和模型目录。隔离主机没有配置 DeepSeek 或 ChatGPT 模型。现有 DSH Desktop 配置保持原状，Desktop 真实账号问答和图像路由仍待验收。 |
+| Chrome 157.0.8103.79 | 通过。本地 HTML 选区使用全局 `Ctrl+Alt+T` 逐字带入 `The reference pear factor equals exactly 314159.`。 |
+| Edge 158.0.4370.45 | 通过原生复制回退。在来宾窗口选择同一条本地 HTML 文字，UIA 层该用例无可用选区，经单次确认后原文逐字匹配。确认到界面显示的取样约 545 ms。来源显示待核对。初次独立 Edge 配置触发系统账号同步提示，后续验收改用来宾窗口。 |
+| WPS 12.1.0.29690 | 通过原生复制回退。WPS PDF 测试版的前台外壳为 `wps.exe`，同安装目录的 `wpspdf.exe` 写入剪贴板。修正后单次确认并逐字带入完整合成句，确认到界面显示的取样约 2,167 ms。来源显示待核对。 |
+| 手动选区 | 通过。拒绝自动复制后打开「粘贴选区」，通过「从剪贴板粘贴」预览合成原句并带入。应用逐字显示并标明「出处未核验」。此前同场成功授权的复制未免除下一次确认。 |
+| Zotero 10.0.8 | 部分通过。使用官方 x64 ZIP 和独立文献库启用了随包 `0.1.6.xpi`。实际端点生成配对文件，无凭据和重放均返回 403，有效配对请求到达阅读器状态检查并返回 409。桌面工具把便携 10.0.8 窗口绑定到系统安装版 9.0.6 的应用标识，未完成活动阅读器非空选区和附件页回跳。 |
+| 来源和笔记 | 通过本机合成问答场景。核对「打开原文」「来源详情」「原页裁图」和 Markdown 另存为。保存文件包含当轮问题、`314159`、原始 LaTeX 与图注出处，安装周期后文件哈希一致。 |
+| 窗口及外观 | 通过已观察用例。设置置顶时覆盖前台阅读器，升级启动后保持，可解除。实机观察了深色和浅色，并从系统深色切换至浅色。会话及标题栏同步改变。复验空会话图标、暗色材料标签、Markdown 及 KaTeX 排版。窗口首次可见的一次样本为 2,472 ms。 |
+| 自动化 | Windows x64 编译无警告、无错误。22 项 PDFium 原生检查、47 项可在 Windows 运行的协议、渲染及 Zotero 检查通过。原全量 Node 套件含 POSIX socket 与权限假设，在 Windows 上仍有失败。 |
 
-## Windows 复验要点
+## 本轮对等范围
 
-在干净的 Windows 11 x64 配置安装候选包，记录版本与 SHA‑256。在声明通过前须实际核对前三段“取词与文档”的每条路径，并验证正常卸载只移除程序。逐字比较每种阅读器的中英文、Unicode、跨段、无选区和复制竞争。用公开或合成 PDF 检查原文首尾、图表和公式，留存真实来源回跳和笔记文件。从官方 DSH 安装桥，先用隔离会话验证工作区归属和模型，待明确授权后才调用真实模型。区分应用请求准备、首段可见及完整显示。与 macOS v0.3.4 使用同一题和材料，未通过的项须列为缺口。
+Windows 分支沿用 macOS v0.3.4 的对话资源、图标母版、协议和 PDFium 版本。应用的 Windows 特有代码在 `windows/`。科研桥打包增加了 Windows 专用参数来包含分块，macOS 的调用方式保持原状。
 
-## 架构依据
+测试覆盖单个明确编号或页码的证据。多栏、跨页图注、复杂公式变量追踪和模型辅助文档规划仍需更大语料覆盖。浏览器用例是本地 HTML。浏览器内置 PDF 阅读器及同一浏览器中受保护文档的覆盖仍待补齐。Zotero 端到端回跳、真实 DSH Desktop 模型请求、跨平台逐像素比较与长时间压力测试均未验收。当前实机结果不足以签收完整 macOS 对等。
 
-原 SwiftUI、AppKit、PDFKit、Vision 和 WebKit API 实现无法在 Windows 直接运行。WPF 保留系统标题栏、可达性、对话框、任务栏和托盘，WebView2 仅加载随包的本地渲染资源。复用 Git 同一主线的桥、样式、许可、图标和 PDFium 版本。平台专有的 PDF、选区和窗口适配集中在 windows 文件夹。Windows 和 macOS 继续各自打包。
+## 复验入口
 
-## 构建复验
+1. 使用仓库锁文件运行 `pnpm build`，再用 `python -X utf8 scripts/package-bridge.py --windows --public --output <归档路径>` 生成桥归档。
+2. 使用 .NET SDK 10.0.404 锁定还原 Windows 项目，按 Windows README 运行 `windows/build.py`。使用 NSIS 3.13、Pillow 11.3.0 和固定的 Windows x64 PDFium 8165。
+3. 运行 `dotnet run --project windows/tests/PdfEvidence/PdfEvidenceChecks.csproj -- <pdfium.dll 路径>`。在安装过 Windows 识别语言的主机用合成扫描页验证原生 OCR。
+4. 用同一候选包执行当前用户干净安装、从基线覆盖及卸载，逐项检查注册信息、快捷方式和数据保留。
 
-在仓库根目录使用 .NET SDK 10.0.404、带 Pillow 11.3.0 的 Python、NSIS 3.13 和 Node/pnpm。若 NSIS 在独立目录，需按该分发的说明设置 NSISDIR。为构建进程设置独立的 DOTNET_CLI_HOME 和 NUGET_PACKAGES，关闭开发证书自动生成。
-
-    dotnet restore windows/ResearchCompanion.Windows/ResearchCompanion.Windows.csproj \
-        --locked-mode -r win-x64 -p:SelfContained=true
-
-在临时目录以发布脚本的 build_bridge 函数生成公开科研桥。参数依次为已存在的临时构建目录、已存在的归档输出目录、是否使用 pnpm 离线缓存以及隔离运行测试的环境。该函数会重建桥并运行协议测试。任何本机订阅适配文件都不属于构建输入。Windows PDFium 使用上游 8165 的 pdfium-win-x64.tgz，构建脚本内固定其 SHA‑256。随后将团队构建工具和实际归档路径代入如下命令。
-
-    python3 windows/build.py \
-        --dotnet /path/to/dotnet --makensis /path/to/makensis \
-        --nuget-cache /path/to/nuget/packages \
-        --pdfium-archive /path/to/pdfium-win-x64.tgz \
-        --bridge-archive /path/to/dsh-research-companion-0.2.6.tgz \
-        --output /path/to/new/windows-output
-
-PDF 检查程序不依赖 WPF，可在 macOS 用同版本的本机 libpdfium.dylib 复跑，也可在 Windows 用候选包里的 pdfium.dll 单独复跑。
-
-    dotnet run --project windows/tests/PdfEvidence/PdfEvidenceChecks.csproj -- /path/to/pdfium.dll
-
-[固定 PDFium 上游发行](https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium%2F8165) · [NSIS 跨平台构建说明](https://nsis.sourceforge.io/Docs/AppendixG.html)
+基准发布页及平台资料见 [macOS v0.3.4](https://github.com/mxk021/ResearchCompanion/releases/tag/v0.3.4)、[DSH 0.2.2-rc.5 桌面构建说明](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.5/apps/desktop/README.md) 和 [Zotero 官方下载](https://www.zotero.org/download/)。

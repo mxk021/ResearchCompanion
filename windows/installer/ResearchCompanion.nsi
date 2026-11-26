@@ -10,10 +10,10 @@ SetOverwrite on
 ShowInstDetails show
 ShowUninstDetails show
 
-VIProductVersion "${VERSION}.0"
+VIProductVersion "${VERSION}.${WINDOWS_BUILD}"
 VIAddVersionKey /LANG=1033 "ProductName" "Research Companion"
 VIAddVersionKey /LANG=1033 "FileDescription" "Research Companion Windows x64 Candidate"
-VIAddVersionKey /LANG=1033 "FileVersion" "${VERSION}"
+VIAddVersionKey /LANG=1033 "FileVersion" "${VERSION}.${WINDOWS_BUILD}"
 VIAddVersionKey /LANG=1033 "ProductVersion" "${VERSION}"
 VIAddVersionKey /LANG=1033 "LegalCopyright" "Research Companion contributors"
 
@@ -60,7 +60,8 @@ Var GuardMutex
   System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR${suffix}") i .r2'
   ${If} $2 != -1
     IntOp $3 $2 & 0x410
-    ${If} $3 != 0x10
+    ; IntOp stores the result as a decimal string; LogicLib != compares strings.
+    ${If} $3 != 16
       !insertmacro RC_Abort "The destination is redirected or is not a directory. 安装目录不是普通目录，未进行修改。"
     ${EndIf}
   ${EndIf}
@@ -102,8 +103,8 @@ Section "Install"
 
   ClearErrors
   SetOutPath "$INSTDIR\app-new"
-  File "${PAYLOAD}/InstallReceipt.txt"
-  File /r /x InstallReceipt.txt "${PAYLOAD}/*"
+  File "${PAYLOAD_RECEIPT}"
+  File /r /x InstallReceipt.txt "${PAYLOAD_FILES}"
   IfErrors stage_failed
   SetOutPath "$INSTDIR"
   ClearErrors
@@ -122,7 +123,7 @@ Section "Install"
 
   CreateShortCut "$SMPROGRAMS\Research Companion.lnk" "$INSTDIR\app\ResearchCompanion.exe"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "Research Companion"
-  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "${VERSION}.${WINDOWS_BUILD}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayIcon" '"$INSTDIR\app\ResearchCompanion.exe"'
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoModify" 1

@@ -10,7 +10,7 @@ namespace ResearchCompanion.Windows;
 
 internal sealed record TranscriptRow(string Id, string Role, string Text, bool CanOpenSource = false,
     string? SourceDisplay = null, string? SourceTitle = null, string? SourcePage = null,
-    string? SourceDetails = null, string? SourceWarning = null, string? Original = null);
+    string? SourceDetails = null, string? SourceWarning = null, string? Original = null, bool Streaming = false);
 
 internal sealed class WindowsTranscript : IDisposable
 {
