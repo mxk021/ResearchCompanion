@@ -16,7 +16,7 @@ import type {} from '@deepseek-ai/dsh-workspace'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { createHash, randomUUID } from 'node:crypto'
-import { basename, join, resolve } from 'node:path'
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
 import { mkdir, readFile } from 'node:fs/promises'
 import { ResearchRetirement } from './ResearchRetirement.js'
@@ -120,6 +120,12 @@ export function apply(ctx: Context): void {
   let researchCanonicalPath = researchWorkspacePath
   const workspaceReady = mkdir(researchWorkspacePath, { recursive: true, mode: 0o700 })
     .then(() => ctx.workspaceRegistry.create(researchWorkspacePath, '科研助手')).then(workspace => { researchWorkspaceId = String(workspace.id); researchCanonicalPath = workspace.path; return workspace })
+  const isResearchDirectory = (cwd: string): boolean => {
+    const absolute = resolve(cwd)
+    if (process.platform !== 'win32') return absolute === researchCanonicalPath || absolute.startsWith(researchCanonicalPath + '/')
+    const subpath = relative(researchCanonicalPath, absolute)
+    return subpath === '' || (subpath !== '..' && !subpath.startsWith('..' + sep) && !isAbsolute(subpath))
+  }
   const contextProvider = new ZoteroContextProvider()
   const persona = async (): Promise<string> => {
     try {
@@ -474,7 +480,7 @@ export function apply(ctx: Context): void {
   ctx.on('agent/pre-step', async (request: any, next: () => Promise<any>) => {
     const sessionId = String(request.agent?.session?.id ?? request.agent?.id ?? '')
     const cwd = request.agent?.session?.header?.cwd ?? request.agent?.session?.cwd
-    const scoped = isResearchWorkspace(workspaceForSession(sessionId) ?? '') || (typeof cwd === 'string' && (resolve(cwd) === researchCanonicalPath || resolve(cwd).startsWith(researchCanonicalPath + '/')))
+    const scoped = isResearchWorkspace(workspaceForSession(sessionId) ?? '') || (typeof cwd === 'string' && isResearchDirectory(cwd))
     if (scoped && !accountProviderAllowed(request.modelSelection?.provider, llm())) {
       throw new Error('Research Companion refuses API-key model routes; check the DSH account or ChatGPT subscription.')
     }

@@ -8,6 +8,8 @@ namespace ResearchCompanion.Windows;
 
 internal static class App
 {
+    internal static string Version => typeof(App).Assembly.GetName().Version!.ToString();
+
     internal static readonly string Profile = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ResearchCompanion");
     [STAThread]

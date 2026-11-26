@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
@@ -46,6 +47,8 @@ internal sealed partial class ResearchWindow : Window
     private readonly Button pin = new() { Content = "固定窗口" };
     private readonly CheckBox include = new() { Content = "带入材料", IsChecked = true, VerticalAlignment = VerticalAlignment.Center };
     private readonly Image brand = new() { Width = 25, Height = 25 };
+    private readonly Lazy<BitmapSource?> lightMark = new(() => LoadBrandMark(false));
+    private readonly Lazy<BitmapSource?> darkMark = new(() => LoadBrandMark(true));
     private readonly List<Border> panels = new();
     private readonly List<Button> buttons = new();
     private readonly CancellationTokenSource lifetime = new();
@@ -63,10 +66,10 @@ internal sealed partial class ResearchWindow : Window
     internal ResearchWindow()
     {
         Title = "科研助手";
-        Width = 640;
-        Height = 822;
-        MinWidth = 460;
-        MinHeight = 480;
+        Width = 740;
+        Height = 760;
+        MinWidth = 428;
+        MinHeight = 568;
         Topmost = settings.Topmost;
         selectionProvider.ZoteroPairingFile = settings.ZoteroPairingFile;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
@@ -121,9 +124,16 @@ internal sealed partial class ResearchWindow : Window
         Content = layout;
         FontFamily = new FontFamily("Segoe UI, Microsoft YaHei UI");
 
-        var header = new DockPanel { Margin = new Thickness(0, 0, 0, 10), LastChildFill = true };
+        var header = new Grid { Margin = new Thickness(0, 0, 0, 10) };
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.ColumnDefinitions.Add(new ColumnDefinition());
         var actions = new WrapPanel { HorizontalAlignment = HorizontalAlignment.Right };
-        DockPanel.SetDock(actions, Dock.Right);
+        Grid.SetColumn(actions, 1);
+        var modelLabel = new FrameworkElementFactory(typeof(TextBlock));
+        modelLabel.SetBinding(TextBlock.TextProperty, new Binding());
+        modelLabel.SetValue(TextBlock.TextTrimmingProperty, TextTrimming.CharacterEllipsis);
+        modelButton.MaxWidth = 170;
+        modelButton.ContentTemplate = new DataTemplate { VisualTree = modelLabel };
         actions.Children.Add(Tool(modelButton, async () => await PickModelAsync()));
         actions.Children.Add(Tool("历史", async () => await ShowHistoryAsync()));
         actions.Children.Add(Tool("新建", async () => await OpenSessionAsync(null)));
@@ -131,7 +141,7 @@ internal sealed partial class ResearchWindow : Window
         var appearance = new Button { Content = "外观" };
         actions.Children.Add(Tool(appearance, () =>
         {
-            var menu = new ContextMenu { PlacementTarget = appearance };
+            var menu = ThemedMenu(appearance);
             foreach (var (label, value) in Themes)
             {
                 var item = new MenuItem { Header = label, IsCheckable = true, IsChecked = settings.Theme == value };
@@ -143,7 +153,11 @@ internal sealed partial class ResearchWindow : Window
             return Task.CompletedTask;
         }));
         header.Children.Add(actions);
-        var identity = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+        var identity = new StackPanel
+        {
+            Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 10, 0), ToolTip = "Research Companion " + App.Version
+        };
         identity.Children.Add(brand);
         identity.Children.Add(new TextBlock {
             Text = "科研助手", FontSize = 15, FontWeight = FontWeights.SemiBold,
@@ -162,16 +176,18 @@ internal sealed partial class ResearchWindow : Window
             return Task.CompletedTask;
         }));
         materialControls.Children.Add(Tool(manual, ManualSelectionAsync));
-        materialControls.Children.Add(Tool(removeFile, async () => { document = null; UpdateMaterial(); await RenderAsync(); }));
+        materialControls.Children.Add(Tool(removeFile, RemoveSessionFileAsync));
         materialControls.Children.Add(Tool(removeSelection, async () => { selection = null; UpdateMaterial(); await RenderAsync(); }));
         include.Margin = new Thickness(7, 2, 0, 3);
+        include.Checked += (_, _) => SaveSessionFile();
+        include.Unchecked += (_, _) => SaveSessionFile();
         materialControls.Children.Add(include);
         material.Children.Add(materialControls);
         materialName.Margin = new Thickness(0, 6, 0, 2);
         material.Children.Add(materialName);
         selectionPreview.Margin = new Thickness(0, 5, 0, 0);
         material.Children.Add(selectionPreview);
-        var top = new StackPanel { Margin = new Thickness(18, 10, 18, 12) };
+        var top = new StackPanel { Margin = new Thickness(22, 10, 22, 12) };
         top.Children.Add(header);
         var materialCard = Panel(material);
         materialCard.AllowDrop = true;
@@ -190,7 +206,14 @@ internal sealed partial class ResearchWindow : Window
 
         Grid.SetRow(transcript.Control, 1);
         layout.Children.Add(transcript.Control);
-        var bottom = new StackPanel { Margin = new Thickness(18, 8, 18, 8) };
+        var bottom = new StackPanel { Margin = new Thickness(22, 8, 22, 8) };
+        SizeChanged += (_, e) =>
+        {
+            if (!e.WidthChanged || (e.PreviousSize.Width < 520) == (e.NewSize.Width < 520)) return;
+            double inset = e.NewSize.Width < 520 ? 14 : 22;
+            top.Margin = new Thickness(inset, 10, inset, 12);
+            bottom.Margin = new Thickness(inset, 8, inset, 8);
+        };
         composer.BorderThickness = new Thickness(0);
         composer.Padding = new Thickness(4, 4, 4, 2);
         composer.PreviewKeyDown += async (_, e) =>
@@ -269,7 +292,7 @@ internal sealed partial class ResearchWindow : Window
 
     private void ConfigureTray()
     {
-        tray.Text = "Research Companion · 科研助手";
+        tray.Text = "Research Companion " + App.Version;
         var icon = System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!);
         if (icon != null) tray.Icon = icon;
         var menu = new Forms.ContextMenuStrip();
@@ -352,7 +375,9 @@ internal sealed partial class ResearchWindow : Window
 
     private void SaveSettings()
     {
-        settings = settings with { Draft = composer.Text, Workspace = workspace, Session = session };
+        settings = settings with { Draft = composer.Text };
+        if (connection != null && workspace != null)
+            settings = settings with { Workspace = workspace, Session = session, RecoveryHost = connection.RecoveryHost };
         settings.Save();
     }
 
@@ -376,28 +401,12 @@ internal sealed partial class ResearchWindow : Window
         Resources[SystemColors.ControlTextBrushKey] = ink;
         Resources[SystemColors.GrayTextBrushKey] = hint;
         foreach (var panel in panels) { panel.Background = raised; panel.BorderBrush = rule; }
+        var template = ButtonTemplate(accent);
         foreach (var button in buttons)
         {
             button.Background = raised;
             button.Foreground = ink;
             button.BorderBrush = rule;
-            var frame = new FrameworkElementFactory(typeof(Border));
-            frame.SetValue(Border.CornerRadiusProperty, new CornerRadius(7));
-            frame.SetValue(Border.BorderThicknessProperty, new Thickness(1));
-            frame.SetBinding(Border.BackgroundProperty, new System.Windows.Data.Binding(nameof(Button.Background)) { RelativeSource = System.Windows.Data.RelativeSource.TemplatedParent });
-            frame.SetBinding(Border.BorderBrushProperty, new System.Windows.Data.Binding(nameof(Button.BorderBrush)) { RelativeSource = System.Windows.Data.RelativeSource.TemplatedParent });
-            var content = new FrameworkElementFactory(typeof(ContentPresenter));
-            content.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Center);
-            content.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
-            content.SetBinding(FrameworkElement.MarginProperty, new System.Windows.Data.Binding(nameof(Button.Padding)) { RelativeSource = System.Windows.Data.RelativeSource.TemplatedParent });
-            frame.AppendChild(content);
-            var template = new ControlTemplate(typeof(Button)) { VisualTree = frame };
-            var disabled = new Trigger { Property = IsEnabledProperty, Value = false };
-            disabled.Setters.Add(new Setter(OpacityProperty, 0.45));
-            template.Triggers.Add(disabled);
-            var hover = new Trigger { Property = IsMouseOverProperty, Value = true };
-            hover.Setters.Add(new Setter(BorderBrushProperty, accent));
-            template.Triggers.Add(hover);
             button.Template = template;
         }
         foreach (var box in new[] { composer, selectionPreview })
@@ -409,9 +418,49 @@ internal sealed partial class ResearchWindow : Window
         send.Foreground = ColorBrush(dark ? "#121821" : "#ffffff");
         include.Foreground = ink;
         status.Foreground = materialName.Foreground = hint;
-        brand.Source = LoadBrandMark(dark);
+        brand.Source = dark ? darkMark.Value : lightMark.Value;
         ApplyTitleBar();
         _ = transcript.UpdateThemeAsync(dark);
+    }
+
+    private ContextMenu ThemedMenu(FrameworkElement anchor)
+    {
+        var menu = new ContextMenu
+        {
+            PlacementTarget = anchor, Background = pin.Background, Foreground = Foreground, BorderBrush = pin.BorderBrush
+        };
+        var item = new Style(typeof(MenuItem));
+        item.Setters.Add(new Setter(ForegroundProperty, Foreground));
+        var highlight = new Trigger { Property = MenuItem.IsHighlightedProperty, Value = true };
+        highlight.Setters.Add(new Setter(ForegroundProperty, ColorBrush("#182235")));
+        item.Triggers.Add(highlight);
+        menu.ItemContainerStyle = item;
+        return menu;
+    }
+
+    private static ControlTemplate ButtonTemplate(Brush accent)
+    {
+        var frame = new FrameworkElementFactory(typeof(Border), "Frame");
+        frame.SetValue(Border.CornerRadiusProperty, new CornerRadius(7));
+        frame.SetValue(Border.BorderThicknessProperty, new Thickness(1));
+        frame.SetBinding(Border.BackgroundProperty, new Binding(nameof(Button.Background)) { RelativeSource = RelativeSource.TemplatedParent });
+        frame.SetBinding(Border.BorderBrushProperty, new Binding(nameof(Button.BorderBrush)) { RelativeSource = RelativeSource.TemplatedParent });
+        var content = new FrameworkElementFactory(typeof(ContentPresenter));
+        content.SetValue(HorizontalAlignmentProperty, HorizontalAlignment.Center);
+        content.SetValue(VerticalAlignmentProperty, VerticalAlignment.Center);
+        content.SetBinding(MarginProperty, new Binding(nameof(Button.Padding)) { RelativeSource = RelativeSource.TemplatedParent });
+        frame.AppendChild(content);
+        var template = new ControlTemplate(typeof(Button)) { VisualTree = frame };
+        var disabled = new Trigger { Property = IsEnabledProperty, Value = false };
+        disabled.Setters.Add(new Setter(OpacityProperty, 0.45));
+        template.Triggers.Add(disabled);
+        foreach (var property in new[] { IsMouseOverProperty, IsKeyboardFocusedProperty })
+        {
+            var active = new Trigger { Property = property, Value = true };
+            active.Setters.Add(new Setter(Border.BorderBrushProperty, accent, "Frame"));
+            template.Triggers.Add(active);
+        }
+        return template;
     }
 
     private static SolidColorBrush ColorBrush(string hex) =>
@@ -446,15 +495,16 @@ internal sealed partial class ResearchWindow : Window
 
     private void UpdateMaterial()
     {
-        materialName.Text = document == null ? "当前无附带文件" :
-            document.Title + (document.IsPdf ? " · " + document.PageCount + " 页" : " · 文本");
+        materialName.Text = document == null
+            ? attachedFileNeedsReview ? "已关联文件无法核对，请重新选择或移除" : "当前无附带文件"
+            : document.Title + (document.IsPdf ? " · " + document.PageCount + " 页" : " · 文本");
         recognize.Visibility = previewDocument.Visibility = document?.IsPdf == true ? Visibility.Visible : Visibility.Collapsed;
-        removeFile.Visibility = document != null ? Visibility.Visible : Visibility.Collapsed;
+        removeFile.Visibility = document != null || attachedFileNeedsReview ? Visibility.Visible : Visibility.Collapsed;
         removeSelection.Visibility = selection != null ? Visibility.Visible : Visibility.Collapsed;
         selectionPreview.Visibility = removeSelection.Visibility;
         selectionPreview.Text = selection == null ? "" :
             $"{selection.Application} · {selection.Title ?? "出处未核验"}\n{selection.Text}";
-        include.Visibility = (selection != null || document != null) ? Visibility.Visible : Visibility.Collapsed;
+        include.Visibility = (selection != null || document != null || attachedFileNeedsReview) ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private async Task ImportAsync()
@@ -478,6 +528,10 @@ internal sealed partial class ResearchWindow : Window
         try
         {
             document = await PdfEvidence.OpenAsync(path, lifetime.Token, WindowsPdfOcr.RecognizeAsync);
+            attachedFileNeedsReview = false;
+            documentOcrRequested = false;
+            include.IsChecked = true;
+            SaveSessionFile();
             status.Text = document.IsPdf ? "文件已关联。复杂版式需核对原页。" : "文本已关联。";
             UpdateMaterial();
             await RenderAsync();
@@ -501,6 +555,11 @@ internal sealed partial class ResearchWindow : Window
                     status.Text = "正在本机识别扫描页…";
             });
             var result = await file.RecognizeMissingPagesAsync(progress, operation.Token);
+            if (result.RecognizedPages > 0)
+            {
+                documentOcrRequested = true;
+                SaveSessionFile();
+            }
             status.Text = result.MissingPages == 0 ? "文件各页已有可读取的文字。" :
                 $"扫描页 {result.MissingPages} 页，已识别 {result.RecognizedPages} 页。引文请核对原页。";
         }
@@ -660,7 +719,7 @@ internal sealed partial class ResearchWindow : Window
     }
 
     private sealed record UserSettings(bool Topmost = false, string Theme = "system", string Draft = "",
-        string? Workspace = null, string? Session = null, string? ZoteroPairingFile = null)
+        string? Workspace = null, string? Session = null, string? ZoteroPairingFile = null, string? RecoveryHost = null)
     {
         private static string FilePath => Path.Combine(App.Profile, "window.json");
         internal static UserSettings Load()

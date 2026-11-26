@@ -10,10 +10,10 @@ SetOverwrite on
 ShowInstDetails show
 ShowUninstDetails show
 
-VIProductVersion "${VERSION}.${WINDOWS_BUILD}"
+VIProductVersion "${VERSION}"
 VIAddVersionKey /LANG=1033 "ProductName" "Research Companion"
 VIAddVersionKey /LANG=1033 "FileDescription" "Research Companion Windows x64 Candidate"
-VIAddVersionKey /LANG=1033 "FileVersion" "${VERSION}.${WINDOWS_BUILD}"
+VIAddVersionKey /LANG=1033 "FileVersion" "${VERSION}"
 VIAddVersionKey /LANG=1033 "ProductVersion" "${VERSION}"
 VIAddVersionKey /LANG=1033 "LegalCopyright" "Research Companion contributors"
 
@@ -56,24 +56,78 @@ Var GuardMutex
   System::Call 'kernel32::CloseHandle(p $GuardMutex)'
 !macroend
 
-!macro RC_CheckDirectory suffix
-  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR${suffix}") i .r2'
+!macro RC_CheckPath path expected
+  System::Call 'kernel32::GetFileAttributesW(w "${path}") i .r2'
   ${If} $2 != -1
     IntOp $3 $2 & 0x410
     ; IntOp stores the result as a decimal string; LogicLib != compares strings.
-    ${If} $3 != 16
-      !insertmacro RC_Abort "The destination is redirected or is not a directory. 安装目录不是普通目录，未进行修改。"
+    ${If} $3 != ${expected}
+      !insertmacro RC_Abort "The install path is redirected or has an unexpected type. 安装路径被重定向或类型异常。"
     ${EndIf}
   ${EndIf}
 !macroend
 
-!macro RC_CheckManaged suffix
-  !insertmacro RC_CheckDirectory "${suffix}"
+!macro RC_CheckManaged prefix suffix
+  !insertmacro RC_CheckPath "$INSTDIR${suffix}" 16
   ${If} ${FileExists} "$INSTDIR${suffix}\*.*"
-  ${AndIfNot} ${FileExists} "$INSTDIR${suffix}\InstallReceipt.txt"
-    !insertmacro RC_Abort "This destination contains files not managed by this installer. 当前目录含有非本安装器管理的文件。"
+    Push "$INSTDIR${suffix}"
+    Call ${prefix}CheckTree
+    ClearErrors
+    FileOpen $2 "$INSTDIR${suffix}\InstallReceipt.txt" r
+    ${If} ${Errors}
+      !insertmacro RC_Abort "The destination is not managed by this installer. 当前目录缺少有效的安装收据。"
+    ${EndIf}
+    FileRead $2 $3
+    FileClose $2
+    ${If} $3 != "Research Companion per-user payload$\r$\n"
+    ${AndIf} $3 != "Research Companion per-user payload$\n"
+      !insertmacro RC_Abort "The destination is not managed by this installer. 当前目录缺少有效的安装收据。"
+    ${EndIf}
   ${EndIf}
 !macroend
+
+; NSIS recursive removal descends into directory reparse points.
+!macro RC_DefineCheckTree prefix
+Function ${prefix}CheckTree
+  Exch $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+  FindFirst $1 $2 "$0\*"
+  ${DoWhile} $2 != ""
+    ${If} $2 != "."
+    ${AndIf} $2 != ".."
+      System::Call 'kernel32::GetFileAttributesW(w "$0\$2") i .r3'
+      IntOp $4 $3 & 0x400
+      ${If} $3 == -1
+      ${OrIf} $4 != 0
+        FindClose $1
+        !insertmacro RC_Abort "The managed payload contains a redirected or inaccessible entry. 程序目录中有重定向或不可读取的项目。"
+      ${EndIf}
+      IntOp $4 $3 & 0x10
+      ${If} $4 == 16
+        Push "$0\$2"
+        Call ${prefix}CheckTree
+      ${EndIf}
+    ${EndIf}
+    ClearErrors
+    FindNext $1 $2
+    ${If} ${Errors}
+      ${ExitDo}
+    ${EndIf}
+  ${Loop}
+  FindClose $1
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
+!macroend
+
+!insertmacro RC_DefineCheckTree ""
+!insertmacro RC_DefineCheckTree "un."
 
 Function .onInit
   ${IfNot} ${AtLeastWin10}
@@ -84,10 +138,13 @@ Function .onInit
 FunctionEnd
 
 Section "Install"
-  !insertmacro RC_CheckDirectory ""
-  !insertmacro RC_CheckManaged "\app"
-  !insertmacro RC_CheckManaged "\app-new"
-  !insertmacro RC_CheckManaged "\app-old"
+  !insertmacro RC_CheckPath "$LOCALAPPDATA\Programs" 16
+  !insertmacro RC_CheckPath "$INSTDIR" 16
+  !insertmacro RC_CheckPath "$INSTDIR\Uninstall.exe" 0
+  !insertmacro RC_CheckPath "$SMPROGRAMS\Research Companion.lnk" 0
+  !insertmacro RC_CheckManaged "" "\app"
+  !insertmacro RC_CheckManaged "" "\app-new"
+  !insertmacro RC_CheckManaged "" "\app-old"
 
   ; Recover the previous copy if a power interruption occurred during promotion.
   ${If} ${FileExists} "$INSTDIR\app-old\InstallReceipt.txt"
@@ -123,7 +180,7 @@ Section "Install"
 
   CreateShortCut "$SMPROGRAMS\Research Companion.lnk" "$INSTDIR\app\ResearchCompanion.exe"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "Research Companion"
-  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "${VERSION}.${WINDOWS_BUILD}"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "${VERSION}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayIcon" '"$INSTDIR\app\ResearchCompanion.exe"'
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoModify" 1
@@ -151,10 +208,13 @@ Function un.onInit
 FunctionEnd
 
 Section "Uninstall"
-  !insertmacro RC_CheckDirectory ""
-  !insertmacro RC_CheckManaged "\app"
-  !insertmacro RC_CheckManaged "\app-new"
-  !insertmacro RC_CheckManaged "\app-old"
+  !insertmacro RC_CheckPath "$LOCALAPPDATA\Programs" 16
+  !insertmacro RC_CheckPath "$INSTDIR" 16
+  !insertmacro RC_CheckPath "$INSTDIR\Uninstall.exe" 0
+  !insertmacro RC_CheckPath "$SMPROGRAMS\Research Companion.lnk" 0
+  !insertmacro RC_CheckManaged "un." "\app"
+  !insertmacro RC_CheckManaged "un." "\app-new"
+  !insertmacro RC_CheckManaged "un." "\app-old"
   Delete "$SMPROGRAMS\Research Companion.lnk"
   RMDir /r "$INSTDIR\app"
   RMDir /r "$INSTDIR\app-new"

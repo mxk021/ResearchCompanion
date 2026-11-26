@@ -44,7 +44,8 @@ internal sealed partial class ResearchWindow
 
     private sealed record SourceReceipt(string RequestId, string Title, string Text, string Scope,
         string? Url, IReadOnlyList<DocumentExcerpt> Pages, bool DispatchVerified = false,
-        string? AppSourceLink = null, bool PositionVerified = false, IReadOnlyList<CropReceipt>? Crops = null);
+        string? AppSourceLink = null, bool PositionVerified = false, IReadOnlyList<CropReceipt>? Crops = null,
+        string? ZoteroPairingId = null);
     private sealed record CropReceipt(int Page, string Sha256);
     private sealed record SourceCrop(CropReceipt Receipt, byte[] Bytes)
     {
@@ -68,10 +69,12 @@ internal sealed partial class ResearchWindow
             var visible = Array(workspaceResponse, "workspaces").ToList();
             if (visible.Count != 1 || Text(visible[0], "id") is not string validWorkspace)
                 throw new InvalidDataException("科研桥未报告唯一科研工作区。请检查 DSH 插件。");
+            var priorHost = connection?.CurrentHost;
             if (connection != null) await connection.DisposeAsync();
             connection = newClient;
             newClient = null;
-            if (workspace != validWorkspace)
+            bool scopeChanged = workspace != validWorkspace || priorHost != connection.CurrentHost;
+            if (scopeChanged)
             {
                 workspace = validWorkspace;
                 session = null;
@@ -83,21 +86,37 @@ internal sealed partial class ResearchWindow
                 models.Clear();
                 UpdateModelButton();
                 blockedSession = null;
+                if (priorHost != null)
+                {
+                    ClearDocument();
+                    selection = null;
+                    UpdateMaterial();
+                }
             }
             await RefreshModelsAsync();
             if (session != null) await RefreshCurrentConversationAsync();
-            if (session == null && workspace == settings.Workspace && settings.Session != null)
+            if (session == null && workspace == settings.Workspace && settings.Session != null &&
+                (settings.RecoveryHost == null || settings.RecoveryHost == connection.RecoveryHost))
             {
                 try
                 {
                     var restored = await connection.RequestAsync("conversation", Target(settings.Session), lifetime.Token);
+                    if (Text(restored, "historyRevision") == null) throw new InvalidDataException("没有可用的会话数据。");
                     session = settings.Session;
                     lastConversation = restored;
+                    RestoreSessionModel(restored);
+                    MergeStream(Field(restored, "stream"));
                     await RenderAsync();
                 }
                 catch (BridgeRequestException) { session = null; }
             }
             status.Text = models.Count == 0 ? "DSH 已连接。请在 DSH 配置可用的账号模型。" : "DSH 已连接";
+            if (scopeChanged)
+            {
+                if (document == null) await RestoreSessionFileAsync();
+                else SaveSessionFile();
+                await RenderAsync();
+            }
         }
         catch
         {
@@ -139,23 +158,14 @@ internal sealed partial class ResearchWindow
     {
         if (busy) return Task.CompletedTask;
         if (models.Count == 0) throw new InvalidOperationException("没有可用账号模型。请先连接 DSH 并核对账号。");
-        var menu = new ContextMenu();
+        var menu = ThemedMenu(modelButton);
         foreach (var model in models)
         {
             var item = new MenuItem { Header = model.Name, IsCheckable = true, IsChecked = chosenModel == model };
-            item.Click += (_, _) =>
-            {
-                if (model.Provider == "deepseek-account" && MessageBox.Show(this,
-                    "是否为本会话使用 DeepSeek 账号模型？请求可能消耗账号余额。",
-                    "选择模型", MessageBoxButton.YesNo) != MessageBoxResult.Yes)
-                    return;
-                chosenModel = model;
-                UpdateModelButton();
-            };
+            item.Click += async (_, _) => await RunUiAsync(() => ChooseSessionModelAsync(model));
             menu.Items.Add(item);
         }
         modelButton.ContextMenu = menu;
-        menu.PlacementTarget = modelButton;
         menu.IsOpen = true;
         return Task.CompletedTask;
     }
@@ -163,6 +173,7 @@ internal sealed partial class ResearchWindow
     private void UpdateModelButton()
     {
         modelButton.Content = chosenModel?.Name ?? "选择模型";
+        modelButton.ToolTip = chosenModel?.Name;
         RefreshSendButton();
     }
 
@@ -214,6 +225,8 @@ internal sealed partial class ResearchWindow
         {
             status.Text = "正在核对材料…";
             string requestId = "dsh-pet-" + Guid.NewGuid();
+            if (include.IsChecked == true && attachedFileNeedsReview)
+                throw new InvalidDataException("已关联的文件无法核对。请重新选择文件，或移除此材料后提问。");
             var source = include.IsChecked == true ? await PrepareSourceAsync(question, requestId, ct) : null;
             IReadOnlyList<SourceCrop> crops = [];
             if (source?.Pages.Any(page => page.VisualRegion != null) == true)
@@ -233,7 +246,11 @@ internal sealed partial class ResearchWindow
                 fields["title"] = PlainLabel(question, 80);
                 var created = await client.RequestAsync("createSession", fields, ct);
                 if (Text(created, "sessionId") != createdId) throw new InvalidDataException("科研桥返回了不同的会话标识。");
+                var draftRecovery = RecoveryFor(null);
                 session = createdId;
+                SaveSessionFile();
+                draftRecovery?.Update(state => state with { File = null });
+                SaveSettings();
             }
             else
             {
@@ -250,7 +267,7 @@ internal sealed partial class ResearchWindow
             }).Task.Unwrap(), streamCancellation.Token);
             var modelRequest = Target(id);
             modelRequest["selection"] = choice.Wire();
-            await client.RequestAsync("researchSelectModel", modelRequest, ct);
+            await BindSessionModelAsync(client, id, choice, ct);
             var request = new Dictionary<string, object?>(modelRequest)
             {
                 ["requestId"] = requestId, ["text"] = question, ["mode"] = "ask",
@@ -372,17 +389,21 @@ internal sealed partial class ResearchWindow
         foreach (var page in regions)
         {
             var preview = await file.RenderCropAsync(page.Page, page.VisualRegion!.Value, cancellationToken);
-            var bitmap = BitmapSource.Create(preview.Width, preview.Height, 96, 96,
-                PixelFormats.Bgr32, null, preview.Pixels, preview.Stride);
-            var encoder = new PngBitmapEncoder();
-            encoder.Frames.Add(BitmapFrame.Create(bitmap));
-            using var encoded = new MemoryStream();
-            encoder.Save(encoded);
-            total += encoded.Length;
-            if (encoded.Length > maxImageBytes || total > maxTotalBytes)
+            var crop = await Task.Run(() =>
+            {
+                var bitmap = BitmapSource.Create(preview.Width, preview.Height, 96, 96,
+                    PixelFormats.Bgr32, null, preview.Pixels, preview.Stride);
+                var encoder = new PngBitmapEncoder();
+                encoder.Frames.Add(BitmapFrame.Create(bitmap));
+                using var encoded = new MemoryStream();
+                encoder.Save(encoded);
+                var bytes = encoded.ToArray();
+                return new SourceCrop(new CropReceipt(page.Page, Convert.ToHexStringLower(SHA256.HashData(bytes))), bytes);
+            }, cancellationToken);
+            total += crop.Bytes.Length;
+            if (crop.Bytes.Length > maxImageBytes || total > maxTotalBytes)
                 throw new InvalidDataException("原页裁图超过 DSH 图像大小限制，请缩小问题范围。");
-            var bytes = encoded.ToArray();
-            crops.Add(new(new(page.Page, Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant()), bytes));
+            crops.Add(crop);
         }
         return crops;
     }
@@ -415,7 +436,8 @@ internal sealed partial class ResearchWindow
             pages.Count == 0 && currentSelection!.ProvenanceVerified ? CleanSourceUrl(currentSelection.Url) : null, pages,
             AppSourceLink: pages.Count == 0 && currentSelection?.Application == "Zotero" &&
                 currentSelection.ProvenanceVerified ? ZoteroLink(currentSelection.Url) : null,
-            PositionVerified: pages.Count > 0 || currentSelection?.ProvenanceVerified == true);
+            PositionVerified: pages.Count > 0 || currentSelection?.ProvenanceVerified == true,
+            ZoteroPairingId: pages.Count == 0 ? currentSelection?.ZoteroPairingId : null);
     }
 
     private static bool VerifyDispatch(JsonElement proof, SourceReceipt source, ModelChoice choice) =>
@@ -437,7 +459,7 @@ internal sealed partial class ResearchWindow
         session = id;
         activeStream = default;
         streamRevision = -1;
-        document = null;
+        ClearDocument();
         selection = null;
         chosenModel = null;
         lastConversation = default;
@@ -447,8 +469,14 @@ internal sealed partial class ResearchWindow
         UpdateModelButton();
         UpdateMaterial();
         ++jump;
-        if (id != null) await RefreshCurrentConversationAsync();
-        else await RenderAsync();
+        SetBusy(true);
+        try
+        {
+            if (id != null) await RefreshCurrentConversationAsync();
+            await RestoreSessionFileAsync();
+            await RenderAsync();
+        }
+        finally { SetBusy(false); }
     }
 
     private async Task RefreshCurrentConversationAsync()
@@ -456,6 +484,7 @@ internal sealed partial class ResearchWindow
         if (session == null || connection == null) return;
         lastConversation = await connection.RequestAsync("conversation", Target(session), lifetime.Token);
         if (Text(lastConversation, "historyRevision") == null) throw new InvalidDataException("没有可用的会话数据。");
+        if (chosenModel == null) RestoreSessionModel(lastConversation);
         MergeStream(Field(lastConversation, "stream"));
         await RenderAsync();
     }
@@ -585,7 +614,8 @@ internal sealed partial class ResearchWindow
                 if (Text(action, "sourceID") != null) ShowSourceExcerpt(source.Source);
                 else if (source.Source.Pages.Count > 0) await OpenDocumentSourceAsync(source.Source);
                 else if (CleanSourceUrl(source.Source.Url) is string address) OpenExternal(address);
-                else if (ZoteroLink(source.Source.AppSourceLink) is string zotero) OpenExternal(zotero);
+                else if (ZoteroLink(source.Source.AppSourceLink) is string zotero)
+                    selectionProvider.OpenZoteroSource(zotero, source.Source.ZoteroPairingId);
                 return;
             }
             if (Text(action, "noteID") is string noteId && notes.TryGetValue(noteId, out var note))

@@ -9,6 +9,7 @@ import { apply } from '../lib/index.js'
 import { researchPrompt, DEFAULT_PERSONA } from '../lib/ResearchContext.js'
 import { BridgeClient } from '../scripts/probe-companion.mjs'
 import { clearAmbientHarnessEnv } from './ambient-env.mjs'
+import { authenticateTestPipe } from './windows-test-pipe.mjs'
 
 clearAmbientHarnessEnv()
 
@@ -177,6 +178,7 @@ async function harness(run) {
     apply(ctx)
     const manifest = await manifestAt(process.env.DSH_PET_INSTANCE_DIRECTORY)
     client = new BridgeClient(manifest.commandSocketPath)
+    await authenticateTestPipe(client.socket, manifest)
     await run({ client, state, routes, calls, research, original, ctx, eventHandlers, researchPath })
   } finally {
     client?.close()

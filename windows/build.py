@@ -7,12 +7,14 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+from xml.etree import ElementTree
 import zipfile
 
 
@@ -20,8 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 WINDOWS = ROOT / "windows"
 APP = WINDOWS / "ResearchCompanion.Windows"
 PROJECT = APP / "ResearchCompanion.Windows.csproj"
-VERSION = json.loads((ROOT / "release.json").read_text(encoding="utf-8"))["version"]
-WINDOWS_BUILD = 1
+VERSION = ElementTree.parse(PROJECT).findtext("./PropertyGroup/Version")
 PDFIUM_SHA256 = "ca7338ae7779b8b1b82f4580305c4d762d214f8df1d54b47647fe3cc75989ded"
 RUNTIME_LICENSES = {
     "Microsoft.NETCore.App.Runtime.win-x64": ("LICENSE.TXT", "THIRD-PARTY-NOTICES.TXT"),
@@ -86,7 +87,9 @@ def build_brand(destination):
     entry = (ROOT / "Resources" / "Transcript" / "index.html").read_text(encoding="utf-8")
     if entry.count("img-src file:;") != 1:
         raise ValueError("The shared transcript image policy changed.")
-    (destination / "index.html").write_text(entry.replace("img-src file:;", "img-src 'self';"), encoding="utf-8")
+    entry = entry.replace("img-src file:;", "img-src 'self';")
+    font_style = '<style>:root { font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif; }</style>'
+    (destination / "index.html").write_text(entry.replace("</head>", f"  {font_style}\n</head>"), encoding="utf-8")
 
 
 def pe_machine(path):
@@ -172,6 +175,8 @@ def verify_payload(payload):
 
 
 def package(args):
+    if VERSION is None or not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", VERSION):
+        raise ValueError("Expected a four-part Windows application version in the project file.")
     brand = args.brand_dir.resolve()
     build_brand(brand)
     if args.brand_only:
@@ -194,7 +199,7 @@ def package(args):
         env = {**os.environ, "NUGET_PACKAGES": str(args.nuget_cache.resolve())}
         run(args.dotnet, "publish", PROJECT, "--self-contained", "--no-restore", "--disable-build-servers",
             "-c", "Release", "-r", "win-x64", "-o", payload, f"-p:BrandDir={brand}",
-            f"-p:FileVersion={VERSION}.{WINDOWS_BUILD}", "-p:DebugType=None", "-p:DebugSymbols=false", env=env)
+            "-p:DebugType=None", "-p:DebugSymbols=false", env=env)
         shutil.copytree(ROOT / "Resources" / "LicenseNotices", payload / "LicenseNotices", dirs_exist_ok=True)
         shutil.copyfile(ROOT / "Resources" / "ThirdPartyNotices.txt", payload / "ThirdPartyNotices.txt")
         shutil.copyfile(ROOT / "LICENSE", payload / "LICENSE")
@@ -213,7 +218,7 @@ def package(args):
         verify_payload(payload)
         run(
             args.makensis, "-V2", "-WX", "-INPUTCHARSET", "UTF8",
-            f"-DVERSION={VERSION}", f"-DWINDOWS_BUILD={WINDOWS_BUILD}",
+            f"-DVERSION={VERSION}",
             f"-DPAYLOAD_RECEIPT={payload / 'InstallReceipt.txt'}",
             f"-DPAYLOAD_FILES={payload / '*'}", f"-DOUTPUT={installer}",
             f"-DICON={brand / 'ResearchCompanion.ico'}", f"-DLICENSE={ROOT / 'LICENSE'}",

@@ -49,6 +49,24 @@ try
         "figure crop contains original dark pixels");
     var equation = (await figures.RetrieveAsync("说明公式（3）"))[0];
     Verify(equation.VisualRegion is { Height: < 0.16 } && equation.Text.Contains("37x"), "equation region and exact registered text");
+    var separated = Fixture("separated-equation.pdf");
+    const string wideEquation = "BT /F1 24 Tf 110 500 Td (y = 37x + 2        \\(3\\)) Tj ET\n";
+    const string separateEquationObjects = "BT /F1 15 Tf 54 500 Td (y = 37 * x + 2) Tj ET\n" +
+        "BT /F1 15 Tf 429 500 Td (\\(4\\)) Tj ET\n";
+    MakePdf(separated, [wideEquation, separateEquationObjects]);
+    var displays = await PdfEvidence.OpenAsync(separated);
+    var wide = (await displays.RetrieveAsync("说明第 1 页公式（3）"))[0];
+    Verify(wide.Text == "y = 37x + 2 (3)" && wide.Regions.Count == 2 &&
+        wide.VisualRegion is { Height: < 0.12 } wideCrop &&
+        wideCrop.X < wide.Regions[0].X && wideCrop.Right > wide.Regions[1].Right,
+        "one PDF text object with a right-separated equation number");
+    var distinctObjects = (await displays.RetrieveAsync("Explain equation (4)"))[0];
+    Verify(distinctObjects.Text == "y = 37 * x + 2 (4)" && distinctObjects.Regions.Count == 2 &&
+        distinctObjects.VisualRegion is { Height: < 0.12 } rowCrop && rowCrop.Right > 0.72,
+        "two same-baseline PDF text objects provide a complete equation crop");
+    await Reject(() => displays.RetrieveAsync("说明第 1 页左栏公式（3）"), "未能定位",
+        "a separated equation cannot establish an explicit column");
+
     Verify((await figures.RetrieveAsync("解释 Table 2"))[0].VisualRegion != null, "numbered table region");
     var recognized = await PdfEvidence.OpenAsync(passage, recognize: (preview, ct) =>
         Task.FromResult<IReadOnlyList<PdfOcrLine>>([new("OCR orchard sample", new(0.14, 0.20, 0.56, 0.04))]));
@@ -75,6 +93,11 @@ try
         ordered.Text.IndexOf("Right: violet", StringComparison.Ordinal), "interleaved objects restored by column");
     var left = (await columns.RetrieveAsync("读取第 1 页左栏"))[0];
     Verify(left.Text.Contains("Left: charlie") && !left.Text.Contains("Right"), "left column isolation");
+    var crossColumn = Fixture("column-equation.pdf");
+    MakePdf(crossColumn, [columnContent + separateEquationObjects.Replace(" 500 Td", " 620 Td", StringComparison.Ordinal)]);
+    var columnEquation = await PdfEvidence.OpenAsync(crossColumn);
+    await Reject(() => columnEquation.RetrieveAsync("Explain equation (4)"), "未能定位",
+        "separated runs cannot bind a number across a detected column layout");
 
     var mixed = Fixture("mixed-layout.pdf");
     MakePdf(mixed, [columnContent + Sheet((60, 680,
@@ -90,6 +113,39 @@ try
     var preview = await geometry.RenderPageAsync(1, width: 460);
     Verify(preview.Width == 460 && preview.Height > preview.Width && preview.Stride == preview.Width * 4 &&
         DarkFraction(preview, region) > 0.04, "rotated CropBox source rectangle agrees with preview pixels");
+
+    var recoveryDir = Fixture("recovery");
+    var recovery = new SessionRecovery(recoveryDir, "desktop-target-a", "workspace-a", "session-a");
+    var scopedModel = new SavedResearchModel("deepseek-account", "deepseek-v4-flash", null);
+    var savedFile = new SavedResearchFile(passage, document.Fingerprint, RecognizeScans: true, Include: false);
+    recovery.Update(_ => new(scopedModel, savedFile));
+    var reloaded = new SessionRecovery(recoveryDir, "desktop-target-a", "workspace-a", "session-a").Read();
+    Verify(reloaded.Model == scopedModel && reloaded.File == savedFile &&
+        reloaded.Model.Matches("deepseek-account", "deepseek-v4-flash", null) &&
+        !reloaded.Model.Matches("deepseek-account", "deepseek-v4-flash", "high"),
+        "restart record retains exact session model and disabled material context");
+    Verify(new SessionRecovery(recoveryDir, "desktop-target-b", "workspace-a", "session-a").Read() == new SavedResearchSession() &&
+        new SessionRecovery(recoveryDir, "desktop-target-a", "workspace-b", "session-a").Read() == new SavedResearchSession() &&
+        new SessionRecovery(recoveryDir, "desktop-target-a", "workspace-a", "session-b").Read() == new SavedResearchSession() &&
+        new SessionRecovery(recoveryDir, "desktop-target-a", "workspace-a", null).Read() == new SavedResearchSession(),
+        "explicit selection never survives a workspace, host or session change");
+    recovery.Update(state => state with { File = null });
+    Verify(recovery.Read() == new SavedResearchSession(scopedModel), "detaching a file retains only the scoped model");
+    if (OperatingSystem.IsWindows())
+    {
+        Task<IReadOnlyList<PdfOcrLine>> Ocr(PagePreview preview, CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<PdfOcrLine>>([new("Restored local OCR", new(0.14, 0.20, 0.56, 0.04))]);
+        var reopened = await SessionRecovery.OpenFileAsync(savedFile, Ocr, CancellationToken.None);
+        var restoredOcr = (await reopened.RetrieveAsync("读第 4 页"))[0];
+        Verify(reopened.Fingerprint == document.Fingerprint && restoredOcr.Text == "Restored local OCR" &&
+            restoredOcr.Recognition != null, "matching local PDF restores its OCR request");
+        await Reject(() => SessionRecovery.OpenFileAsync(savedFile with { Fingerprint = new string('0', 64) },
+            Ocr, CancellationToken.None), "内容已更新", "changed PDF is excluded before recognition");
+        await Reject(() => SessionRecovery.OpenFileAsync(savedFile with { Path = Path.GetFileName(passage) },
+            Ocr, CancellationToken.None), "不再是本机", "relative reference is excluded from restore");
+        await Reject(() => SessionRecovery.OpenFileAsync(savedFile with { Path = passage + ":alternate" },
+            Ocr, CancellationToken.None), "不再是本机", "alternate stream is excluded from restore");
+    }
 
     var notes = Fixture("notes.md");
     await File.WriteAllTextAsync(notes, "# A test\n科研摘要：线索原文。\n准确核验。\n");

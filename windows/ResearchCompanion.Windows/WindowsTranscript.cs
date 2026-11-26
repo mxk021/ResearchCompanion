@@ -2,15 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 
 namespace ResearchCompanion.Windows;
-
-internal sealed record TranscriptRow(string Id, string Role, string Text, bool CanOpenSource = false,
-    string? SourceDisplay = null, string? SourceTitle = null, string? SourcePage = null,
-    string? SourceDetails = null, string? SourceWarning = null, string? Original = null, bool Streaming = false);
 
 internal sealed class WindowsTranscript : IDisposable
 {
@@ -21,7 +18,9 @@ internal sealed class WindowsTranscript : IDisposable
     internal WebView2 Control => view;
     private bool ready;
     private bool dark;
-    private string? currentSnapshot;
+    private readonly TranscriptDelivery delivery;
+
+    internal WindowsTranscript() => delivery = new(RenderAsync);
 
     internal event Action<JsonElement>? Interaction;
 
@@ -38,7 +37,13 @@ internal sealed class WindowsTranscript : IDisposable
         core.Settings.AreDefaultContextMenusEnabled = false;
         core.Settings.IsStatusBarEnabled = false;
         core.Settings.AreHostObjectsAllowed = false;
-        core.NavigationStarting += (_, e) => e.Cancel = e.Uri != StartPage;
+        core.NavigationStarting += (_, e) =>
+        {
+            e.Cancel = e.Uri != StartPage;
+            if (e.Cancel) return;
+            ready = false;
+            delivery.Reset();
+        };
         core.FrameNavigationStarting += (_, e) => e.Cancel = true;
         core.NewWindowRequested += (_, e) => e.Handled = true;
         core.DownloadStarting += (_, e) => e.Cancel = true;
@@ -73,7 +78,11 @@ internal sealed class WindowsTranscript : IDisposable
             {
                 ready = true;
                 await UpdateThemeAsync(dark);
-                if (currentSnapshot != null) await RenderAsync(currentSnapshot);
+                try { await delivery.ReadyAsync(); }
+                catch (Exception error) when (error is InvalidOperationException or COMException)
+                {
+                    System.Diagnostics.Trace.TraceWarning("Could not load the research conversation renderer.");
+                }
                 return;
             }
             if (ready) Interaction?.Invoke(root.Clone());
@@ -81,18 +90,16 @@ internal sealed class WindowsTranscript : IDisposable
         core.Navigate(StartPage);
     }
 
-    internal Task PushAsync(string session, IReadOnlyList<TranscriptRow> rows, string emptyGuidance, int jump)
-    {
-        var order = new string[rows.Count];
-        for (var i = 0; i < order.Length; i++) order[i] = rows[i].Id;
-        var snapshot = JsonSerializer.Serialize(new { session, rows, order, emptyGuidance, jump }, Json);
-        if (currentSnapshot == snapshot) return Task.CompletedTask;
-        currentSnapshot = snapshot;
-        return ready ? RenderAsync(snapshot) : Task.CompletedTask;
-    }
+    internal Task PushAsync(string session, IReadOnlyList<TranscriptRow> rows, string emptyGuidance, int jump) =>
+        delivery.PushAsync(session, rows, emptyGuidance, jump);
 
-    private Task<string> RenderAsync(string snapshot) =>
-        view.CoreWebView2.ExecuteScriptAsync("window.ResearchTranscript.update(" + snapshot + ");");
+    private async Task<bool> RenderAsync(TranscriptPatch patch)
+    {
+        var json = JsonSerializer.Serialize(patch, Json);
+        var result = await view.CoreWebView2.ExecuteScriptAsync(
+            "(() => { window.ResearchTranscript.update(" + json + "); return true; })()");
+        return result == "true";
+    }
 
     internal Task UpdateThemeAsync(bool value)
     {
@@ -110,5 +117,10 @@ internal sealed class WindowsTranscript : IDisposable
             + JsonSerializer.Serialize(revealId ?? "", Json) + ");")
         : Task.CompletedTask;
 
-    public void Dispose() => view.Dispose();
+    public void Dispose()
+    {
+        ready = false;
+        delivery.Reset();
+        view.Dispose();
+    }
 }

@@ -194,7 +194,8 @@ def verify(executable, fixture, root, package, expected_text, page):
     env = dict(os.environ, MOZ_HEADLESS='1', MOZ_NO_REMOTE='1', MOZ_CRASHREPORTER_DISABLE='1', TMPDIR=str(root))
     result_file = profile / 'fixture-result.json'
     with (root / 'launch.log').open('w') as log:
-        proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env, start_new_session=True)
+        proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env,
+                                start_new_session=os.name != 'nt')
         try:
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline and proc.poll() is None and not result_file.exists():
@@ -211,11 +212,17 @@ def verify(executable, fixture, root, package, expected_text, page):
                 raise SystemExit('The native reader result differed from the expected selection.')
         finally:
             if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGTERM)
+                if os.name == 'nt':
+                    proc.terminate()
+                else:
+                    os.killpg(proc.pid, signal.SIGTERM)
                 try:
                     proc.wait(timeout=6)
                 except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    if os.name == 'nt':
+                        proc.kill()
+                    else:
+                        os.killpg(proc.pid, signal.SIGKILL)
                     proc.wait()
 
 

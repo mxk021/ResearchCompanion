@@ -292,20 +292,35 @@ internal sealed class PdfEvidence
         foreach (var original in indexed)
         {
             var page = column == 0 ? original : original.ForColumn(column);
-            foreach (var line in page.Lines)
+            for (int i = 0; i < page.Lines.Length; i++)
             {
+                var line = page.Lines[i];
                 if (line.Content is not { Fault: false, Region: PdfRegion location }) continue;
                 string text = line.Content.Text.Trim();
                 var label = NumberedObject.Match(text);
                 var tag = target.Type == "equation" ? EquationTag.Match(text) : Match.Empty;
                 bool isLabel = label.Success && label.Index == 0 && ObjectType(label.Groups["type"].Value) == target.Type
                     && label.Groups["id"].Value.Equals(target.Id, StringComparison.OrdinalIgnoreCase);
-                bool isEquation = tag.Success && tag.Groups["id"].Value.Equals(target.Id, StringComparison.OrdinalIgnoreCase)
-                    && EquationInk.IsMatch(text[..tag.Index]);
+                bool expectedTag = tag.Success && tag.Groups["id"].Value.Equals(target.Id, StringComparison.OrdinalIgnoreCase);
+                bool isEquation = expectedTag && EquationInk.IsMatch(text[..tag.Index]);
+                var region = location;
+                TextLine? equationBody = null;
+                if (expectedTag && tag.Index == 0 && column == 0 && !page.HasColumns &&
+                    line.Content.FollowsSeparatedRun && i > 0 &&
+                    page.Lines[i - 1].Content is { Fault: false, Region: PdfRegion body } previous &&
+                    EquationInk.IsMatch(previous.Text) &&
+                    Math.Min(body.Bottom, location.Bottom) - Math.Max(body.Y, location.Y) >=
+                    Math.Min(body.Height, location.Height) * 0.5)
+                {
+                    // The gutter check split this PDFium text row. Fuse only
+                    // the verified display and its standalone printed number.
+                    equationBody = page.Lines[i - 1];
+                    region = Union(body, location);
+                    isEquation = true;
+                }
                 if (!isLabel && !isEquation) continue;
                 if (isLabel && target.Type == "equation" && !EquationInk.IsMatch(text)) continue;
 
-                var region = location;
                 if (target.Type != "equation")
                 {
                     // Include the adjacent original-page area as well as its identified caption.
@@ -330,7 +345,8 @@ internal sealed class PdfEvidence
                     region = new PdfRegion(x, y, Math.Min(1, region.Right + 0.025) - x,
                         Math.Min(1, region.Bottom + 0.022) - y);
                 }
-                var excerpt = VerifiedExcerpt(page, line.Start, line.End, mayUseIsolatedLine: true);
+                var excerpt = VerifiedExcerpt(page, equationBody?.Start ?? line.Start, line.End, mayUseIsolatedLine: true);
+                if (equationBody != null) excerpt = excerpt with { Text = equationBody.Content.Text.TrimEnd() + " " + text };
                 matches.Add(excerpt with { VisualRegion = region });
             }
         }
@@ -613,10 +629,12 @@ internal sealed class PdfEvidence
     private static Regex Pattern(string expression) =>
         new(expression, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(300));
 
-    private sealed record LineContent(string Text, PdfRegion? Region, bool Fault, int Column = 0);
+    private sealed record LineContent(string Text, PdfRegion? Region, bool Fault, int Column = 0,
+        bool FollowsSeparatedRun = false);
     private sealed record TextLine(LineContent Content, int Start, int End);
 
-    private sealed record PageText(int Number, string Text, TextLine[] Lines, bool Ambiguous, string? Recognition = null)
+    private sealed record PageText(int Number, string Text, TextLine[] Lines, bool Ambiguous, string? Recognition = null,
+        bool HasColumns = false)
     {
         public static PageText Assemble(int number, IEnumerable<LineContent> contents, bool ambiguous)
         {
@@ -670,6 +688,7 @@ internal sealed class PdfEvidence
         PdfRegion? previous = null;
         var fault = false;
         var separatedRuns = false;
+        var followsSeparatedRun = false;
         var newLine = false;
 
         void CloseLine()
@@ -678,12 +697,13 @@ internal sealed class PdfEvidence
             {
                 var lineText = line.ToString();
                 var lacksPosition = region is null && !string.IsNullOrWhiteSpace(lineText);
-                result.Add(new LineContent(lineText, region, fault || lacksPosition));
+                result.Add(new LineContent(lineText, region, fault || lacksPosition, FollowsSeparatedRun: followsSeparatedRun));
             }
             line.Clear();
             region = null;
             previous = null;
             fault = false;
+            followsSeparatedRun = false;
         }
 
         for (var index = 0; index < count; index++)
@@ -712,6 +732,7 @@ internal sealed class PdfEvidence
                 while (line.Length > 0 && char.IsWhiteSpace(line[^1])) line.Length--;
                 CloseLine();
                 separatedRuns = true;
+                followsSeparatedRun = true;
             }
             if (!decoded)
             {
@@ -757,10 +778,10 @@ internal sealed class PdfEvidence
         ambiguous |= withRegion.Any(line => line.Fault || HasRightToLeftText(line.Text)) ||
             withRegion.Length != lines.Count(line => !string.IsNullOrWhiteSpace(line.Text));
         if (ambiguous)
-            return PageText.Assemble(number, lines, true);
+            return PageText.Assemble(number, lines, true) with { HasColumns = true };
         var ordered = before.OrderBy(Vertical).Concat(left.OrderBy(Vertical))
             .Concat(right.OrderBy(Vertical)).Concat(after.OrderBy(Vertical));
-        return PageText.Assemble(number, ordered, false);
+        return PageText.Assemble(number, ordered, false) with { HasColumns = true };
     }
 
     private static (double Split, double Top, double Bottom)? FindColumnSplit(LineContent[] lines)

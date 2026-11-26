@@ -1,43 +1,44 @@
-# Research Companion Windows x64 实机验收报告
+# Research Companion 0.3.4.2 Windows x64 实机验收
 
-2026-11-26（北京时间）。在本机 Windows x64（系统构建 26300.9818）执行。测试材料为两页合成 PDF、本地 HTML 和 Markdown。Windows 移植起点为 `windows/port-v0.3.4` 的 `6994d1b7100520ba000828fe7e40d8095ea371da`，功能和视觉基准为 macOS v0.3.4 的 `e60a069d4ae5070438fe5ed9c73d90e1b0353e06`。验收以实际观察到的结果为准。
+验收日期为 2026 年 11 月 26 日（北京时间）。Windows 移植基线是 `windows/port-v0.3.4` 的 `bf21c7b0de0af8c6427817e59b3754b6ef009f88`，视觉与功能基线是 macOS v0.3.4 的 `e60a069d4ae5070438fe5ed9c73d90e1b0353e06`。Windows 主机系统构建为 `26300.9818`。资料为本地合成 PDF、HTML 和 Markdown。DSH Desktop 与 Zotero 使用隔离测试配置，共向真实模型提交三次短请求。用户的全局模型配置沿用原设置。
 
-## 交付包
+## 候选安装包
 
-- 安装器文件 `ResearchCompanion-0.3.4-win-x64-candidate-setup.exe`。Windows 应用文件版本及安装注册版本为 `0.3.4.1`。
-- 大小 59,969,429 字节。SHA-256 为 `8358d92305579fde2fdda39c676128767b7efd3d77466521e76067a600f55ebd`。
-- 当前用户 NSIS 安装器，负载为 x64、自包含 .NET 10、PDFium 8165 及 WebView2 组件。候选包未做 Authenticode 签名。实机使用现有 WebView2 Evergreen。
-- 交付为本地候选。复核时远端 `main`、Windows 分支和 `v0.3.4` 标签均与开始时一致。未推送或发布。
+- 文件为 `ResearchCompanion-0.3.4.2-win-x64-candidate-setup.exe`，共 60,000,780 字节。候选版递增至 `0.3.4.2`，用于验证从 `0.3.4.1` 覆盖升级。
+- SHA-256 为 `449ecd39dce78cb329658454029af3a19841ae620c5c72eb30aedb878eace9d9`。
+- NSIS 3.13 当前用户安装，包含 Windows x64 自带 .NET 10 的应用、PDFium 8165、DSH 研究桥 0.2.6 和 Zotero 只读取词扩展 0.1.6。实机使用现有 WebView2 Evergreen Runtime。
+- 安装器的 Authenticode 状态为 `NotSigned`。校验和可以复核文件完整性。数字签名及 SmartScreen 发布者信誉未验收。
+- GitHub 推送、正式发布、`main` 及现有标签变更均未执行。
 
 ## 实机结果
 
 | 项目 | 结果与证据 |
 | --- | --- |
-| 安装、升级、卸载 | 通过。交付包干净安装 6,536 ms，从原移植提交构建的 Windows 0.3.4 覆盖升级 9,110 ms。卸载核对程序、开始菜单快捷方式及卸载注册项移除。窗口设置、收据和导出的 Markdown 保留。 |
-| Windows OCR | 通过两页 PDF 的扫描页测试。WinRT 在本机安装的简体中文识别语言下，从唯一无文字层页识别了 `314159`、`37` 和图注，返回 3 个区域。识别耗时 309 ms，标点存在 OCR 差异。窗口显示识别 1 页，原生栏位与来源位置可回核。 |
-| 图、表、公式和原页裁图 | PDFium 原生回归覆盖唯一图号、表号、带标号公式、未知对象、重复范围、裁图像素和旋转页面。实机问答界面分别提交文字页 Figure 1 和扫描页 Figure 2 的 PNG，来源收据验证文本和图像哈希。Figure 1 原页跳转高亮、三根柱和完整图注的独立裁图均已查看。 |
-| 文献问答和流式回复 | Windows 界面、DPAPI/HMAC 命名管道及本机合成协议服务端到端通过。Figure 2 用例在等待状态看到首段，约 316 ms，完整回复约 2,828 ms。时间含桌面验收工具取样开销，回包来源是合成服务。 |
-| DSH | 官方 Windows `0.2.2-rc.5` 在隔离 web profile 成功安装并加载生产科研桥 `0.2.6`。通过真实命名管道读取协议 v1、唯一科研工作区、流式及裁图能力和模型目录。隔离主机没有配置 DeepSeek 或 ChatGPT 模型。现有 DSH Desktop 配置保持原状，Desktop 真实账号问答和图像路由仍待验收。 |
-| Chrome 157.0.8103.79 | 通过。本地 HTML 选区使用全局 `Ctrl+Alt+T` 逐字带入 `The reference pear factor equals exactly 314159.`。 |
-| Edge 158.0.4370.45 | 通过原生复制回退。在来宾窗口选择同一条本地 HTML 文字，UIA 层该用例无可用选区，经单次确认后原文逐字匹配。确认到界面显示的取样约 545 ms。来源显示待核对。初次独立 Edge 配置触发系统账号同步提示，后续验收改用来宾窗口。 |
-| WPS 12.1.0.29690 | 通过原生复制回退。WPS PDF 测试版的前台外壳为 `wps.exe`，同安装目录的 `wpspdf.exe` 写入剪贴板。修正后单次确认并逐字带入完整合成句，确认到界面显示的取样约 2,167 ms。来源显示待核对。 |
-| 手动选区 | 通过。拒绝自动复制后打开「粘贴选区」，通过「从剪贴板粘贴」预览合成原句并带入。应用逐字显示并标明「出处未核验」。此前同场成功授权的复制未免除下一次确认。 |
-| Zotero 10.0.8 | 部分通过。使用官方 x64 ZIP 和独立文献库启用了随包 `0.1.6.xpi`。实际端点生成配对文件，无凭据和重放均返回 403，有效配对请求到达阅读器状态检查并返回 409。桌面工具把便携 10.0.8 窗口绑定到系统安装版 9.0.6 的应用标识，未完成活动阅读器非空选区和附件页回跳。 |
-| 来源和笔记 | 通过本机合成问答场景。核对「打开原文」「来源详情」「原页裁图」和 Markdown 另存为。保存文件包含当轮问题、`314159`、原始 LaTeX 与图注出处，安装周期后文件哈希一致。 |
-| 窗口及外观 | 通过已观察用例。设置置顶时覆盖前台阅读器，升级启动后保持，可解除。实机观察了深色和浅色，并从系统深色切换至浅色。会话及标题栏同步改变。复验空会话图标、暗色材料标签、Markdown 及 KaTeX 排版。窗口首次可见的一次样本为 2,472 ms。 |
-| 自动化 | Windows x64 编译无警告、无错误。22 项 PDFium 原生检查、47 项可在 Windows 运行的协议、渲染及 Zotero 检查通过。原全量 Node 套件含 POSIX socket 与权限假设，在 Windows 上仍有失败。 |
+| 安装、升级、卸载 | 最终包全新安装 6,553 ms，由旧候选 0.3.4.1 覆盖升级 6,044 ms。卸载退出码 0，应用、开始菜单快捷方式和卸载注册项移除。安装器、应用文件、产品属性和卸载注册版本均为 `0.3.4.2`。升级确实替换负载，设置、来源收据和 Markdown 笔记的哈希保持一致。暂存目录已清理。 |
+| 安装安全 | 安装程序检查已有安装标记以及正常目录树，升级前拒绝无法确认所有权的目录，实测保留该目录中的普通文件。持有安装互斥量时第二个安装返回 1，已有安装保持完整。安装器签名状态如上。 |
+| DSH Desktop 图表问答与流式回复 | 真实 Windows DSH Desktop `0.2.2-rc.5`、研究桥 `0.2.6`、本次会话的 `DeepSeek-V4.1-Flash`（`off`）。模型正确识别合成 Figure 1 的三根深蓝柱及其递增顺序，逐字引用图注。图中没有刻度，回复里的目测比例未计入正确性验收。界面仍处于等待状态时，采样文本由 97 增至 148、281、462 和 568 字符。快捷键至首段可见约 6.28 秒。DSH 实测模型派发至首段为 4,177 ms，至完成为 6,061 ms。截图 01、03。 |
+| 图表原页证据 | 实际送入模型的 Figure 1 PNG 与 DSH 归一化图像的 SHA-256 一致，均为 `32f9c9957c22e502ee65a682b5161886e5d0e66038b5da6b62bbe4d4066c80c6`。来源详情显示图注和文件页，原页裁图包含三根柱子和完整图注。打开原文跳到文件第 1 页并正确高亮。截图 03、05。 |
+| 公式与 KaTeX | 本轮包含公式修复的候选构建从原双页 PDF 定位分开的正文和右侧 `(3)`，实际裁图与 DSH 模型入口 SHA-256 同为 `12d1e398d2664b80232d8c3971b72e8c293500c4fcf8b9fa0f1d943f1eae748b`。模型逐字转录 `y = 37 * x + 2 (3)`，复核系数 37、常数项 2，并正确用 KaTeX 排版。实际界面首次见到公式回复约 2.34 秒，约 4.93 秒时显示完成。截图 08、09。 |
+| 会话恢复 | 隔离 DSH Desktop 正常退出和重启后，认证实例目标、工作区、两个会话、三条真实回复、模型目录和科研桥保持一致，常用 DSH 的五个进程继续运行。Windows 应用重启恢复历史、来源按钮及草稿。最终交付包首次打开旧会话时，重新选择本会话的 Flash 和附件一次。再次重启后，应用自动恢复该模型、问答及双页 PDF，界面显示「已恢复会话及原文件」。恢复记录核对了 PDF 的 SHA-256、OCR 状态及材料开关。恢复测试没有新增模型请求。截图 07、11。 |
+| Windows OCR | 同一份双页 PDF 有 1 个扫描页，Windows OCR 识别成功。独立 WinRT 实机运行从扫描图像读到 `314159`、`37` 和图注，保留 3 个文字区域。一次样本导入 20 ms、识别 207 ms。截图 02。 |
+| Zotero | 官方便携 Zotero 10.0.8 和随包扩展 0.1.6 同时与系统安装的 Zotero 9.0.6 运行。隔离文献库中的独立合成 PDF 附件标题为 `RC-acceptance`，附件键为 `RI3UAXAY`。从真实阅读窗口按 `Ctrl+Alt+T`，科研助手逐字读取该 48 字符选区，显示 Zotero 来源及已读取状态。真实 Flash 回答 `314159`，科研桥确认只收到该段文字。将同一附件切到第 2 页，再点回答中的「打开原文」，原配对阅读器在同一标签和附件返回第 1 页。桌面工具无法绑定便携窗口时，由用户按了一次快捷键。独立附件用例覆盖题名、文献库、附件与物理页关联。旧收据的摘录仍可查看，没有配对标识的旧链接需要重新取词。 |
+| Chrome 158.0.8127.37 | 最终交付包实机使用 `Ctrl+Alt+T`，直接读取本地 HTML 的完整选区 `The reference pear factor equals exactly 314159.`。界面显示 `已读取选区`。截图 06、15。 |
+| Edge 158.0.4370.45、WPS 12.1.0.29690、手动粘贴 | 最终交付包在 Edge 来宾 HTML 和 WPS PDF 中均显示单次确认，并通过原生复制逐字带入完整合成选区，来源标为待核对。确认至读到预览的一次样本分别为 861 ms、2,468 ms。再次拒绝自动复制后，使用「粘贴选区」预览并带入整句，标记「出处未核验」。截图 12 至 14。 |
+| 笔记导出 | 本轮从真实 Figure 1 回答导出 Markdown，并读取文件核实提问、回复、原始 LaTeX 块、原页编号和完整图注。 |
+| UI、窗口和主题 | 本轮实机观察浅色和深色、主题切换以及点按置顶和解除置顶。保留 macOS 的共用图标和会话渲染资源，依据其源码将桌面窗口默认尺寸、最小尺寸、留白及明暗配色对齐。Windows 采用系统字体和系统对话框。长模型名在按钮内截断，悬停可读全名。截图 01、04、06。最终交付包也复测了 Chrome 切到前台时的置顶状态，随后解除置顶并恢复浅色。截图 15、16。 |
+| 性能 | 最终候选包一次冷启动首次出现窗口约 1,997 ms，科研助手进程工作集 190.8 MiB。工作集读数只含应用进程。90 条历史消息和 72 次流式更新的固定测试中，WebView2 跨层消息从 8,964,893 降至 50,763 字节，减少 99.43%。模型网络耗时见 DSH 行。 |
 
-## 本轮对等范围
+## 自动化与范围
 
-Windows 分支沿用 macOS v0.3.4 的对话资源、图标母版、协议和 PDFium 版本。应用的 Windows 特有代码在 `windows/`。科研桥打包增加了 Windows 专用参数来包含分块，macOS 的调用方式保持原状。
-
-测试覆盖单个明确编号或页码的证据。多栏、跨页图注、复杂公式变量追踪和模型辅助文档规划仍需更大语料覆盖。浏览器用例是本地 HTML。浏览器内置 PDF 阅读器及同一浏览器中受保护文档的覆盖仍待补齐。Zotero 端到端回跳、真实 DSH Desktop 模型请求、跨平台逐像素比较与长时间压力测试均未验收。当前实机结果不足以签收完整 macOS 对等。
+- Windows x64 Release 编译无警告、无错误。33 项 PDFium 和本地会话检查通过，其中包含 26 项图、表、普通及右对齐编号公式、分栏歧义、旋转裁剪与文字定位检查，以及 7 项模型授权范围和附件核验检查。11 项会话渲染交付测试通过，覆盖增量合并、撤回、WebView2 重载和 UTF-16 边界。
+- 在 Windows 执行的 Node 适用套件 89 项全部通过。旧的 `command-bridge`、`instance-bridge`、`probe-companion` 套件仍带有 Unix socket 假设，未纳入该计数。Windows DPAPI/HMAC 管道、真实 Desktop 实例发现和模型派发另有原生或实机证据。
+- 本次 macOS 对照使用 v0.3.4 源码及共用资源。该版本的公开发布资产为 macOS DMG 和源代码，本轮主机为 Windows，未做两端同步运行或逐像素比对。浏览器材料为合成 HTML，Zotero 为独立合成资料库。实机 Zotero 回跳覆盖独立 PDF 附件，父级书目字段由自动化用例覆盖。未覆盖长时压力、所有多栏 PDF 版式和受保护的浏览器文档。
+- 截图来自 Windows 实际窗口，位于交付目录 `0.3.4.2-实机截图`。截图 01 至 06 使用本轮含性能与主题修复的候选构建，截图 07 至 10 包含公式或 Zotero 修复后的实机证据，截图 11 至 16 来自交付的精确安装包。
 
 ## 复验入口
 
-1. 使用仓库锁文件运行 `pnpm build`，再用 `python -X utf8 scripts/package-bridge.py --windows --public --output <归档路径>` 生成桥归档。
-2. 使用 .NET SDK 10.0.404 锁定还原 Windows 项目，按 Windows README 运行 `windows/build.py`。使用 NSIS 3.13、Pillow 11.3.0 和固定的 Windows x64 PDFium 8165。
-3. 运行 `dotnet run --project windows/tests/PdfEvidence/PdfEvidenceChecks.csproj -- <pdfium.dll 路径>`。在安装过 Windows 识别语言的主机用合成扫描页验证原生 OCR。
-4. 用同一候选包执行当前用户干净安装、从基线覆盖及卸载，逐项检查注册信息、快捷方式和数据保留。
+1. 参照 `windows/README.md` 本地构建。用仓库锁文件构建研究桥，生成 Windows `.tgz`。使用 .NET SDK 10.0.404、NSIS 3.13、Pillow 11.3.0 和固定 PDFium 8165 运行 `windows/build.py`。
+2. 运行 `dotnet run --project windows/tests/PdfEvidence/PdfEvidenceChecks.csproj -- <pdfium.dll 的位置>` 和 `dotnet run --project windows/tests/TranscriptDelivery/TranscriptDeliveryChecks.csproj`。在安装 WinRT OCR 语言的 Windows 上用含扫描页的 PDF 复查原文与坐标。
+3. 用同一候选包做新装、从 0.3.4.1 覆盖安装、卸载，比较文件元数据、卸载注册及测试数据哈希。使用已登录的隔离 DSH Desktop 以及含合成 PDF 的隔离 Zotero 对照上表复测。
 
-基准发布页及平台资料见 [macOS v0.3.4](https://github.com/mxk021/ResearchCompanion/releases/tag/v0.3.4)、[DSH 0.2.2-rc.5 桌面构建说明](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.5/apps/desktop/README.md) 和 [Zotero 官方下载](https://www.zotero.org/download/)。
+基线与上游说明见 [macOS v0.3.4 发布页](https://github.com/mxk021/ResearchCompanion/releases/tag/v0.3.4)、[DSH Desktop 构建说明](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.5/apps/desktop/README.md) 和 [Zotero 官网](https://www.zotero.org/download/) 。

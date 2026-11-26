@@ -33,7 +33,8 @@ public sealed class BridgeClient : IAsyncDisposable
     private static readonly Regex NoncePattern = new("^[a-f0-9]{64}$", RegexOptions.CultureInvariant);
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
-    private sealed record Endpoint(string InstanceId, string Kind, int Pid, int SessionId, string PipeName, byte[] ProtectedCredential);
+    private sealed record Endpoint(string InstanceId, string Kind, int Pid, int SessionId, string PipeName,
+        byte[] ProtectedCredential, string? Profile, string? TargetId);
 
     private readonly Endpoint endpoint;
     private byte[]? credential;
@@ -45,6 +46,8 @@ public sealed class BridgeClient : IAsyncDisposable
     }
 
     public JsonElement Capabilities { get; private set; }
+    internal string? RecoveryHost { get; private set; }
+    internal string CurrentHost => RecoveryHost ?? "instance:" + endpoint.InstanceId;
     public JsonElement AttachmentLimits => Capabilities.TryGetProperty("attachmentLimits", out var limits) ? limits : default;
     public bool SupportsDocumentImages => Supports("researchDocumentImages");
 
@@ -250,6 +253,11 @@ public sealed class BridgeClient : IAsyncDisposable
             || !instance.TryGetProperty("pid", out var pid) || !pid.TryGetInt32(out int serverPid) || serverPid != endpoint.Pid
             || StringValue(instance, "commandSocketPath") != PipePrefix + endpoint.PipeName)
             throw new IOException("科研桥协议或实例不匹配。");
+        if (endpoint.TargetId is { Length: > 0 and <= 200 } target && !target.Any(char.IsControl) &&
+            endpoint.Profile is not { Length: > 100 } && endpoint.Profile?.Any(char.IsControl) != true &&
+            StringValue(instance, "targetId") == target && StringValue(instance, "profile") == endpoint.Profile &&
+            StringValue(instance, "kind") == endpoint.Kind)
+            RecoveryHost = string.Join('\0', endpoint.Kind, endpoint.Profile ?? "", target);
     }
 
     private static Endpoint? ReadEndpoint(string path, string sid, int session)
@@ -283,7 +291,8 @@ public sealed class BridgeClient : IAsyncDisposable
         using var process = Process.GetProcessById(pid);
         if (process.SessionId != session || new DateTimeOffset(process.StartTime).ToUnixTimeSeconds() > startedAt + 1)
             return null;
-        return new Endpoint(id, kind, pid, session, expected, Convert.FromBase64String(protectedCredential));
+        return new Endpoint(id, kind, pid, session, expected, Convert.FromBase64String(protectedCredential),
+            StringValue(row, "profile"), StringValue(row, "targetId"));
     }
 
     private static bool IsUnavailable(Exception error) =>

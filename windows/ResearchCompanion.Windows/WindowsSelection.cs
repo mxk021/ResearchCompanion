@@ -23,7 +23,7 @@ namespace ResearchCompanion.Windows;
 
 public sealed record WindowsSelectionResult(
     string Text, string Application, string? Title, string? Url,
-    bool ProvenanceVerified, bool ClipboardWasReplaced);
+    bool ProvenanceVerified, bool ClipboardWasReplaced, string? ZoteroPairingId = null);
 
 internal sealed class WindowsSelectionCaptureException(string message, bool canTryNativeCopy = false)
     : InvalidOperationException(message)
@@ -414,6 +414,10 @@ public sealed class WindowsSelection : IDisposable
     {
         var pairing = ZoteroPairing();
         if (pairing is null) return null;
+        var owner = ZoteroListenerProcess(pairing.Endpoint.Port);
+        if (owner == 0) return null;
+        if (owner != attempt.Source.Pid)
+            throw Failure("Zotero 配对与当前窗口不一致，请选择该配置的配对文件。");
         await ActivateSourceAsync(attempt, cancellationToken);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(2));
@@ -438,9 +442,10 @@ public sealed class WindowsSelection : IDisposable
                 count += received;
             }
             EnsureCurrent(attempt, cancellationToken, requireSourceFocus: true);
-            if (count == bytes.Length) return null;
+            if (count == bytes.Length || ZoteroListenerProcess(pairing.Endpoint.Port) != owner) return null;
             using var document = JsonDocument.Parse(bytes.AsMemory(0, count));
             var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return null;
             if (response.StatusCode != HttpStatusCode.OK)
             {
                 switch (GetString(root, "error"))
@@ -467,12 +472,79 @@ public sealed class WindowsSelection : IDisposable
                 return null;
             var title = GetString(selection, "title");
             if (title is null || title.Length > 512) title = attempt.Source.Title;
-            return new WindowsSelectionResult(text, "Zotero", title, ZoteroLocation(selection, key, GetString(capture, "method")), true, false);
+            return new WindowsSelectionResult(text, "Zotero", title,
+                ZoteroLocation(selection, key, GetString(capture, "method")), true, false, pairing.Identity);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { return null; }
         catch (HttpRequestException) { return null; }
         catch (IOException) { return null; }
         catch (JsonException) { return null; }
+    }
+
+    // Zotero's profiles can listen on different loopback ports. Associate the
+    // paired endpoint with the native window rather than trusting its title alone.
+    private static int ZoteroListenerProcess(int port)
+    {
+        const uint InsufficientBuffer = 122;
+        const uint IPv4 = 2;
+        const uint OwnerPidListeners = 3;
+        const uint IPv4Loopback = 0x0100007f;
+        const int RowSize = 24;
+        var size = 0;
+        if (Native.GetExtendedTcpTable(null, ref size, false, IPv4, OwnerPidListeners, 0) != InsufficientBuffer ||
+            size is < sizeof(int) or > 1_048_576)
+            return 0;
+        var buffer = new byte[size];
+        if (Native.GetExtendedTcpTable(buffer, ref size, false, IPv4, OwnerPidListeners, 0) != 0)
+            return 0;
+        var count = BitConverter.ToInt32(buffer, 0);
+        if (count < 0 || count > (buffer.Length - sizeof(int)) / RowSize) return 0;
+        var owner = 0;
+        for (var row = 0; row < count; row++)
+        {
+            var offset = sizeof(int) + row * RowSize;
+            var address = BitConverter.ToUInt32(buffer, offset + 4);
+            var localPort = (buffer[offset + 8] << 8) | buffer[offset + 9];
+            if (localPort != port || address is not (0 or IPv4Loopback)) continue;
+            var pid = BitConverter.ToInt32(buffer, offset + 20);
+            if (owner != 0 && pid != owner) return 0;
+            owner = pid;
+        }
+        return owner;
+    }
+
+    internal void OpenZoteroSource(string address, string? pairingId)
+    {
+        if (pairingId is null)
+            throw Failure("这条来源未绑定 Zotero 配置，请重新选取原文。");
+        var pairing = ZoteroPairing();
+        if (pairing is null || pairing.Identity != pairingId || pairing.ProfilePath is not { } profile)
+            throw Failure("请选用记录这条来源时的 Zotero 配对文件。");
+        var owner = ZoteroListenerProcess(pairing.Endpoint.Port);
+        if (owner == 0)
+            throw Failure("请先打开与这条来源配对的 Zotero 配置。");
+
+        try
+        {
+            using var process = Process.GetProcessById(owner);
+            if (!string.Equals(process.ProcessName, "zotero", StringComparison.OrdinalIgnoreCase) ||
+                process.MainModule?.FileName is not { } executable || process.HasExited ||
+                ZoteroListenerProcess(pairing.Endpoint.Port) != owner)
+                throw Failure("无法确认配对的 Zotero 阅读器。");
+            // Gecko dispatches the URI to this profile's running instance. The
+            // system scheme association could instead target a different copy.
+            var start = new ProcessStartInfo(executable) { UseShellExecute = false };
+            start.ArgumentList.Add("-profile");
+            start.ArgumentList.Add(profile);
+            start.ArgumentList.Add("-url");
+            start.ArgumentList.Add(address);
+            using var launcher = Process.Start(start);
+            if (launcher is null) throw Failure("未能向已配对的 Zotero 发送来源链接。");
+        }
+        catch (Exception error) when (error is ArgumentException or System.ComponentModel.Win32Exception)
+        {
+            throw Failure("未能向已配对的 Zotero 发送来源链接。");
+        }
     }
 
     private Pairing? ZoteroPairing()
@@ -534,7 +606,11 @@ public sealed class WindowsSelection : IDisposable
             location.Host != "127.0.0.1" || location.AbsolutePath != "/dsh-companion/context" ||
             location.UserInfo.Length != 0 || location.Query.Length != 0 || location.Fragment.Length != 0)
             return null;
-        return new Pairing(token, location);
+        var parent = Path.GetDirectoryName(path);
+        var profile = string.Equals(Path.GetFileName(path), "pairing.json", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(Path.GetFileName(parent), "dsh-companion-bridge", StringComparison.OrdinalIgnoreCase)
+            ? Path.GetDirectoryName(parent) : null;
+        return new Pairing(token, location, profile);
     }
 
     private static byte[] ReadSafeFile(string path, int limit)
@@ -592,7 +668,10 @@ public sealed class WindowsSelection : IDisposable
     }
 
     private sealed record SourceWindow(nint Window, uint Thread, int Pid, string Title, string Application, bool CopyAllowed);
-    private sealed record Pairing(string Token, Uri Endpoint);
+    private sealed record Pairing(string Token, Uri Endpoint, string? ProfilePath)
+    {
+        public string Identity => Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(Token)));
+    }
     private readonly record struct DirectRead(string? Text, string? Error)
     {
         public bool IsKnown => Text is not null || Error is not null;
@@ -718,6 +797,8 @@ public sealed class WindowsSelection : IDisposable
             public uint Type;
             public InputData Data;
         }
+        [DllImport("iphlpapi.dll")] internal static extern uint GetExtendedTcpTable(
+            [Out] byte[]? table, ref int size, [MarshalAs(UnmanagedType.Bool)] bool sort, uint family, uint tableClass, uint reserved);
         [DllImport("user32.dll")] internal static extern nint GetForegroundWindow();
         [DllImport("user32.dll")] internal static extern uint GetWindowThreadProcessId(nint window, out uint process);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern int GetWindowText(nint hwnd, StringBuilder value, int capacity);

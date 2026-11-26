@@ -8,5 +8,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../ResearchCompanion.Windows/PdfEvidence.cs" />
+    <Compile Include="../../ResearchCompanion.Windows/SessionRecovery.cs" />
   </ItemGroup>
 </Project>
