@@ -63,6 +63,7 @@ def build_bridge(temp, payload, offline, test_env):
 
 
 def isolated_environment(test_home):
+    test_home = test_home.resolve()
     env = {key: value for key, value in os.environ.items() if not key.upper().startswith('DSH_')}
     env.update(HOME=str(test_home), CFFIXED_USER_HOME=str(test_home))
     if os.name == 'nt':
@@ -70,6 +71,11 @@ def isolated_environment(test_home):
             path = test_home / relative
             path.mkdir(parents=True, exist_ok=True)
             env[name] = str(path)
+        # Node fixtures use os.tmpdir(). Supply a canonical path so 8.3
+        # aliases inherited from the runner do not trip the bridge's realpath check.
+        fixture_temp = test_home / 'Temp'
+        fixture_temp.mkdir()
+        env.update(TEMP=str(fixture_temp), TMP=str(fixture_temp))
     return env
 
 
@@ -77,7 +83,7 @@ def bridge_only(options):
     dest = options.output.resolve()
     dest.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='rc-bridge-', dir='/private/tmp' if sys.platform == 'darwin' else None) as directory:
-        temp = Path(directory)
+        temp = Path(directory).resolve()
         test_home = temp / 'home'
         test_home.mkdir(mode=0o700)
         archive = build_bridge(temp, dest, options.offline, isolated_environment(test_home))
