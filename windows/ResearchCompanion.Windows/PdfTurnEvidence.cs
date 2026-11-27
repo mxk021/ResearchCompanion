@@ -30,9 +30,14 @@ internal sealed partial class PdfEvidence
     private const int TranslationSegmentLimit = 10_000;
     private const int MaxTurnSegments = 40;
     private const int MinimumPartialBody = 80;
-    private static readonly Regex TranslateRequest = Pattern(@"翻译|译[成为出]|翻[成为]|\btranslat(?:e|ion)\b");
+    private static readonly Regex TranslateRequest = Pattern(@"翻译(?!模型|工具|任务|方法|系统|质量|软件)|译[成为出]|翻[成为]|\btranslat(?:e|ion)\b");
     private static readonly Regex ExactRequest = Pattern(
-        @"摘[录出]|抄[录出]|照录|提取|逐字|读出|逐段|逐句|逐页|逐条|精确引用|准确引用|原文引用|只(?:给|要|看)原文|必须完整|不得遗漏|不遗漏|不要(?:总结|分析)|无需(?:总结|分析)|\b(?:quote|transcribe|extract|verbatim|read|word for word|without omissions|paragraph by paragraph|sentence by sentence)\b");
+        @"摘[录出]|抄[录出写]|照录|提取|逐字|读出|逐段|逐句|逐页|逐条|精确引用|准确引用|原文引用|引用原文|直接引用|原话|原文怎么说|只(?:给|要|看)原文|必须完整|不得遗漏|不遗漏|不增不减|不要(?:总结|分析)|无需(?:总结|分析)|(?:只|仅)(?:能|可)?(?:根据|依据|使用|引用|参考)[^。！？]{0,12}(?:论文|本文|PDF|原文)|(?:给出|展示|列出|提供)\s*(?:论文|文中|这[段篇]|该[段文]|第.{1,16}页)?\s*原文|(?:列出|写出|给出|展示)\s*(?:其|该)?原式|\b(?:quote|transcribe|extract|verbatim|read|word[- ]for[- ]word|exact quotation|original wording|without omissions|paragraph by paragraph|sentence by sentence)\b");
+    private static readonly Regex NegatedPrecision = Pattern(
+        @"(?:不(?:用|要|需要|必)|无需)\s*(?:逐字)?\s*(?:精确引用|准确引用|直接引用|引用原文|原文引用|翻译|摘录|照录|逐字|逐句)|\b(?:do not|don't|no need to)\s+(?:translate|quote|transcribe)\b");
+    private static readonly Regex NumberedDiscussionReference = Pattern(
+        @"(?<kind>算法|图|表|公式|方程|式)\s*[（(]?\s*(?<number>\d+)(?!\d)");
+    private static readonly Regex AlgorithmDiscussion = Pattern(@"算法\s*[（(]?\s*\d+|\balgorithm\s+\d+");
     private static readonly Regex FormulaOrDefinition = Pattern(
         @"公式|原式|方程|算式|推导|变量|定义|等式|定理|引理|符号|参数.{0,5}(?:含义|表示|定义)|\b(?:formulae?|formulas|equations?|derivations?|variables?|theorems?|lemmas?|proof|definitions?|symbols?)\b|\b(?:what\s+does\s+(?:the\s+)?(?:parameter|[a-z])\b.{0,28}|parameters?\b.{0,24})(?:mean|denote|represent)\b");
     private static readonly Regex WholeDocument = Pattern(
@@ -75,6 +80,161 @@ internal sealed partial class PdfEvidence
 
     internal Task ValidateCurrentAsync(CancellationToken cancellationToken) =>
         Task.Run(() => VerifyFile(cancellationToken), cancellationToken);
+
+    internal static bool UsesOnlySelection(string question) => OnlySelection.IsMatch(question) ||
+        question.Contains("only the selection", StringComparison.OrdinalIgnoreCase);
+
+    internal static bool RequiresExactEvidence(string question, bool includingUserImages = false)
+    {
+        var instruction = NegatedPrecision.Replace(DocumentInstruction(question, includingUserImages), " ");
+        return Anchors.IsMatch(instruction) || TranslateRequest.IsMatch(instruction) || ExactRequest.IsMatch(instruction);
+    }
+
+    internal Task<DocumentEvidenceTurn> RetrieveForDiscussionAsync(string question, string? selection = null,
+        IReadOnlyList<DocumentExcerpt>? priorEvidence = null, bool includingUserImages = false,
+        CancellationToken cancellationToken = default) =>
+        Task.Run(() =>
+        {
+            if (RequiresExactEvidence(question, includingUserImages) || UsesOnlySelection(question))
+                throw new InvalidDataException("本轮需要精确核对原文。");
+            try
+            {
+                VerifyFile(cancellationToken);
+                var instruction = NegatedPrecision.Replace(Instruction(question, includingUserImages), " ");
+                var result = RetrieveDiscussion(instruction, selection, priorEvidence, cancellationToken);
+                VerifyFile(cancellationToken);
+                return result;
+            }
+            catch (InvalidDataException)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return NoDiscussionEvidence();
+            }
+        }, cancellationToken);
+
+    private static DocumentEvidenceTurn NoDiscussionEvidence() =>
+        new([], [], "本轮未取得可核对的文件摘录");
+
+    private DocumentEvidenceTurn RetrieveDiscussion(string instruction, string? selection,
+        IReadOnlyList<DocumentExcerpt>? prior, CancellationToken ct)
+    {
+        if (!IsPdf)
+        {
+            var excerpts = RelevantPassages(ReadPages(1, 1, ct), SearchQuestion(instruction, selection), 0, discussion: true);
+            var bounded = TakeDiscussionExcerpts(excerpts, TurnLimit(selection));
+            return bounded.Count == 0 ? NoDiscussionEvidence() : new([bounded], [], "相关文件原文摘录");
+        }
+
+        var address = Address(instruction, discussion: true);
+        DocumentEvidenceTurn? verified = null;
+        if (address.Explicit || Summary.IsMatch(instruction) || WholeDocument.IsMatch(instruction) ||
+            prior?.Any(item => item.ObjectLabel != null) == true && FollowUp.IsMatch(instruction))
+        {
+            try { verified = RetrieveTurn(instruction, selection, prior, false, ct); }
+            catch (Exception error) when (error is InvalidDataException or DocumentPlanningNeededException)
+            {
+                // Only the discussion route can proceed with independent snippets
+                // when the stronger document-object or contiguous read is unavailable.
+                ct.ThrowIfCancellationRequested();
+            }
+        }
+        bool needsAlgorithm = AlgorithmDiscussion.IsMatch(instruction);
+        if (verified != null && (!needsAlgorithm || verified.Segments.Count > 1))
+            return verified;
+
+        // Do not silently widen a request for a concrete section or column.
+        if (address.Section != null || address.Column != 0 && !address.HasPages)
+            return NoDiscussionEvidence();
+        var indexed = ReadPages(address.First, address.Last, ct);
+        var query = SearchQuestion(instruction, selection);
+        var matches = RelevantPassages(indexed, query, address.Column, discussion: true,
+            preferPageEvidence: address.HasPages && !address.WantsObject);
+        var ordered = (verified?.Segments.FirstOrDefault() ?? []).Concat(matches)
+            .DistinctBy(item => (item.Page, item.Text));
+        var selected = TakeDiscussionExcerpts(ordered, TurnLimit(selection));
+        if (selected.Count == 0) return NoDiscussionEvidence();
+        var missing = indexed.Where(page => !page.Lines.Any(line => Readable(line, true))).Select(page => page.Number).ToArray();
+        string coverage = "相关原文摘录 · 文件页 " + PageList(selected.Select(item => item.Page));
+        if (missing.Length > 0) coverage += " · 文件第 " + PageList(missing) + " 页不可核对";
+        const string guidance = "本轮只核验所附独立摘录的原文和页位。请区分论文明确写明的内容、合理推断和仍缺证据的细节。";
+        return new([selected], missing, coverage, guidance);
+    }
+
+    private static IReadOnlyList<DocumentExcerpt> TakeDiscussionExcerpts(IEnumerable<DocumentExcerpt> excerpts, int limit)
+    {
+        var selected = new List<DocumentExcerpt>();
+        int used = 0;
+        foreach (var excerpt in excerpts)
+        {
+            int cost = EvidenceCost(excerpt);
+            if (excerpt.Text.Contains('\0') || used + cost > limit) continue;
+            selected.Add(excerpt);
+            used += cost;
+        }
+        return selected;
+    }
+
+    private static IEnumerable<string> DiscussionReferenceTerms(string question)
+    {
+        foreach (Match reference in NumberedDiscussionReference.Matches(question))
+        {
+            string number = reference.Groups["number"].Value;
+            switch (reference.Groups["kind"].Value)
+            {
+                case "算法": yield return "Algorithm " + number; break;
+                case "图": yield return "Figure " + number; yield return "Fig. " + number; break;
+                case "表": yield return "Table " + number; break;
+                default: yield return "Equation " + number; yield return "Eq. (" + number + ")"; break;
+            }
+        }
+        if (question.Contains("参考点", StringComparison.Ordinal))
+        {
+            yield return "reference point";
+            yield return "uniform starting point";
+            yield return "auxiliary variable";
+        }
+    }
+
+    private static bool ContainsSearchTerm(string text, string term)
+    {
+        if (!char.IsDigit(term[^1])) return text.Contains(term, StringComparison.OrdinalIgnoreCase);
+        int start = 0;
+        while ((start = text.IndexOf(term, start, StringComparison.OrdinalIgnoreCase)) >= 0)
+        {
+            int end = start + term.Length;
+            if (end == text.Length || !char.IsDigit(text[end])) return true;
+            start = end;
+        }
+        return false;
+    }
+
+    private IReadOnlyList<DocumentExcerpt> MappedDiscussionNeighbors(PageText page, int center, string[] keywords)
+    {
+        var mapped = page.Lines.Where(line => Readable(line, true)).ToArray();
+        var centers = mapped.Select(line => (Line: line, Score: keywords.Count(term => ContainsSearchTerm(line.Content.Text, term))))
+            .Where(candidate => candidate.Score > 0).OrderByDescending(candidate => candidate.Score)
+            .Select(candidate => candidate.Line);
+        var bands = new List<PdfRegion>();
+        var chosen = new HashSet<TextLine>();
+        foreach (var seed in centers.Prepend(page.Lines[center]))
+        {
+            if (seed.Content.Region is not { } anchor || !Readable(seed, true)) continue;
+            if (bands.Any(band => Math.Abs(anchor.X - band.X) <= 0.09 && Math.Abs(anchor.Y - band.Y) <= 0.11))
+                continue;
+            bands.Add(anchor);
+            chosen.Add(seed);
+            // Nearby lines stay independent evidence when reading order is
+            // uncertain. A neighboring column must not become continuation.
+            foreach (var neighbor in mapped.Where(line => line.Content.Region is { } box &&
+                Math.Abs(box.X - anchor.X) <= 0.075 && box.Y >= anchor.Y - 0.06 && box.Y <= anchor.Y + 0.15)
+                .OrderBy(line => line.Content.Region!.Value.Y).Take(16))
+                chosen.Add(neighbor);
+            if (bands.Count == 3) break;
+        }
+        return chosen.OrderBy(line => line.Content.Region!.Value.X >= 0.47)
+            .ThenBy(line => line.Content.Region!.Value.Y)
+            .Select(line => VerifiedExcerpt(page, line.Start, line.End, mayUseIsolatedLine: true)).ToArray();
+    }
 
     internal Task<DocumentEvidenceTurn> RetrieveTurnAsync(string question, string? selection = null,
         IReadOnlyList<DocumentExcerpt>? priorEvidence = null, bool includingUserImages = false,
@@ -133,13 +293,18 @@ internal sealed partial class PdfEvidence
     {
         if (string.IsNullOrWhiteSpace(question) || question.Length > 8_000)
             throw new InvalidDataException("请输入不超过 8000 字的取证问题。");
+        return DocumentInstruction(question, includingUserImages);
+    }
+
+    private static string DocumentInstruction(string question, bool includingUserImages)
+    {
         if (!includingUserImages) return question;
         var clauses = Regex.Split(question, @"[。！!？?；;\r\n]|(?<=\.)\s+(?=[A-Z])")
             .Where(clause => !UserImageClause.IsMatch(clause) || FileClause.IsMatch(clause)).ToArray();
         return clauses.Any(clause => !string.IsNullOrWhiteSpace(clause)) ? string.Join("\n", clauses) : question;
     }
 
-    private TurnAddress Address(string question)
+    private TurnAddress Address(string question, bool discussion = false)
     {
         var anchors = Anchors.Matches(question);
         if (anchors.Count > 1) throw new InvalidDataException("请每次只指定一组起止原句。");
@@ -166,7 +331,7 @@ internal sealed partial class PdfEvidence
         else if (alias.Count == 1) first = last = alias[0].Groups["first"].Success ? 1 : PageCount;
         bool left = LeftColumn.IsMatch(outside), right = RightColumn.IsMatch(outside);
         if (left && right) throw new InvalidDataException("请一次只指定一栏，以便核对原文顺序。");
-        if (!anchor.Success && UnparsedRange.IsMatch(remainder))
+        if (!discussion && !anchor.Success && UnparsedRange.IsMatch(remainder))
             throw new InvalidDataException("无法确定起止原句。请使用两个完整的引号内端点，或指定页码。");
         bool target = !anchor.Success && (VisualObject.IsMatch(outside) || NumberedObject.IsMatch(outside) ||
             RelativeObject.IsMatch(outside));
@@ -177,9 +342,9 @@ internal sealed partial class PdfEvidence
     private DocumentEvidenceTurn RetrieveTurn(string question, string? selection, IReadOnlyList<DocumentExcerpt>? prior,
         bool includingUserImages, CancellationToken ct)
     {
-        var instruction = Instruction(question, includingUserImages);
+        var instruction = NegatedPrecision.Replace(Instruction(question, includingUserImages), " ");
         bool translate = TranslateRequest.IsMatch(instruction);
-        if (OnlySelection.IsMatch(instruction))
+        if (UsesOnlySelection(instruction))
         {
             if (string.IsNullOrWhiteSpace(selection)) throw new InvalidDataException("本轮仅限选区，当前没有可用选区。");
             return new([], [], "仅本次选区", IsTranslation: translate, SelectionOnly: true);
@@ -477,7 +642,7 @@ internal sealed partial class PdfEvidence
     private DocumentEvidenceTurn ApplyPlan(JsonElement plan, string question, string? selection, DocumentEvidenceTurn? prior,
         bool includingUserImages, CancellationToken ct)
     {
-        var instruction = Instruction(question, includingUserImages);
+        var instruction = NegatedPrecision.Replace(Instruction(question, includingUserImages), " ");
         var address = Address(instruction);
         bool translate = TranslateRequest.IsMatch(instruction);
         bool exact = translate || ExactRequest.IsMatch(instruction);

@@ -23,8 +23,10 @@ try
         Sheet((60, 717, "RC-WIN: Frozen source one."), (60, 690, "Begin reading at Golden lens."),
             (60, 663, "Middle evidence one.")),
         Sheet((60, 717, "Middle evidence two."), (60, 690, "End at Copper rotation."),
-            (60, 663, "RC-WIN: Frozen source two.")),
-        Sheet((60, 717, "End at Copper rotation."), (60, 690, "Repeated end anchor.")),
+            (60, 663, "RC-WIN: Frozen source two."), (60, 636, "Algorithm 1 initializes a reference point."),
+            (60, 609, "Figure 3 compares ordinary evidence with the reference point.")),
+        Sheet((60, 717, "End at Copper rotation."), (60, 690, "Repeated end anchor."),
+            (60, 663, "Algorithm 10 is described by Figure 30.")),
         "80 200 274 127 re f\n"
     ]);
     var document = await PdfEvidence.OpenAsync(passage);
@@ -79,6 +81,35 @@ try
     await Reject(() => document.RetrieveAsync("读取第 1、3 页"), "多个页段", "compact disjoint scope");
     Verify((await document.RetrieveAsync("读取首页"))[0].Page == 1, "first page alias");
     Verify((await document.RetrieveAsync("查找 Frozen source"))[0].Text.Contains("Frozen source"), "lexical excerpts");
+    const string ordinaryQuestion = "解释一下算法1和图3";
+    const string referenceFollowUp = "固定参考点u如何确定，人为规定？";
+    Verify(!PdfEvidence.RequiresExactEvidence(ordinaryQuestion) && !PdfEvidence.RequiresExactEvidence(referenceFollowUp) &&
+        !PdfEvidence.RequiresExactEvidence("无需翻译，解释图3") &&
+        !PdfEvidence.RequiresExactEvidence("介绍这个翻译方法的限制"), "discussion questions stay outside strict evidence policy");
+    Verify(PdfEvidence.RequiresExactEvidence("逐字引用图3的图注") &&
+        PdfEvidence.RequiresExactEvidence("精确引用论文对 u 的定义") &&
+        PdfEvidence.RequiresExactEvidence("将第 4 页逐段译成中文") &&
+        PdfEvidence.RequiresExactEvidence("只依据本文给出回答") &&
+        PdfEvidence.RequiresExactEvidence("从「Golden lens.」到「Copper rotation.」"),
+        "strict policy includes exact quotation, translation, source-only and anchored ranges");
+    var discussion = await document.RetrieveForDiscussionAsync(ordinaryQuestion);
+    Verify(discussion.Segments[0].Any(item => item.Page == 2 && item.ObjectLabel == "Figure 3" && item.VisualRegion != null) &&
+        discussion.Segments[0].Any(item => item.Page == 2 && item.Text.Contains("Algorithm 1") &&
+            item.Text.Contains("Figure 3") && item.Regions.Count > 0), "discussion combines .4.2 crop and related verified source text");
+    Verify(discussion.Segments[0].All(item => item.Page != 3), "numbered discussion cannot match a different reference prefix");
+    var reference = await document.RetrieveForDiscussionAsync(referenceFollowUp);
+    Verify(reference.Segments[0].Any(item => item.Page == 2 && item.Text.Contains("reference point") &&
+        item.Fingerprint == document.Fingerprint), "cross-language follow-up obtains current version-bound excerpts");
+    var mixedScope = await document.RetrieveForDiscussionAsync("概括第 3–4 页");
+    Verify(mixedScope.Segments[0].All(item => item.Page == 3) && mixedScope.MissingPages.SequenceEqual([4]),
+        "ordinary page discussion keeps only available source in the requested scope");
+    Verify((await document.RetrieveForDiscussionAsync("固定参考轴和训练批次的关系？")).Segments.Count == 0 &&
+        (await document.RetrieveForDiscussionAsync("说明第 4 页")).Segments.Count == 0,
+        "absence of evidence keeps a discussion source-less");
+    await Reject(() => document.RetrieveForDiscussionAsync("逐字引用图3的图注"), "精确核对",
+        "discussion fallback cannot admit an exact request");
+    await Reject(() => document.RetrieveTurnAsync("逐字摘录从「THE ORCHARD CONTROL TAG 781321」到「UNPRINTED MOREAU SENTINEL 845917」的原文。"),
+        "未匹配", "exact absent anchors fail closed");
     var partialTurn = await document.RetrieveTurnAsync("总结全文的研究发现");
     Verify(partialTurn.Segments.Count == 1 && partialTurn.MissingPages.SequenceEqual([4]) &&
         partialTurn.Segments[0].Select(excerpt => excerpt.Page).SequenceEqual([1, 2, 3]) &&
@@ -198,6 +229,10 @@ try
         "This inserted object spans the gutter and separates two different layout bands on the same sheet."))]);
     var complicated = await PdfEvidence.OpenAsync(mixed);
     await Reject(() => complicated.RetrieveAsync("读取第 1 页"), "栏序", "spanning object blocks ordering");
+    var mappedNeighbors = await complicated.RetrieveForDiscussionAsync("Explain charlie");
+    Verify(mappedNeighbors.Segments[0].Count > 1 && mappedNeighbors.Segments[0].Any(item => item.Text.Contains("charlie")) &&
+        mappedNeighbors.Segments[0].All(item => !item.Text.Contains("Right") && item.Regions.Count == 1),
+        "ambiguous-page discussion keeps independently mapped neighbors without traversing columns");
 
     var rotated = Fixture("rotated.pdf");
     MakePdf(rotated, [Sheet((95, 150, "Offset and rotated marker."))], "[0 0 420 325]",
@@ -249,6 +284,8 @@ try
         "Unicode text anchors with no PDF coordinates");
     await File.WriteAllTextAsync(notes, "# A test\n科研摘要：线索原文。\n改后核验。\n");
     await Reject(() => markdown.RetrieveAsync("概括"), "内容已更新", "same-length edits invalidate a receipt");
+    Verify((await markdown.RetrieveForDiscussionAsync("概括")).Segments.Count == 0,
+        "changed attachment never contributes stale discussion evidence");
     return 0;
 }
 finally

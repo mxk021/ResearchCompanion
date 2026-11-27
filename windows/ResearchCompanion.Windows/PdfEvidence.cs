@@ -60,7 +60,7 @@ internal sealed partial class PdfEvidence
     private static readonly Regex LeftColumn = Pattern(@"左\s*(?:侧|边)?\s*栏|\bleft(?:[- ]hand)?\s+column\b");
     private static readonly Regex RightColumn = Pattern(@"右\s*(?:侧|边)?\s*栏|\bright(?:[- ]hand)?\s+column\b");
     private static readonly Regex Terms = Pattern(@"[\p{IsCJKUnifiedIdeographs}]+|[\p{L}\p{N}]{2,}");
-    private static readonly Regex Summary = Pattern(@"总结|概述|摘要|主要内容|讲了什么|\bsummari[sz](?:e|ation)\b|\bsummary\b");
+    private static readonly Regex Summary = Pattern(@"总结|概述|概括|摘要|主要内容|讲了什么|\bsummari[sz](?:e|ation)\b|\bsummary\b");
     private static readonly Regex FooterPageNumber = Pattern(
         @"^\s*(?:\d{1,4}|(?:physical\s+)?page\s+\d{1,4}|第\s*\d{1,4}\s*页)\s*$");
     private static readonly HashSet<string> StopWords = new(StringComparer.OrdinalIgnoreCase)
@@ -460,13 +460,15 @@ internal sealed partial class PdfEvidence
         return excerpts;
     }
 
-    private IReadOnlyList<DocumentExcerpt> RelevantPassages(PageText[] indexed, string question, int column)
+    private IReadOnlyList<DocumentExcerpt> RelevantPassages(PageText[] indexed, string question, int column,
+        bool discussion = false, bool preferPageEvidence = false)
     {
         if (indexed.Length == 1 && !IsPdf && indexed[0].Text.Length <= 6800)
             return new[] { VerifiedExcerpt(indexed[0], 0, indexed[0].Text.Length) };
 
-        var keywords = SearchTerms(question).Distinct(StringComparer.OrdinalIgnoreCase).Take(60).ToArray();
-        var wantsSummary = Summary.IsMatch(question);
+        var keywords = (discussion ? DiscussionReferenceTerms(question).Concat(SearchTerms(question)) : SearchTerms(question))
+            .Distinct(StringComparer.OrdinalIgnoreCase).Take(60).ToArray();
+        var wantsSummary = Summary.IsMatch(question) || preferPageEvidence;
         var ranked = new List<(PageText Page, int Line, int Score)>();
         foreach (var source in indexed)
         {
@@ -477,7 +479,7 @@ internal sealed partial class PdfEvidence
             {
                 var line = page.Lines[i];
                 if (line.Content.Fault || string.IsNullOrWhiteSpace(line.Content.Text)) continue;
-                var score = keywords.Count(word => line.Content.Text.Contains(word, StringComparison.OrdinalIgnoreCase));
+                var score = keywords.Count(word => ContainsSearchTerm(line.Content.Text, word));
                 if (score > bestScore || bestIndex < 0 && wantsSummary)
                 {
                     bestIndex = i;
@@ -488,9 +490,17 @@ internal sealed partial class PdfEvidence
         }
 
         var result = new List<DocumentExcerpt>();
-        foreach (var match in ranked.OrderByDescending(x => x.Score).ThenBy(x => x.Page.Number).Take(5))
+        var suppliedPages = 0;
+        foreach (var match in ranked.OrderByDescending(x => x.Score).ThenBy(x => x.Page.Number))
         {
             var (page, center, _) = match;
+            if (discussion && page.Ambiguous && IsPdf)
+            {
+                var neighbors = MappedDiscussionNeighbors(page, center, keywords);
+                result.AddRange(neighbors);
+                if (neighbors.Count > 0 && ++suppliedPages == 5) break;
+                continue;
+            }
             var first = center;
             var last = center;
             var basis = page.Lines[center].Content;
@@ -503,10 +513,19 @@ internal sealed partial class PdfEvidence
             }
             var lo = page.Lines[first].Start;
             var hi = page.Lines[last].End;
-            if (hi - lo > MaxExcerpt)
-                throw new InvalidDataException("定位到的连续文字太长，请限定原句起点和终点。");
-            result.Add(VerifiedExcerpt(page, lo, hi, mayUseIsolatedLine: page.Ambiguous));
+            try
+            {
+                if (hi - lo > MaxExcerpt)
+                    throw new InvalidDataException("定位到的连续文字太长，请限定原句起点和终点。");
+                result.Add(VerifiedExcerpt(page, lo, hi, mayUseIsolatedLine: page.Ambiguous));
+            }
+            catch (InvalidDataException) when (discussion)
+            {
+                // Unverified candidates cannot acquire a source position.
+            }
+            if (!discussion && result.Count == 5 || discussion && ++suppliedPages == 5) break;
         }
+        if (discussion) return result;
         if (result.Count == 0)
             throw new InvalidDataException("没有匹配且可核验的文档文字。请尝试原文关键词、页码或重新选择含文字层的 PDF。");
         RequireBounded(result);

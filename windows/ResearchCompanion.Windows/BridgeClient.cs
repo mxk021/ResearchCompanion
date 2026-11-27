@@ -54,6 +54,7 @@ public sealed class BridgeClient : IAsyncDisposable
     internal bool SupportsPdfBatch => Supports("researchPdfBatch") && Supports("researchPromptGuidance");
     internal bool SupportsPromptGuidance => Supports("researchPromptGuidance");
     internal bool SupportsDocumentPlanning => Supports("researchDocumentPlan");
+    internal bool SupportsDiscussionEvidence => Supports("researchDiscussionEvidence");
 
     private bool Supports(string feature) =>
         Capabilities.TryGetProperty("supports", out var supports) && supports.ValueKind == JsonValueKind.Array &&

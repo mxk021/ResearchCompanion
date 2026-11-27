@@ -318,6 +318,44 @@ test('source cannot be transmitted before an explicit current-paper preview key'
   })
 })
 
+test('discussion admits a document follow-up without falsely attaching or verifying evidence', async () => {
+  await harness(async ({ client, calls, eventHandlers }) => {
+    const target = { workspaceId: 'research-workspace', sessionId: 'research-session' }
+    const selection = { provider: 'chatgpt', model: 'gpt-test', reasoningEffort: 'medium' }
+    await client.request('researchSelectModel', { ...target, selection })
+    assert.ok((await client.request('capabilities')).supports.includes('researchDiscussionEvidence'))
+    const material = {
+      source: 'PDF', title: 'Synthetic', scope: '相关原文摘录 · 文件页 2',
+      text: 'Algorithm 1 initializes a reference point. Figure 3 shows an example.'
+    }
+    const first = { ...target, selection, requestId: 'ordinary-visual', text: '解释一下算法1和图3',
+      includeContext: true, material, evidencePolicy: 'discussion' }
+    const followUp = { ...target, selection, requestId: 'ordinary-follow-up', text: '固定参考点u如何确定，人为规定？',
+      includeContext: false, evidencePolicy: 'discussion' }
+    assert.equal((await client.request('researchPrompt', first)).accepted, true)
+    assert.equal((await client.request('researchPrompt', followUp)).accepted, true)
+    const prompts = calls.filter(([name]) => name === 'prompt').map(([, value]) => value)
+    assert.equal(prompts.length, 2)
+    assert.deepEqual(prompts.map(value => value.sessionId), [target.sessionId, target.sessionId])
+    assert.ok(prompts[0].content[0].text.includes(material.text))
+    const serialized = prompts[1].content[0].text
+    assert.ok(serialized.endsWith('【用户问题】\n' + followUp.text))
+    assert.match(serialized, /相关上下文/)
+    assert.match(serialized, /不能充当新原文或本轮核验/)
+    assert.match(serialized, /JSON 引用数据】\nnull/)
+    assert.ok(!serialized.includes(material.text))
+    const stream = eventHandlers.get('llm/stream')[0]
+    const messages = [{ role: 'user', source: { kind: 'user', rpcId: followUp.requestId },
+      content: [{ type: 'text', text: serialized }] }]
+    await consumeStream(stream, { ...selection, sessionId: target.sessionId, messages })
+    assert.equal((await client.request('conversation', { ...target, requestId: followUp.requestId })).dispatchEvidence, null)
+    await assert.rejects(
+      client.request('researchPrompt', { ...followUp, requestId: 'strict-translation', mode: 'translate' }),
+      /材料核验策略无效/)
+    assert.equal(calls.filter(([name]) => name === 'prompt').length, 2)
+  })
+})
+
 test('research directory enumerates account routes only, with exact model abilities and real failure', async () => {
   await harness(async ({ client, state, calls }) => {
     const { catalog } = await client.request('modelCatalog')

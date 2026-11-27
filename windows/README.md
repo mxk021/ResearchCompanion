@@ -13,9 +13,9 @@ WebView2 缺失时，从 Microsoft 官方渠道安装 Evergreen Runtime。候选
 ## 连接科研桥
 
 1. 安装官方 Windows x64 DSH Desktop 0.2.2-rc.5，打开一次初始化桌面 profile，然后从程序菜单选择「退出」。
-2. 将科研助手安装目录 `app` 中的 `dsh-research-companion-0.2.8.tgz` 复制到独立的用户目录。DSH 的本地包依赖会继续使用这份归档。用 DSH 自带的 `dsh.cmd` 在 PowerShell 执行下列命令，并使用复制后的绝对路径。更新现有科研桥同样使用此命令。
+2. 将科研助手安装目录 `app` 中的 `dsh-research-companion-0.2.9.tgz` 复制到独立的用户目录。DSH 的本地包依赖会继续使用这份归档。用 DSH 自带的 `dsh.cmd` 在 PowerShell 执行下列命令，并使用复制后的绝对路径。更新现有科研桥同样使用此命令。
 
-       & "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add --offline --ignore-scripts "file:C:\path\to\dsh-research-companion-0.2.8.tgz"
+       & "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add --offline --ignore-scripts "file:C:\path\to\dsh-research-companion-0.2.9.tgz"
 
 3. 打开 DSH，再点科研助手的「连接 DSH」。科研助手使用桥提供的科研工作区和为本次会话选择的账号模型。公开包不包含订阅适配器、API Key 或用户账号。
 

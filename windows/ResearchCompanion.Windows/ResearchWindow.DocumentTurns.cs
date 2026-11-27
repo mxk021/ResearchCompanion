@@ -13,24 +13,37 @@ namespace ResearchCompanion.Windows;
 
 internal sealed partial class ResearchWindow
 {
-    private sealed record PreparedTurn(IReadOnlyList<SourceReceipt?> Sources, string? Guidance = null, bool IsTranslation = false);
+    private sealed record PreparedTurn(IReadOnlyList<SourceReceipt?> Sources, string? Guidance = null,
+        bool IsTranslation = false, bool IsDiscussion = false, bool MissingDocumentEvidence = false);
 
     private async Task<PreparedTurn> PrepareTurnEvidenceAsync(string question, bool images, CancellationToken ct)
     {
-        if (include.IsChecked != true) return new([null]);
+        bool onlySelection = PdfEvidence.UsesOnlySelection(question);
+        bool discussion = !onlySelection && !PdfEvidence.RequiresExactEvidence(question, images);
+        if (include.IsChecked != true)
+        {
+            if (onlySelection) throw new InvalidDataException("本轮请求限于选区，请先带入可用选区。");
+            return new([null], IsDiscussion: discussion);
+        }
         var captured = selection;
-        bool onlySelection = question.Contains("只用选区", StringComparison.Ordinal) ||
-            question.Contains("只翻译选区", StringComparison.Ordinal) ||
-            question.Contains("仅根据选区", StringComparison.Ordinal) ||
-            question.Contains("only the selection", StringComparison.OrdinalIgnoreCase);
         if (onlySelection && captured == null)
             throw new InvalidDataException("本轮请求限于选区，但当前没有可用选区。");
+        if (discussion && captured != null && (captured.Text.Length > 24_000 || captured.Text.Contains('\0')))
+            captured = null;
+        if (attachedFileNeedsReview && !onlySelection && !discussion)
+            throw new InvalidDataException("已关联的文件无法核对。请重新选择文件，或移除此材料后提问。");
         if (document is not { } file || onlySelection)
-            return new([captured == null ? null : MakeTurnSource([], captured, null)]);
+            return new([captured == null ? null : MakeTurnSource([], captured, null)], IsDiscussion: discussion,
+                MissingDocumentEvidence: discussion && attachedFileNeedsReview);
 
         var prior = PriorDocumentEvidence(file);
         DocumentEvidenceTurn turn;
-        try { turn = await file.RetrieveTurnAsync(question, captured?.Text, prior, images, ct); }
+        try
+        {
+            turn = discussion
+                ? await file.RetrieveForDiscussionAsync(question, captured?.Text, prior, images, ct)
+                : await file.RetrieveTurnAsync(question, captured?.Text, prior, images, ct);
+        }
         catch (DocumentPlanningNeededException error)
         {
             if (images || connection is not { SupportsDocumentPlanning: true } client || chosenModel is not { } model)
@@ -42,8 +55,11 @@ internal sealed partial class ResearchWindow
         if (turn.Segments.Count > 1 && captured != null)
             throw new InvalidDataException("所选 PDF 范围需要分段。请缩小范围，或移除选区后单独处理 PDF。");
         if (turn.SelectionOnly) return new([MakeTurnSource([], captured!, null)], turn.Guidance, turn.IsTranslation);
+        if (discussion && turn.Segments.Count == 0)
+            return new([captured == null ? null : MakeTurnSource([], captured, null)], IsDiscussion: true,
+                MissingDocumentEvidence: true);
         return new(turn.Segments.Select(x => (SourceReceipt?)MakeTurnSource(x, captured, turn.Coverage)).ToArray(),
-            turn.Guidance, turn.IsTranslation);
+            turn.Guidance, turn.IsTranslation, discussion);
     }
 
     private async Task<DocumentEvidenceTurn> PlanDocumentTurnAsync(BridgeClient client, ModelChoice model, PdfEvidence file,

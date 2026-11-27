@@ -229,10 +229,8 @@ internal sealed partial class ResearchWindow
                 throw new InvalidDataException("附图需要当前明确选择且支持图片的模型，并符合 DSH 的图片限制。");
             limits.Check(userImages, []);
             status.Text = "正在核对材料…";
-            if (include.IsChecked == true && attachedFileNeedsReview)
-                throw new InvalidDataException("已关联的文件无法核对。请重新选择文件，或移除此材料后提问。");
             var evidence = await PrepareTurnEvidenceAsync(question, userImages.Length != 0, ct);
-            if (evidence.Guidance != null && !client.SupportsPromptGuidance)
+            if (evidence.Guidance != null && !client.SupportsPromptGuidance && !evidence.IsDiscussion)
                 throw new InvalidDataException("本轮证据说明需要科研桥 0.2.8，消息未发送。");
             if (evidence.IsTranslation && userImages.Length != 0)
                 throw new InvalidDataException("文档翻译与附图需分开处理。请移除图片，或在输入框提问图片中的内容。");
@@ -301,6 +299,8 @@ internal sealed partial class ResearchWindow
                     {
                         request["mode"] = "ask";
                         request["includeContext"] = source != null;
+                        if (step == null && evidence.IsDiscussion && client.SupportsDiscussionEvidence)
+                            request["evidencePolicy"] = "discussion";
                         if (guidance != null && client.SupportsPromptGuidance) request["guidance"] = guidance;
                         if (step != null) request["pdfBatch"] = step.Wire(journal!.BatchId);
                         if (source != null)
@@ -376,7 +376,7 @@ internal sealed partial class ResearchWindow
             {
                 await SubmitAsync(parts[0], evidence.Guidance);
             }
-            status.Text = "回复完成";
+            status.Text = evidence.MissingDocumentEvidence ? "回复完成 · 本轮未取得可核对的文件摘录" : "回复完成";
         }
         catch (BridgeRequestException error)
         {

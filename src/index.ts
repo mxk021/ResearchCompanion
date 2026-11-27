@@ -830,7 +830,7 @@ export function apply(ctx: Context): void {
       ...(typeof (ctx.sessionController as unknown as { projections?: unknown }).projections === 'function' ? ['taskPreview'] : []),
       // The Windows client reads its authenticated Zotero selection before constructing inline material.
       ...(process.platform === 'win32' ? [] : ['researchContext']),
-      'researchPrompt', 'conversation', 'researchStream', 'researchMaterial', 'researchPromptGuidance', 'researchPdfBatch',
+      'researchPrompt', 'conversation', 'researchStream', 'researchMaterial', 'researchDiscussionEvidence', 'researchPromptGuidance', 'researchPdfBatch',
       ...(imageUploads() ? ['researchDocumentImages', 'researchUserImages'] : []),
       ...(researchSessionQuery() !== undefined && archiveSessionIDs() !== undefined ? ['researchHistory'] : []),
       ...(retirement.available(optionalService) ? ['researchSafeDelete','research.retirement.offline.v1'] : []),
@@ -992,7 +992,7 @@ export function apply(ctx: Context): void {
         const crops = request.documentImages
         const userImages = request.userImages
         const text = researchPrompt(request.text, request.mode, context, await persona(),
-          { user: userImages.length, crops: crops.length }, request.guidance, request.pdfBatch)
+          { user: userImages.length, crops: crops.length }, request.guidance, request.pdfBatch, request.evidencePolicy)
         return admitResearchPrompt(request, [{ type: 'text', text }],
           context && (request.material || crops.length || userImages.length)
             ? {text: context.text, crops, userImages} : undefined,
