@@ -90,7 +90,7 @@ export interface CommandHandlers {
   researchDocumentPlan?: (request: OpenSessionCommand & { text: string; document: PlanningDocument; selection: ResearchSelection; signal: AbortSignal }) => Promise<unknown>
   researchRetirement?: (request: RetirementRequest) => Promise<unknown>
   researchHistory?: (request: ResearchHistoryRequest) => Promise<unknown>
-  researchPrompt?: (request: OpenSessionCommand & { requestId: string; text: string; mode: string; contextKey?: string; includeContext: boolean; expectedSelection?: ResearchSelection; material?: ResearchContext; documentImages: readonly PromptImage[] }) => Promise<unknown>
+  researchPrompt?: (request: OpenSessionCommand & { requestId: string; text: string; mode: string; evidencePolicy?: 'discussion'; contextKey?: string; includeContext: boolean; expectedSelection?: ResearchSelection; material?: ResearchContext; documentImages: readonly PromptImage[] }) => Promise<unknown>
   capabilities?: () => readonly string[]
   fileCandidates?: (request: OpenSessionCommand & { query: string }) => Promise<{ candidates: readonly { path: string; kind: 'file' | 'directory' }[] }>
   skillCandidates?: (request: OpenSessionCommand) => Promise<{ skills: readonly { name: string; description: string; conflict: boolean }[] }>
@@ -121,6 +121,7 @@ interface CommandRequest {
   mode?: unknown
   contextKey?: unknown
   includeContext?: unknown
+  evidencePolicy?: unknown
   material?: unknown
   document?: unknown
   selection?: unknown
@@ -393,6 +394,11 @@ export class CommandBridge {
       }
       if (action === 'researchPrompt' && this.handlers.researchPrompt) {
         if (request.includeContext !== undefined && typeof request.includeContext !== 'boolean') throw new CommandError('invalid-request', 'includeContext must be boolean')
+        const mode = optionalStringField(request.mode, 'mode') ?? 'ask'
+        const evidencePolicy = request.evidencePolicy
+        if (evidencePolicy !== undefined && (evidencePolicy !== 'discussion' || mode === 'translate')) {
+          throw new CommandError('invalid-request', '材料核验策略无效。')
+        }
         const contextKey = optionalStringField(request.contextKey, 'contextKey')
         let material: ResearchContext | undefined
         if (request.material !== undefined) {
@@ -411,7 +417,7 @@ export class CommandBridge {
         this.respond(client.socket, id, await this.handlers.researchPrompt({
           workspaceId: stringField(request.workspaceId, 'workspaceId'), sessionId: stringField(request.sessionId, 'sessionId'),
           requestId: stringField(request.requestId, 'requestId'), text: optionalStringField(request.text, 'text') ?? '',
-          mode: optionalStringField(request.mode, 'mode') ?? 'ask', contextKey,
+          mode, evidencePolicy, contextKey,
           includeContext: request.includeContext !== false, ...(material ? { material } : {}),
           expectedSelection, documentImages,
         })); return

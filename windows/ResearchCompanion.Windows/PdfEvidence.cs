@@ -48,6 +48,17 @@ internal sealed class PdfEvidence
         """从[^\n。]{3,}(?:到|至)[^\n。]{3,}|\bfrom\s+.{3,}\s+(?:to|through)\s+.{3,}""");
     private static readonly Regex VisualObject = Pattern(
         """(?:图表|图注|子图|原图|公式|原式|数学式|方程)|(?:图|表|式)\s*[A-Za-z]?[（(]?\s*[\d一二三四五六七八九十]|\b(?:figure|fig\.|eq\.|equation|formula|table|caption)\s*[A-Za-z]?\s*[\d(]""");
+    private static readonly Regex NegatedPrecision = Pattern(
+        """(?:不(?:用|要|需要|必)|无需)\s*(?:逐字)?\s*(?:精确引用|准确引用|直接引用|引用原文|原文引用|翻译|摘录|照录|逐字|逐句)|\b(?:do not|don't|no need to)\s+(?:translate|quote|transcribe)\b""");
+    private static readonly Regex ExactWording = Pattern(
+        """逐字|逐句|精确引用|准确引用|原文引用|引用原文|直接引用|原文摘录|原话|原文怎么说|照录|抄[录出写]|必须完整|不得遗漏|不增不减"""
+        + """|(?:只|仅)(?:能|可)?(?:根据|依据|使用|引用|参考)[^。！？]{0,12}(?:论文|本文|PDF|原文)|(?:只|仅)(?:给|要|看)原文"""
+        + """|(?:提取|摘出|给出|展示|列出|提供)\s*(?:论文|文中|这[段篇]|该[段文]|第.{1,16}页)?\s*原文|(?:列出|写出|给出|展示)\s*(?:其|该)?原式"""
+        + """|翻译(?!模型|工具|任务|方法|系统|质量|软件)|(?:翻|译)[成为]"""
+        + """|\b(?:verbatim|word[- ]for[- ]word|exact quotation|original wording|translate|transcribe|quote (?:the )?(?:paper|document|original|caption|exact))\b"""
+        + """|^\s*(?:(?:could you|can you|please)\s+)*(?:quote|extract)\s""");
+    private static readonly Regex NumberedReference = Pattern(
+        """(?<kind>算法|图|表|(?:公式|方程|式))\s*[（(]?\s*(?<number>\d+)(?!\d)""");
     private static readonly Regex LeftColumn = Pattern(@"左\s*(?:侧|边)?\s*栏|\bleft(?:[- ]hand)?\s+column\b");
     private static readonly Regex RightColumn = Pattern(@"右\s*(?:侧|边)?\s*栏|\bright(?:[- ]hand)?\s+column\b");
     private static readonly Regex Terms = Pattern(@"[\p{IsCJKUnifiedIdeographs}]+|[\p{L}\p{N}]{2,}");
@@ -86,7 +97,22 @@ internal sealed class PdfEvidence
 
     public Task<IReadOnlyList<DocumentExcerpt>> RetrieveAsync(
         string question, CancellationToken cancellationToken = default) =>
-        Task.Run(() => Retrieve(question, cancellationToken), cancellationToken);
+        Task.Run(() => Retrieve(question, discussion: false, cancellationToken), cancellationToken);
+
+    internal static bool RequiresExactEvidence(string question) =>
+        Anchors.IsMatch(question) || ExactWording.IsMatch(NegatedPrecision.Replace(question, string.Empty));
+
+    internal Task<IReadOnlyList<DocumentExcerpt>> RetrieveForDiscussionAsync(
+        string question, CancellationToken cancellationToken = default) =>
+        Task.Run(() =>
+        {
+            try { return Retrieve(question, discussion: true, cancellationToken); }
+            catch (InvalidDataException)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return Array.Empty<DocumentExcerpt>();
+            }
+        }, cancellationToken);
 
     public Task<PagePreview> RenderPageAsync(int page, int width = 1152, CancellationToken cancellationToken = default) =>
         Task.Run(() =>
@@ -140,7 +166,7 @@ internal sealed class PdfEvidence
         }, cancellationToken);
     }
 
-    private IReadOnlyList<DocumentExcerpt> Retrieve(string question, CancellationToken cancellationToken)
+    private IReadOnlyList<DocumentExcerpt> Retrieve(string question, bool discussion, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(question) || question.Length > 8000)
             throw new InvalidDataException("请输入不超过 8000 字的取证问题。");
@@ -154,7 +180,7 @@ internal sealed class PdfEvidence
         var aliases = PageAliases.Matches(outsidePassage);
         var addressCount = requestedPages.Count + aliases.Count;
         var remainder = PageAliases.Replace(PageAddress.Replace(outsidePassage, string.Empty), string.Empty);
-        if (IsPdf && VisualObject.IsMatch(outsidePassage))
+        if (!discussion && IsPdf && VisualObject.IsMatch(outsidePassage))
             throw new InvalidDataException("Windows 候选版暂未核验图表、图注与公式的编号及像素。可先打开原 PDF，选择正文后提问。");
         if (IsPdf && (addressCount > 1 || DisjointPages.IsMatch(outsidePassage) || UnsupportedAddress.IsMatch(remainder)))
             throw new InvalidDataException("无法核对多个页段、章节编号或该页码格式。请使用一个阿拉伯数字页码或连续页段，如第 2–4 页。");
@@ -178,15 +204,15 @@ internal sealed class PdfEvidence
         var right = IsPdf && RightColumn.IsMatch(outsidePassage);
         if (left && right) throw new InvalidDataException("请一次只指定一栏，以便核对原文顺序。");
         var column = left ? 1 : right ? 2 : 0;
-        if (anchors.Count == 0 && UnparsedRange.IsMatch(remainder))
+        if (!discussion && anchors.Count == 0 && UnparsedRange.IsMatch(remainder))
             throw new InvalidDataException("无法确定起止原句。可改用从「起点原句」到「终点原句」，也可指定页码。");
 
         var indexed = ReadPages(first, last, cancellationToken);
         IReadOnlyList<DocumentExcerpt> result = anchors.Count == 1
             ? ExactPassage(indexed, anchors[0], column)
             : addressCount > 0 && IsPdf
-                ? ExplicitPages(indexed, column)
-                : RelevantPassages(indexed, outsidePassage, column);
+                ? ExplicitPages(indexed, column, discussion)
+                : RelevantPassages(indexed, outsidePassage, column, discussion);
         VerifyFile(cancellationToken);
         return result;
     }
@@ -267,20 +293,25 @@ internal sealed class PdfEvidence
         return excerpts;
     }
 
-    private IReadOnlyList<DocumentExcerpt> ExplicitPages(PageText[] indexed, int column)
+    private IReadOnlyList<DocumentExcerpt> ExplicitPages(PageText[] indexed, int column, bool discussion)
     {
-        var excerpts = indexed.Select(page => column == 0 ? page : page.ForColumn(column))
-            .Select(page => VerifiedExcerpt(page, 0, page.Text.Length)).ToArray();
-        RequireBounded(excerpts);
+        var excerpts = new List<DocumentExcerpt>();
+        foreach (var source in indexed)
+        {
+            var page = column == 0 ? source : source.ForColumn(column);
+            AddExcerpt(excerpts, page, 0, page.Text.Length, discussion);
+        }
+        if (!discussion) RequireBounded(excerpts);
         return excerpts;
     }
 
-    private IReadOnlyList<DocumentExcerpt> RelevantPassages(PageText[] indexed, string question, int column)
+    private IReadOnlyList<DocumentExcerpt> RelevantPassages(PageText[] indexed, string question, int column, bool discussion)
     {
         if (indexed.Length == 1 && !IsPdf && indexed[0].Text.Length <= 6800)
             return new[] { VerifiedExcerpt(indexed[0], 0, indexed[0].Text.Length) };
 
-        var keywords = SearchTerms(question).Distinct(StringComparer.OrdinalIgnoreCase).Take(60).ToArray();
+        var keywords = (discussion ? SearchTerms(question).Concat(ReferenceTerms(question)) : SearchTerms(question))
+            .Distinct(StringComparer.OrdinalIgnoreCase).Take(60).ToArray();
         var wantsSummary = Summary.IsMatch(question);
         var ranked = new List<(PageText Page, int Line, int Score)>();
         foreach (var source in indexed)
@@ -292,7 +323,7 @@ internal sealed class PdfEvidence
             {
                 var line = page.Lines[i];
                 if (line.Content.Fault || string.IsNullOrWhiteSpace(line.Content.Text)) continue;
-                var score = keywords.Count(word => line.Content.Text.Contains(word, StringComparison.OrdinalIgnoreCase));
+                var score = keywords.Count(word => ContainsSearchTerm(line.Content.Text, word));
                 if (score > bestScore || bestIndex < 0 && wantsSummary)
                 {
                     bestIndex = i;
@@ -303,7 +334,7 @@ internal sealed class PdfEvidence
         }
 
         var result = new List<DocumentExcerpt>();
-        foreach (var match in ranked.OrderByDescending(x => x.Score).ThenBy(x => x.Page.Number).Take(5))
+        foreach (var match in ranked.OrderByDescending(x => x.Score).ThenBy(x => x.Page.Number))
         {
             var (page, center, _) = match;
             var first = center;
@@ -318,14 +349,31 @@ internal sealed class PdfEvidence
             }
             var lo = page.Lines[first].Start;
             var hi = page.Lines[last].End;
-            if (hi - lo > MaxExcerpt)
-                throw new InvalidDataException("定位到的连续文字太长，请限定原句起点和终点。");
-            result.Add(VerifiedExcerpt(page, lo, hi, mayUseIsolatedLine: page.Ambiguous));
+            AddExcerpt(result, page, lo, hi, discussion, mayUseIsolatedLine: page.Ambiguous);
+            if (result.Count == 5) break;
         }
-        if (result.Count == 0)
-            throw new InvalidDataException("没有匹配且可核验的文档文字。请尝试原文关键词、页码或重新选择含文字层的 PDF。");
-        RequireBounded(result);
+        if (!discussion)
+        {
+            if (result.Count == 0)
+                throw new InvalidDataException("没有匹配且可核验的文档文字。请尝试原文关键词、页码或重新选择含文字层的 PDF。");
+            RequireBounded(result);
+        }
         return result;
+    }
+
+    private void AddExcerpt(List<DocumentExcerpt> result, PageText page, int start, int end, bool discussion,
+        bool mayUseIsolatedLine = false)
+    {
+        try
+        {
+            if (end - start > MaxExcerpt)
+                throw new InvalidDataException("定位到的连续文字太长，请限定原句起点和终点。");
+            result.Add(VerifiedExcerpt(page, start, end, mayUseIsolatedLine));
+        }
+        catch (InvalidDataException) when (discussion)
+        {
+            // An unverifiable candidate is never returned with a source position.
+        }
     }
 
     private DocumentExcerpt VerifiedExcerpt(PageText page, int start, int end, bool mayUseIsolatedLine = false)
@@ -394,6 +442,48 @@ internal sealed class PdfEvidence
             }
             else if (word.Length >= 3 && !StopWords.Contains(word)) yield return word;
         }
+    }
+
+    private static IEnumerable<string> ReferenceTerms(string question)
+    {
+        foreach (Match match in NumberedReference.Matches(question))
+        {
+            var number = match.Groups["number"].Value;
+            switch (match.Groups["kind"].Value)
+            {
+                case "图":
+                    yield return "Figure " + number;
+                    yield return "Fig. " + number;
+                    break;
+                case "算法":
+                    yield return "Algorithm " + number;
+                    break;
+                case "表":
+                    yield return "Table " + number;
+                    break;
+                default:
+                    yield return "Equation " + number;
+                    yield return "Eq. (" + number + ")";
+                    break;
+            }
+        }
+        if (question.Contains("参考点", StringComparison.Ordinal))
+            yield return "reference point";
+    }
+
+    private static bool ContainsSearchTerm(string text, string term)
+    {
+        if (!char.IsDigit(term[^1]))
+            return text.Contains(term, StringComparison.OrdinalIgnoreCase);
+        for (var offset = 0; offset < text.Length;)
+        {
+            int start = text.IndexOf(term, offset, StringComparison.OrdinalIgnoreCase);
+            if (start < 0) return false;
+            int end = start + term.Length;
+            if (end == text.Length || !char.IsDigit(text[end])) return true;
+            offset = end;
+        }
+        return false;
     }
 
     private static (string Value, List<int> Offsets) FoldWhitespace(string input)

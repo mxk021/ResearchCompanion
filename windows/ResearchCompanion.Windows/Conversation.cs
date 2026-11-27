@@ -197,7 +197,14 @@ internal sealed partial class ResearchWindow
         {
             status.Text = "正在核对材料…";
             string requestId = "dsh-pet-" + Guid.NewGuid();
-            var source = include.IsChecked == true ? await PrepareSourceAsync(question, requestId, ct) : null;
+            bool selectionOnly = UsesOnlySelection(question);
+            bool discussion = !selectionOnly && !PdfEvidence.RequiresExactEvidence(question);
+            bool includeMaterial = include.IsChecked == true;
+            if (selectionOnly && !includeMaterial)
+                throw new InvalidDataException("本轮请求限于选区，请先带入可用选区。");
+            bool documentRequested = includeMaterial && document != null && !selectionOnly;
+            var source = includeMaterial ? await PrepareSourceAsync(question, requestId, discussion, selectionOnly, ct) : null;
+            bool missingDocumentEvidence = discussion && documentRequested && (source == null || source.Pages.Count == 0);
             if (session == null)
             {
                 var createdId = Guid.NewGuid().ToString();
@@ -221,6 +228,9 @@ internal sealed partial class ResearchWindow
                 ["requestId"] = requestId, ["text"] = question, ["mode"] = "ask",
                 ["includeContext"] = source != null
             };
+            if (discussion && Array(client.Capabilities, "supports").Any(value =>
+                value.ValueKind == JsonValueKind.String && value.GetString() == "researchDiscussionEvidence"))
+                request["evidencePolicy"] = "discussion";
             if (source != null)
             {
                 var material = new Dictionary<string, string>
@@ -263,7 +273,7 @@ internal sealed partial class ResearchWindow
                     Text(item, "role") == "assistant" && Text(Field(item, "reply"), "requestId") == requestId);
                 if (!Flag(reply, "running") && hasReply)
                 {
-                    status.Text = "回复完成";
+                    status.Text = missingDocumentEvidence ? "回复完成 · 本轮未取得可核对的文件摘录" : "回复完成";
                     return;
                 }
                 if (Text(reply, "error") is string failure && !Flag(reply, "running"))
@@ -297,27 +307,49 @@ internal sealed partial class ResearchWindow
         }
     }
 
-    private async Task<SourceReceipt?> PrepareSourceAsync(string question, string requestId, CancellationToken ct)
+    private static bool UsesOnlySelection(string question) =>
+        question.Contains("只用选区", StringComparison.Ordinal)
+        || question.Contains("只翻译选区", StringComparison.Ordinal)
+        || question.Contains("仅根据选区", StringComparison.Ordinal);
+
+    private async Task<SourceReceipt?> PrepareSourceAsync(string question, string requestId, bool discussion,
+        bool selectionOnly, CancellationToken ct)
     {
+        const int materialLimit = 24_000;
         var currentSelection = selection;
         var currentDocument = document;
-        if (currentSelection == null && currentDocument == null) return null;
-        bool useOnlySelection = question.Contains("只用选区", StringComparison.Ordinal)
-            || question.Contains("只翻译选区", StringComparison.Ordinal)
-            || question.Contains("仅根据选区", StringComparison.Ordinal);
-        if (useOnlySelection && currentSelection == null)
+        if (selectionOnly && currentSelection == null)
             throw new InvalidDataException("本轮请求限于选区，但当前没有可用选区。");
-        IReadOnlyList<DocumentExcerpt> pages = currentDocument == null || useOnlySelection
-            ? System.Array.Empty<DocumentExcerpt>() : await currentDocument.RetrieveAsync(question, ct);
-        var parts = pages.Select(page => $"【文件第 {page.Page} 页】\n{page.Text}").ToList();
+        if (currentSelection == null && currentDocument == null) return null;
+        if (discussion && (currentSelection?.Text.Length > materialLimit || currentSelection?.Text.Contains('\0') == true))
+            currentSelection = null;
+        IReadOnlyList<DocumentExcerpt> candidates = currentDocument == null || selectionOnly
+            ? System.Array.Empty<DocumentExcerpt>()
+            : discussion ? await currentDocument.RetrieveForDiscussionAsync(question, ct)
+                         : await currentDocument.RetrieveAsync(question, ct);
+        var pages = new List<DocumentExcerpt>();
+        var parts = new List<string>();
+        const string selectionHeading = "【所选文字】\n";
+        int remaining = materialLimit - (currentSelection == null ? 0 : currentSelection.Text.Length + selectionHeading.Length);
+        foreach (var page in candidates)
+        {
+            var part = $"【文件第 {page.Page} 页】\n{page.Text}";
+            if (discussion && (part.Contains('\0') || part.Length + 2 > remaining))
+                continue;
+            remaining -= part.Length + 2;
+            pages.Add(page);
+            parts.Add(part);
+        }
         if (currentSelection != null)
-            parts.Add((pages.Count == 0 ? "" : "【所选文字】\n") + currentSelection.Text);
+            parts.Add((pages.Count == 0 ? "" : selectionHeading) + currentSelection.Text);
+        if (discussion && parts.Count == 0) return null;
         var text = string.Join("\n\n", parts);
-        if (string.IsNullOrWhiteSpace(text) || text.Length > 24_000 || text.Contains('\0'))
+        if (string.IsNullOrWhiteSpace(text) || text.Length > materialLimit || text.Contains('\0'))
             throw new InvalidDataException("本轮材料为空、格式无效或过长。请缩小读取范围。");
         var title = pages.Count > 0 ? pages[0].Title : currentSelection!.Title ?? currentSelection.Application;
         var scope = pages.Count > 0
-            ? "文件页 " + string.Join("、", pages.Select(page => page.Page).Distinct()) + (currentSelection == null ? "" : "及所选文字")
+            ? (discussion ? "相关原文摘录 · " : "") + "文件页 " + string.Join("、", pages.Select(page => page.Page).Distinct())
+                + (currentSelection == null ? "" : "及所选文字")
             : currentSelection!.ProvenanceVerified ? "用户选区" : "用户选区 · 出处未核验";
         return new(requestId, title, text, scope,
             pages.Count == 0 && currentSelection!.ProvenanceVerified ? CleanSourceUrl(currentSelection.Url) : null, pages,

@@ -816,7 +816,7 @@ export function apply(ctx: Context): void {
       ...(typeof (ctx.sessionController as unknown as { projections?: unknown }).projections === 'function' ? ['taskPreview'] : []),
       // The Windows client reads its authenticated Zotero selection before constructing inline material.
       ...(process.platform === 'win32' ? [] : ['researchContext']),
-      'researchPrompt', 'conversation', 'researchStream', 'researchMaterial',
+      'researchPrompt', 'conversation', 'researchStream', 'researchMaterial', 'researchDiscussionEvidence',
       ...(imageUploads() ? ['researchDocumentImages'] : []),
       ...(researchSessionQuery() !== undefined && archiveSessionIDs() !== undefined ? ['researchHistory'] : []),
       ...(retirement.available(optionalService) ? ['researchSafeDelete','research.retirement.offline.v1'] : []),
@@ -975,7 +975,7 @@ export function apply(ctx: Context): void {
         if (request.contextKey && context?.key !== request.contextKey) throw new Error('当前 Zotero 原文或选区已变化，请核对预览再发。')
         // The memory seam is disabled; no invisible retention or autonomous actions.
         await noMemory.recall(request.text)
-        const text = researchPrompt(request.text, request.mode, context, await persona())
+        const text = researchPrompt(request.text, request.mode, context, await persona(), request.evidencePolicy)
         const crops = request.documentImages
         return admitResearchPrompt(request, [{ type: 'text', text }],
           context && (crops.length || context.scope?.startsWith('文档对象')) ? {text: context.text, crops} : undefined,

@@ -22,8 +22,10 @@ try
         Sheet((60, 717, "RC-WIN: Frozen source one."), (60, 690, "Begin reading at Golden lens."),
             (60, 663, "Middle evidence one.")),
         Sheet((60, 717, "Middle evidence two."), (60, 690, "End at Copper rotation."),
-            (60, 663, "RC-WIN: Frozen source two.")),
-        Sheet((60, 717, "End at Copper rotation."), (60, 690, "Repeated end anchor.")),
+            (60, 663, "RC-WIN: Frozen source two."), (60, 636, "Algorithm 1 initializes a reference point."),
+            (60, 609, "Figure 3 compares ordinary evidence with the reference point.")),
+        Sheet((60, 717, "End at Copper rotation."), (60, 690, "Repeated end anchor."),
+            (60, 663, "Algorithm 10 is described by Figure 30.")),
         "80 200 274 127 re f\n"
     ]);
     var document = await PdfEvidence.OpenAsync(passage);
@@ -42,6 +44,30 @@ try
     await Reject(() => document.RetrieveAsync("读取第 1、3 页"), "多个页段", "compact disjoint scope");
     Verify((await document.RetrieveAsync("读取首页"))[0].Page == 1, "first page alias");
     Verify((await document.RetrieveAsync("查找 Frozen source"))[0].Text.Contains("Frozen source"), "lexical excerpts");
+
+    const string firstQuestion = "解释一下算法1和图3";
+    const string followUp = "固定参考点u如何确定，人为规定？";
+    Verify(!PdfEvidence.RequiresExactEvidence(firstQuestion) && !PdfEvidence.RequiresExactEvidence(followUp),
+        "ordinary visual question and follow-up use discussion policy");
+    Verify(PdfEvidence.RequiresExactEvidence("逐字引用图3的图注") &&
+        PdfEvidence.RequiresExactEvidence("精确引用论文对 u 的定义") &&
+        PdfEvidence.RequiresExactEvidence("将第 4 页逐段译成中文") &&
+        PdfEvidence.RequiresExactEvidence("把这一段原文翻译成中文") &&
+        PdfEvidence.RequiresExactEvidence("从「Golden lens.」到「Copper rotation.」"),
+        "exact quotation, translation and anchored passage retain strict policy");
+    Verify(!PdfEvidence.RequiresExactEvidence("无需翻译，解释图3"),
+        "a negated translation does not block ordinary figure discussion");
+    var related = await document.RetrieveForDiscussionAsync(firstQuestion);
+    Verify(related.Any(item => item.Page == 2 && item.Text.Contains("Algorithm 1") &&
+        item.Text.Contains("Figure 3") && item.Regions.Count > 0), "related mapped mentions can support object discussion");
+    Verify(related.All(item => item.Page != 3), "a numbered reference cannot match another number's prefix");
+    var reference = await document.RetrieveForDiscussionAsync(followUp);
+    Verify(reference.Any(item => item.Page == 2 && item.Text.Contains("reference point") &&
+        item.Fingerprint == document.Fingerprint), "cross-language follow-up retrieves a version-bound excerpt");
+    var mixedPages = await document.RetrieveForDiscussionAsync("概括第 3–4 页");
+    Verify(mixedPages.Count == 1 && mixedPages[0].Page == 3, "unreadable page does not discard readable evidence");
+    Verify((await document.RetrieveForDiscussionAsync("固定参考轴和训练批次的关系？")).Count == 0,
+        "no evidence returns an empty result rather than false source");
 
     var aligned = Fixture("columns.pdf");
     var columnContent = Sheet(
@@ -81,6 +107,8 @@ try
         "Unicode text anchors with no PDF coordinates");
     await File.WriteAllTextAsync(notes, "# A test\n科研摘要：线索原文。\n改后核验。\n");
     await Reject(() => markdown.RetrieveAsync("概括"), "内容已更新", "same-length edits invalidate a receipt");
+    Verify((await markdown.RetrieveForDiscussionAsync("概括")).Count == 0,
+        "discussion never sends stale evidence for changed file");
     return 0;
 }
 finally
