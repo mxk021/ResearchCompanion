@@ -548,13 +548,23 @@ internal sealed partial class ResearchWindow
         var material = new TextBox { Margin = new Thickness(0, 0, 5, 0), MinWidth = 140 };
         AutoLabel(title, "标题");
         AutoLabel(material, "材料");
-        var archive = new ComboBox { ItemsSource = new[] { "全部", "未归档", "已归档" }, SelectedIndex = 0, MinWidth = 80 };
+        var archive = new ComboBox
+        {
+            ItemsSource = new[] { "全部", "未归档", "已归档" }, SelectedIndex = 0, MinWidth = 80,
+            Foreground = ColorBrush("#182235")
+        };
+        archive.Resources[SystemColors.WindowBrushKey] = Brushes.White;
+        archive.Resources[SystemColors.WindowTextBrushKey] = archive.Foreground;
         var filter = new Button { Content = "查找" };
         var more = new Button { Content = "下一页", IsEnabled = false, Margin = new Thickness(0, 5, 0, 0) };
         var controls = new WrapPanel();
         foreach (var item in new UIElement[] { new TextBlock { Text = "标题 " }, title, new TextBlock { Text = "材料 " }, material, archive, filter })
             controls.Children.Add(item);
-        var results = new ListBox { DisplayMemberPath = nameof(HistoryRow.Title), Margin = new Thickness(0, 8, 0, 0) };
+        var results = new ListBox
+        {
+            DisplayMemberPath = nameof(HistoryRow.Title), Margin = new Thickness(0, 8, 0, 0),
+            Background = pin.Background, Foreground = Foreground, BorderBrush = pin.BorderBrush
+        };
         var view = new DockPanel { Margin = new Thickness(15) };
         DockPanel.SetDock(controls, Dock.Top);
         DockPanel.SetDock(more, Dock.Bottom);
