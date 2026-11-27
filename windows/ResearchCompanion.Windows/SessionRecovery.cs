@@ -14,7 +14,9 @@ internal sealed record SavedResearchModel(string Provider, string Model, string?
         Provider == provider && Model == model && Effort == effort;
 }
 
-internal sealed record SavedResearchFile(string Path, string Fingerprint, bool RecognizeScans, bool Include);
+internal sealed record SavedZoteroAttachment(string Library, string AttachmentKey, long AttachmentId, string PairingId);
+internal sealed record SavedResearchFile(string Path, string Fingerprint, bool RecognizeScans, bool Include,
+    SavedZoteroAttachment? Zotero = null);
 
 internal sealed record SavedResearchSession(SavedResearchModel? Model = null, SavedResearchFile? File = null);
 

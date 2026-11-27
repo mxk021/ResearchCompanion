@@ -59,6 +59,7 @@ function fixture() {
   const permissions = new Map();
   const types = new Map([['/profile/dsh-companion-bridge', 'directory']]);
   const readPaths = [];
+  const fileStats = new Map();
   const missingResult = 12345;
   const events = new Map();
   let selectedAttachmentID = 42;
@@ -78,7 +79,9 @@ function fixture() {
       isSymlink: () => types.get(p) === 'symlink',
       exists: () => types.has(p) || data.has(p),
       isDirectory: () => types.get(p) === 'directory',
-      isFile: () => types.get(p) === 'regular' || (!types.has(p) && data.has(p))
+      isFile: () => types.get(p) === 'regular' || (!types.has(p) && data.has(p)),
+      get fileSize() { return fileStats.get(p)?.bytes; },
+      get lastModifiedTime() { return fileStats.get(p)?.modifiedMs; }
     }) },
     getMainWindow: () => ({ Zotero_Tabs: { selectedType: 'reader', selectedID: 'reader-42' } }),
     Reader: {
@@ -107,7 +110,7 @@ function fixture() {
     Services: { appShell: { hiddenDOMWindow: { crypto: crypto.webcrypto } }, scriptloader: { loadSubScript: (_url, scope) => vm.runInNewContext(fs.readFileSync(path.join(root, 'core.js'), 'utf8'), scope) } }
   });
   vm.runInContext(fs.readFileSync(path.join(root, 'bootstrap.js'), 'utf8'), sandbox);
-  return { sandbox, Zotero, view, events, data, types, readPaths, permissions, switchPaper: () => { selectedAttachmentID = 43; }, setOnRead: callback => { onRead = callback; } };
+  return { sandbox, Zotero, view, events, data, types, fileStats, readPaths, permissions, switchPaper: () => { selectedAttachmentID = 43; }, setOnRead: callback => { onRead = callback; } };
 }
 
 function body(result) { return JSON.parse(result[2]); }
@@ -381,4 +384,74 @@ test('live replies are tagged with the active attachment and reject a changed ta
   const changed=send();
   assert.equal(changed[0],409);
   assert.equal(JSON.parse(changed[2]).error,'SOURCE_CHANGED');
+});
+
+test('active PDF path and file version are returned only to a paired, opt-in live request', async () => {
+  const f = fixture();
+  const win = {Zotero_Tabs:{selectedID:'Reader-1',selectedType:'reader'},document:{hasFocus:()=>true}};
+  f.sandbox.Services.focus = {activeWindow: win};
+  const view = {_iframeWindow:{document:{hasFocus:()=>true,activeElement:{}}},
+    _selectionRanges:[{text:'Exact local PDF selection.',position:{pageIndex:0}}]};
+  const attachment = f.Zotero.Items.get(42);
+  attachment.isStoredFileAttachment = () => true;
+  attachment.attachmentPath = 'storage:fixture.pdf';
+  const stored = '/storage/PDF00042/fixture.pdf';
+  f.Zotero.Attachments = {
+    getStorageDirectory: a => { assert.equal(a, attachment); return {path:'/storage/PDF00042'}; },
+    LINK_MODE_LINKED_FILE: 2, BASE_PATH_PLACEHOLDER:'attachments:',
+    resolveRelativePath: raw => { assert.equal(raw, 'attachments:linked.pdf'); return '/linked/linked.pdf'; }
+  };
+  f.types.set(stored, 'regular');
+  f.fileStats.set(stored, {bytes:65536, modifiedMs:1794700000000});
+  const reader = {itemID:42,_item:attachment,_internalReader:{_lastView:view}};
+  f.Zotero.getMainWindow = () => win;
+  f.Zotero.Reader.getByTabID = () => reader;
+  await f.sandbox.startup({rootURI:'test://bridge/'});
+  const endpoint = new f.Zotero.Server.Endpoints[core.ENDPOINT_PATH]();
+  const requestId = '00000000-0000-4000-8000-000000000004';
+  const live = () => new URLSearchParams({selection:'live', requestId});
+  const optedHeaders = () => ({...headers(), 'X-Research-Companion-Local-PDF':'1'});
+  const read = () => endpoint.init(request({headers:optedHeaders(), searchParams:live()}));
+  assert.equal(body(await endpoint.init(request({searchParams:live()}))).liveSelection.pdfFile, undefined);
+  assert.equal(body(await endpoint.init(request({headers:optedHeaders()}))).pdfFile, undefined);
+  assert.equal((await endpoint.init(request({headers:{host:'127.0.0.1:23119','X-Research-Companion-Local-PDF':'1'},
+    searchParams:live()})))[0], 403);
+  const selected = body(await read()).liveSelection;
+  assert.deepEqual(selected.pdfFile, {path:stored, bytes:65536, modifiedMs:1794700000000, attachmentID:42,
+    attachmentKey:'PDF00042', library:'library'});
+  assert.equal(selected.text, 'Exact local PDF selection.');
+  f.types.set(stored, 'symlink');
+  assert.equal(body(await read()).liveSelection.pdfFile, undefined);
+  const linked = '/linked/linked.pdf';
+  f.types.set(linked, 'regular');
+  f.fileStats.set(linked, {bytes:12, modifiedMs:1794700000001});
+  attachment.isStoredFileAttachment = () => false;
+  attachment.attachmentLinkMode = 2;
+  attachment.attachmentPath = 'attachments:linked.pdf';
+  assert.equal(body(await read()).liveSelection.pdfFile.path, linked);
+  attachment.attachmentPath = 'AAAAlegacyAliasMustNotBeMigrated';
+  assert.equal(body(await read()).liveSelection.pdfFile, undefined);
+  f.sandbox.Services.appinfo = {OS:'WINNT'};
+  const windowsPDF = 'C:\\Library\\linked.pdf';
+  f.types.set(windowsPDF, 'regular');
+  f.fileStats.set(windowsPDF, {bytes:12, modifiedMs:1794700000001});
+  attachment.attachmentPath = windowsPDF;
+  assert.equal(body(await read()).liveSelection.pdfFile.path, windowsPDF);
+  for (const invalid of [
+    '\\\\server\\share\\linked.pdf', '\\\\?\\C:\\Library\\linked.pdf',
+    'C:linked.pdf', 'C:\\Library\\..\\linked.pdf', 'C:\\Library\\linked.pdf:stream.pdf'
+  ]) {
+    f.types.set(invalid, 'regular');
+    f.fileStats.set(invalid, {bytes:12, modifiedMs:1794700000001});
+    attachment.attachmentPath = invalid;
+    assert.equal(body(await read()).liveSelection.pdfFile, undefined, invalid);
+  }
+  delete f.sandbox.Services.appinfo;
+  attachment.attachmentPath = '/linked/linked.pdf';
+  reader._item = {...attachment, key:'DIFF0001'};
+  assert.equal(body(await read()).liveSelection.pdfFile, undefined);
+  reader._item = attachment;
+  f.fileStats.set(linked, {get bytes() { win.Zotero_Tabs.selectedID = 'Reader-2'; return 12; }, modifiedMs:1794700000001});
+  assert.equal((await read())[0], 409);
+  f.sandbox.shutdown();
 });

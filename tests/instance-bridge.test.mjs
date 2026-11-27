@@ -14,6 +14,7 @@ import {
   refreshHarnessInstanceWebURL,
 } from '../lib/index.js'
 import { clearAmbientHarnessEnv } from './ambient-env.mjs'
+import { authenticateTestPipe } from './windows-test-pipe.mjs'
 
 clearAmbientHarnessEnv()
 const { Context, cleanup: cleanupCordis } = await loadCordis()
@@ -70,8 +71,15 @@ test('descriptor uses explicit profile evidence and emits only loopback origins'
     webServer: { protocol: 'https:', host: '192.168.1.2', port: 3080 },
   })
   assert.equal(untrusted.webURL, undefined)
-  assert.ok(untrusted.statusSocketPath.length < 104)
-  assert.ok(untrusted.commandSocketPath.length < 104)
+  if (process.platform === 'win32') {
+    assert.equal(untrusted.transport.scheme, 'windows-pipe-v1')
+    const prefix = '\\\\.\\pipe\\ResearchCompanion-v1-'
+    assert.ok(untrusted.statusSocketPath.startsWith(prefix) && untrusted.statusSocketPath.endsWith('-s'))
+    assert.ok(untrusted.commandSocketPath.startsWith(prefix) && untrusted.commandSocketPath.endsWith('-c'))
+  } else {
+    assert.ok(untrusted.statusSocketPath.length < 104)
+    assert.ok(untrusted.commandSocketPath.length < 104)
+  }
 
   const officialDesktopShape = createHarnessInstanceDescriptor({
     profileContext: {
@@ -106,6 +114,7 @@ test('descriptor uses explicit profile evidence and emits only loopback origins'
 })
 
 function descriptor(id, root) {
+  if (process.platform === 'win32') return createHarnessInstanceDescriptor()
   return {
     protocolVersion: 1,
     instanceId: id,
@@ -182,7 +191,8 @@ async function capabilities(socket) {
   return next()
 }
 
-test('socket creation restores the caller umask and keeps 0600 permissions', async () => {
+test('socket creation restores the caller umask and keeps 0600 permissions',
+  { skip: process.platform === 'win32' }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-pet-umask-'))
   const socketPath = join(root, 'command.sock')
   const originalUmask = process.umask()
@@ -210,8 +220,8 @@ test('two instance bridges keep identities, sockets, and discovery manifests iso
   const secondManifest = new HarnessInstanceManifest(second, discovery)
   const firstBridge = new CommandBridge(handlers(first.instanceId), first.commandSocketPath, first)
   const secondBridge = new CommandBridge(handlers(second.instanceId), second.commandSocketPath, second)
-  const firstStatus = new LocalStateBridge(() => handlers(first.instanceId).snapshotFor(), first.statusSocketPath)
-  const secondStatus = new LocalStateBridge(() => handlers(second.instanceId).snapshotFor(), second.statusSocketPath)
+  const firstStatus = new LocalStateBridge(() => handlers(first.instanceId).snapshotFor(), first.statusSocketPath, first)
+  const secondStatus = new LocalStateBridge(() => handlers(second.instanceId).snapshotFor(), second.statusSocketPath, second)
   const unrelated = join(discovery, 'keep.txt')
 
   try {
@@ -221,10 +231,14 @@ test('two instance bridges keep identities, sockets, and discovery manifests iso
     secondBridge.start()
     firstStatus.start()
     secondStatus.start()
-    const firstSocket = await waitForServer(first.commandSocketPath)
-    const secondSocket = await waitForServer(second.commandSocketPath)
     firstManifest.publish()
     secondManifest.publish()
+    const firstFields = JSON.parse(await readFile(firstManifest.path, 'utf8'))
+    const secondFields = JSON.parse(await readFile(secondManifest.path, 'utf8'))
+    const firstSocket = await waitForServer(first.commandSocketPath)
+    await authenticateTestPipe(firstSocket, firstFields)
+    const secondSocket = await waitForServer(second.commandSocketPath)
+    await authenticateTestPipe(secondSocket, secondFields)
 
     const firstCapabilities = await capabilities(firstSocket)
     const secondCapabilities = await capabilities(secondSocket)
@@ -232,8 +246,10 @@ test('two instance bridges keep identities, sockets, and discovery manifests iso
     assert.equal(secondCapabilities.instance.instanceId, second.instanceId)
     assert.equal(firstCapabilities.instance.commandSocketPath, first.commandSocketPath)
     assert.equal(secondCapabilities.instance.commandSocketPath, second.commandSocketPath)
-    assert.deepEqual(JSON.parse(await readFile(firstManifest.path, 'utf8')), first)
-    assert.equal((await stat(firstManifest.path)).mode & 0o777, 0o600)
+    const { protectedCredential, ...published } = firstFields
+    assert.deepEqual(published, first)
+    if (process.platform === 'win32') assert.match(protectedCredential, /^[a-zA-Z0-9+/]+={0,2}$/)
+    else assert.equal((await stat(firstManifest.path)).mode & 0o777, 0o600)
 
     firstManifest.remove()
     assert.equal(await stat(secondManifest.path).then(() => true), true)
@@ -245,6 +261,9 @@ test('two instance bridges keep identities, sockets, and discovery manifests iso
     const stillAlive = await capabilities(secondSocket)
     assert.equal(stillAlive.instance.instanceId, second.instanceId)
   } finally {
+    firstBridge.stop()
+    firstStatus.stop()
+    firstManifest.remove()
     secondBridge.stop()
     secondStatus.stop()
     secondManifest.remove()
@@ -252,7 +271,8 @@ test('two instance bridges keep identities, sockets, and discovery manifests iso
   }
 })
 
-test('an active socket is never unlinked by a competing bridge stop', async () => {
+test('an active socket is never unlinked by a competing bridge stop',
+  { skip: process.platform === 'win32' }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-pet-existing-'))
   const socketPath = join(root, 'dsh-pet-command.sock')
   const first = new CommandBridge(handlers('existing-owner'), socketPath)
@@ -273,7 +293,7 @@ test('an active socket is never unlinked by a competing bridge stop', async () =
   }
 })
 
-test('a stale socket is reclaimed after a refused probe', async () => {
+test('a stale socket is reclaimed after a refused probe', { skip: process.platform === 'win32' }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-pet-stale-'))
   const socketPath = join(root, 'dsh-pet-command.sock')
   const stale = createServer()
@@ -292,7 +312,8 @@ test('a stale socket is reclaimed after a refused probe', async () => {
   }
 })
 
-test('stop does not unlink a replacement socket with a different inode', async () => {
+test('stop does not unlink a replacement socket with a different inode',
+  { skip: process.platform === 'win32' }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-pet-replacement-'))
   const socketPath = join(root, 'dsh-pet-command.sock')
   const bridge = new CommandBridge(handlers('owner'), socketPath)

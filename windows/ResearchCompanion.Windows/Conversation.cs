@@ -115,6 +115,7 @@ internal sealed partial class ResearchWindow
             {
                 if (document == null) await RestoreSessionFileAsync();
                 else SaveSessionFile();
+                await RestoreDraftImagesAsync(lifetime.Token);
                 await RenderAsync();
             }
         }
@@ -186,11 +187,12 @@ internal sealed partial class ResearchWindow
                 button.IsEnabled = !value;
         include.IsEnabled = !value;
         composer.IsReadOnly = value;
+        draftImagePanel.IsEnabled = !value;
         RefreshSendButton();
     }
 
     private void RefreshSendButton() => send.IsEnabled = !busy && connection != null && workspace != null
-        && chosenModel != null && !string.IsNullOrWhiteSpace(composer.Text) &&
+        && chosenModel != null && (!string.IsNullOrWhiteSpace(composer.Text) || draftImages.Count != 0) &&
         (session == null || blockedSession != session);
 
     private Dictionary<string, object?> Target(string id) =>
@@ -198,22 +200,18 @@ internal sealed partial class ResearchWindow
 
     private async Task SendAsync()
     {
-        if (busy || connection == null || workspace == null || chosenModel == null || string.IsNullOrWhiteSpace(composer.Text))
+        if (busy || connection is not { } client || workspace == null || chosenModel is not { } choice)
             return;
+        string question = composer.Text.Trim();
+        if (question.Length == 0 && draftImages.Count == 0) return;
+        if (question.Length == 0) question = "请说明所附图片中的主要内容。";
+        if (question.Length > 16_000) throw new InvalidDataException("问题过长，请拆分后发送。");
         if (session != null && blockedSession == session)
             throw new InvalidOperationException("上一轮提交状态尚未确认。请先在 DSH 核对，或另开新会话。");
 
         using var cancelToken = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
         waiting = cancelToken;
         var ct = waiting.Token;
-        var client = connection;
-        var choice = chosenModel;
-        string question = composer.Text.Trim();
-        if (question.Length > 16_000)
-        {
-            waiting = null;
-            throw new InvalidDataException("问题过长，请拆分后发送。");
-        }
         bool submitting = false;
         bool admitted = false;
         using var streamCancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -223,111 +221,162 @@ internal sealed partial class ResearchWindow
         SetBusy(true);
         try
         {
+            var userImages = draftImages.Select(x => x.Image).ToArray();
+            var limits = ImageBudget.Decode(client.AttachmentLimits);
+            if (userImages.Length > 0 && (!choice.SupportsImages || draftImages.Any(x =>
+                x.Width > limits.Dimension || x.Height > limits.Dimension ||
+                !ValidDimensions(x.Width, x.Height, limits.Pixels))))
+                throw new InvalidDataException("附图需要当前明确选择且支持图片的模型，并符合 DSH 的图片限制。");
+            limits.Check(userImages, []);
             status.Text = "正在核对材料…";
-            string requestId = "dsh-pet-" + Guid.NewGuid();
             if (include.IsChecked == true && attachedFileNeedsReview)
                 throw new InvalidDataException("已关联的文件无法核对。请重新选择文件，或移除此材料后提问。");
-            var source = include.IsChecked == true ? await PrepareSourceAsync(question, requestId, ct) : null;
-            IReadOnlyList<SourceCrop> crops = [];
-            if (source?.Pages.Any(page => page.VisualRegion != null) == true)
+            var evidence = await PrepareTurnEvidenceAsync(question, userImages.Length != 0, ct);
+            if (evidence.Guidance != null && !client.SupportsPromptGuidance)
+                throw new InvalidDataException("本轮证据说明需要科研桥 0.2.8，消息未发送。");
+            if (evidence.IsTranslation && userImages.Length != 0)
+                throw new InvalidDataException("文档翻译与附图需分开处理。请移除图片，或在输入框提问图片中的内容。");
+
+            var parts = evidence.Sources;
+            bool batch = parts.Count > 1;
+            if (batch && (!client.SupportsPdfBatch || parts.Count > 24 || userImages.Length > 0))
+                throw new InvalidDataException("此范围需要分段。请确认已使用科研桥 0.2.8，并缩小范围或移除图片后再试。");
+            if (parts.Any(x => x != null) && userImages.Length > 0 && !client.SupportsUserImages)
+                throw new InvalidDataException("当前科研桥不支持附图与文献联合问答。请更新至 0.2.8。");
+
+            string id = await EnsureTurnSessionAsync(client, question, ct);
+            PdfBatchJournal? journal = null;
+            if (batch)
             {
-                crops = await PrepareCropsAsync(document!, source, client, choice, ct);
-                source = source with
+                journal = OpenPdfBatch(id, question, choice, evidence);
+                string kind = evidence.IsTranslation ? "分段翻译" : "分段分析与汇总";
+                int maxCalls = evidence.IsTranslation ? parts.Count : parts.Count * 2;
+                if (choice.Provider != "chatgpt" && MessageBox.Show(this,
+                    $"{kind}最多发送 {maxCalls} 次模型请求，可能消耗账号余额。是否继续？",
+                    "处理长篇 PDF", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
                 {
-                    Scope = (crops.Count > 0 ? "文档对象 · 原页裁图 · " : "文档对象 · 文字证据 · ") + source.Scope,
-                    Text = crops.Count > 0 ? source.Text : "【此轮仅附文字摘录。请说明无法从文字核对的原页图形或公式。】\n" + source.Text,
-                    Crops = crops.Select(crop => crop.Receipt).ToArray()
-                };
+                    status.Text = "问题和材料已保留。";
+                    return;
+                }
             }
-            if (session == null)
-            {
-                var createdId = Guid.NewGuid().ToString();
-                var fields = Target(createdId);
-                fields["title"] = PlainLabel(question, 80);
-                var created = await client.RequestAsync("createSession", fields, ct);
-                if (Text(created, "sessionId") != createdId) throw new InvalidDataException("科研桥返回了不同的会话标识。");
-                var draftRecovery = RecoveryFor(null);
-                session = createdId;
-                SaveSessionFile();
-                draftRecovery?.Update(state => state with { File = null });
-                SaveSettings();
-            }
-            else
-            {
-                var current = await client.RequestAsync("conversation", Target(session), ct);
-                if (Flag(current, "running")) throw new InvalidOperationException("此会话仍在运行，请等待当前任务完成。");
-            }
-            var id = session;
+            await BindSessionModelAsync(client, id, choice, ct);
             streamSubscription = client.SubscribeResearchAsync(id, state => Dispatcher.InvokeAsync(async () =>
             {
-                // Keep the last visible text until the durable reply replaces it.
                 if (!streamCancellation.IsCancellationRequested && ReferenceEquals(connection, client) && session == id &&
                     Field(state, "message").ValueKind == JsonValueKind.Object && MergeStream(state))
                     await RenderAsync();
             }).Task.Unwrap(), streamCancellation.Token);
-            var modelRequest = Target(id);
-            modelRequest["selection"] = choice.Wire();
-            await BindSessionModelAsync(client, id, choice, ct);
-            var request = new Dictionary<string, object?>(modelRequest)
+
+            async Task<string> SubmitAsync(SourceReceipt? original, string? guidance, PdFBatchPart? step = null)
             {
-                ["requestId"] = requestId, ["text"] = question, ["mode"] = "ask",
-                ["includeContext"] = source != null
-            };
-            if (source != null)
-            {
-                var material = new Dictionary<string, string>
+                ct.ThrowIfCancellationRequested();
+                submitting = admitted = false;
+                var prior = step != null ? journal!.Find(step.Key) : null;
+                string requestId = prior ?? "dsh-pet-" + Guid.NewGuid();
+                var source = original is null ? null : original with { RequestId = requestId };
+                IReadOnlyList<SourceCrop> crops = [];
+                if (step == null && source?.Pages.Any(page => page.VisualRegion != null) == true)
                 {
-                    ["source"] = source.Pages.Count > 0 ? "PDF/文本" : "Windows 选区",
-                    ["title"] = PlainLabel(source.Title, 512),
-                    ["scope"] = PlainLabel(source.Scope, 512),
-                    ["text"] = source.Text
-                };
-                if (source.Pages.Count == 1) material["page"] = $"文件第 {source.Pages[0].Page} 页";
-                if (source.Url != null) material["url"] = source.Url;
-                request["material"] = material;
-                if (crops.Count > 0) request["images"] = crops.Select(crop => crop.Wire()).ToArray();
-            }
-            status.Text = "正在提交给 DSH…";
-            submitting = true;
-            var accepted = await client.RequestAsync("researchPrompt", request, ct);
-            if (!Flag(accepted, "accepted")) throw new InvalidDataException("科研桥未返回可确认的提交回执。");
-            admitted = true;
-            composer.Clear();
-            SaveSettings();
-            ++jump;
-            status.Text = "已提交 · 等待回复";
-            var deadline = DateTime.UtcNow.AddMinutes(6);
-            var verify = Target(id);
-            verify["requestId"] = requestId;
-            while (DateTime.UtcNow < deadline)
-            {
-                var reply = await client.RequestAsync("conversation", verify, ct);
-                if (source != null && VerifyDispatch(Field(reply, "dispatchEvidence"), source, choice))
-                {
-                    var verified = source with { DispatchVerified = true };
-                    receipts[requestId] = verified;
-                    SaveReceipt(id, verified, crops);
-                    source = null;
+                    crops = await PrepareCropsAsync(document!, source, client, choice, ct);
+                    source = source with
+                    {
+                        Scope = (crops.Count > 0 ? "文档对象 · 原页裁图 · " : "文档对象 · 文字证据 · ") + source.Scope,
+                        Text = crops.Count > 0 ? source.Text : "【此轮仅附文字摘录。请说明无法从文字核对的原页图形或公式。】\n" + source.Text,
+                        Crops = crops.Select(crop => crop.Receipt).ToArray()
+                    };
                 }
-                lastConversation = reply;
-                MergeStream(Field(reply, "stream"));
-                bool hasReply = Array(reply, "messages").Any(item =>
-                    Text(item, "role") == "assistant" && Text(Field(item, "reply"), "requestId") == requestId);
-                if (hasReply) activeStream = default;
+                if (source?.Text.Length > 24_000) throw new InvalidDataException("本轮材料过长，请缩小范围。");
+                limits.Check(userImages, crops);
+
+                if (prior == null)
+                {
+                    bool imageOnly = source == null && userImages.Length != 0;
+                    var request = Target(id);
+                    request["selection"] = choice.Wire();
+                    request["requestId"] = requestId;
+                    request["text"] = question;
+                    if (imageOnly)
+                        request["images"] = await Task.Run(() => userImages.Select(x => x.Wire()).ToArray(), ct);
+                    else
+                    {
+                        request["mode"] = "ask";
+                        request["includeContext"] = source != null;
+                        if (guidance != null && client.SupportsPromptGuidance) request["guidance"] = guidance;
+                        if (step != null) request["pdfBatch"] = step.Wire(journal!.BatchId);
+                        if (source != null)
+                        {
+                            request["material"] = WireMaterial(source);
+                            if (crops.Count > 0) request["images"] = await Task.Run(() => crops.Select(crop => crop.Wire()).ToArray(), ct);
+                            if (userImages.Length != 0)
+                                request["userImages"] = await Task.Run(() => userImages.Select(x => x.Wire()).ToArray(), ct);
+                        }
+                    }
+                    status.Text = step?.Label ?? "正在提交给 DSH…";
+                    if (source?.Pages.Count > 0 && document is { } attached) await attached.ValidateCurrentAsync(ct);
+                    if (step != null) journal!.Remember(step.Key, requestId);
+                    submitting = true;
+                    JsonElement accepted;
+                    try { accepted = await client.RequestAsync(imageOnly ? "prompt" : "researchPrompt", request, ct); }
+                    catch (BridgeRequestException) { if (step != null) journal!.Forget(step.Key); throw; }
+                    if (!Flag(accepted, "accepted"))
+                        throw new InvalidDataException("科研桥未返回可确认的提交回执。");
+                    admitted = true;
+                    if (step == null)
+                    {
+                        composer.Clear();
+                        draftImages.Clear();
+                        SaveDraftImages();
+                        UpdateDraftImagePanel();
+                        SaveSettings();
+                        ++jump;
+                    }
+                }
+                else admitted = true; // An unresolved part is queried by its exact ID and is never dispatched again.
+                status.Text = step?.Label ?? "已提交 · 等待回复";
+                var deadline = DateTime.UtcNow.AddMinutes(step == null ? 6 : 10);
+                var verify = Target(id);
+                verify["requestId"] = requestId;
+                while (DateTime.UtcNow < deadline)
+                {
+                    var reply = await client.RequestAsync("conversation", verify, ct);
+                    if (source != null && VerifyDispatch(Field(reply, "dispatchEvidence"), source, choice, userImages.Length))
+                    {
+                        var verified = source with { DispatchVerified = true };
+                        receipts[requestId] = verified;
+                        SaveReceipt(id, verified, crops);
+                        source = null;
+                    }
+                    lastConversation = reply;
+                    MergeStream(Field(reply, "stream"));
+                    var assistant = Array(reply, "messages").LastOrDefault(item =>
+                        Text(item, "role") == "assistant" && Text(Field(item, "reply"), "requestId") == requestId);
+                    var completed = Field(reply, "completedPart");
+                    string? answer = step != null && Text(completed, "requestId") == requestId
+                        ? Text(completed, "text") : Text(assistant, "text");
+                    if (assistant.ValueKind == JsonValueKind.Object) activeStream = default;
+                    await RenderAsync();
+                    if (!Flag(reply, "running") && !string.IsNullOrWhiteSpace(answer)) return answer;
+                    if (!Flag(reply, "running") && Text(reply, "error") is string failure)
+                        throw new InvalidOperationException("DSH 返回错误 · " + failure);
+                    await Task.Delay(850, ct);
+                }
+                throw new TimeoutException("等待完整回复超时。请核对 DSH 会话状态后继续。");
+            }
+
+            if (journal != null)
+            {
+                await RunBatchAsync(evidence, SubmitAsync, ct);
+                journal.Complete();
+                composer.Clear();
+                SaveSettings();
+                ++jump;
                 await RenderAsync();
-                if (!Flag(reply, "running") && hasReply)
-                {
-                    status.Text = "回复完成";
-                    return;
-                }
-                if (Text(reply, "error") is string failure && !Flag(reply, "running"))
-                {
-                    status.Text = "DSH 返回错误 · " + failure;
-                    return;
-                }
-                await Task.Delay(850, ct);
             }
-            status.Text = "已提交，等待超时。请刷新会话或在 DSH 查看进度。";
+            else
+            {
+                await SubmitAsync(parts[0], evidence.Guidance);
+            }
+            status.Text = "回复完成";
         }
         catch (BridgeRequestException error)
         {
@@ -339,7 +388,7 @@ internal sealed partial class ResearchWindow
             status.Text = admitted ? "已停止等待。DSH 可能仍在处理。" :
                 submitting ? "已停止等待，提交结果尚未确认。请在 DSH 核对。" : "已取消，未提交。";
         }
-        catch (Exception error) when (submitting)
+        catch (Exception error) when (submitting || admitted)
         {
             if (!admitted) blockedSession = session;
             status.Text = (admitted ? "已提交，后续读取失败 · " : "提交状态无法确认 · ") + error.Message;
@@ -358,6 +407,37 @@ internal sealed partial class ResearchWindow
                 SetBusy(false);
             }
         }
+    }
+
+    private async Task<string> EnsureTurnSessionAsync(BridgeClient client, string question, CancellationToken ct)
+    {
+        if (session is { } existing)
+        {
+            var current = await client.RequestAsync("conversation", Target(existing), ct);
+            if (Flag(current, "running")) throw new InvalidOperationException("此会话仍在运行，请等待当前任务完成。");
+            return existing;
+        }
+        var createdId = Guid.NewGuid().ToString();
+        var fields = Target(createdId);
+        fields["title"] = PlainLabel(question, 80);
+        var created = await client.RequestAsync("createSession", fields, ct);
+        if (Text(created, "sessionId") != createdId) throw new InvalidDataException("科研桥返回了不同的会话标识。");
+        var draftRecovery = RecoveryFor(null);
+        var oldImages = DraftImagePath(null);
+        session = createdId;
+        SaveSessionFile();
+        draftRecovery?.Update(state => state with { File = null });
+        if (draftImages.Count != 0)
+        {
+            SaveDraftImages();
+            if (oldImages != null)
+            {
+                try { File.Delete(oldImages); }
+                catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+            }
+        }
+        SaveSettings();
+        return createdId;
     }
 
     private bool MergeStream(JsonElement state)
@@ -408,45 +488,14 @@ internal sealed partial class ResearchWindow
         return crops;
     }
 
-    private async Task<SourceReceipt?> PrepareSourceAsync(string question, string requestId, CancellationToken ct)
-    {
-        var currentSelection = selection;
-        var currentDocument = document;
-        if (currentSelection == null && currentDocument == null) return null;
-        bool useOnlySelection = question.Contains("只用选区", StringComparison.Ordinal)
-            || question.Contains("只翻译选区", StringComparison.Ordinal)
-            || question.Contains("仅根据选区", StringComparison.Ordinal);
-        if (useOnlySelection && currentSelection == null)
-            throw new InvalidDataException("本轮请求限于选区，但当前没有可用选区。");
-        IReadOnlyList<DocumentExcerpt> pages = currentDocument == null || useOnlySelection
-            ? System.Array.Empty<DocumentExcerpt>() : await currentDocument.RetrieveAsync(question, ct);
-        var parts = pages.Select(page => page.Recognition is { Length: > 0 } recognized
-            ? $"【文件第 {page.Page} 页 · {recognized}】\n{page.Text}"
-            : $"【文件第 {page.Page} 页】\n{page.Text}").ToList();
-        if (currentSelection != null)
-            parts.Add((pages.Count == 0 ? "" : "【所选文字】\n") + currentSelection.Text);
-        var text = string.Join("\n\n", parts);
-        if (string.IsNullOrWhiteSpace(text) || text.Length > 24_000 || text.Contains('\0'))
-            throw new InvalidDataException("本轮材料为空、格式无效或过长。请缩小读取范围。");
-        var title = pages.Count > 0 ? pages[0].Title : currentSelection!.Title ?? currentSelection.Application;
-        var scope = pages.Count > 0
-            ? "文件页 " + string.Join("、", pages.Select(page => page.Page).Distinct()) + (currentSelection == null ? "" : "及所选文字")
-            : currentSelection!.ProvenanceVerified ? "用户选区" : "用户选区 · 出处未核验";
-        return new(requestId, title, text, scope,
-            pages.Count == 0 && currentSelection!.ProvenanceVerified ? CleanSourceUrl(currentSelection.Url) : null, pages,
-            AppSourceLink: pages.Count == 0 && currentSelection?.Application == "Zotero" &&
-                currentSelection.ProvenanceVerified ? ZoteroLink(currentSelection.Url) : null,
-            PositionVerified: pages.Count > 0 || currentSelection?.ProvenanceVerified == true,
-            ZoteroPairingId: pages.Count == 0 ? currentSelection?.ZoteroPairingId : null);
-    }
-
-    private static bool VerifyDispatch(JsonElement proof, SourceReceipt source, ModelChoice choice) =>
+    private static bool VerifyDispatch(JsonElement proof, SourceReceipt source, ModelChoice choice, int userImages) =>
         Text(proof, "requestId") == source.RequestId &&
         string.Equals(Text(proof, "sha256"), Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(source.Text))), StringComparison.OrdinalIgnoreCase) &&
         Field(proof, "utf16Length").TryReadInt() == source.Text.Length &&
         Text(Field(proof, "selection"), "provider") == choice.Provider &&
         Text(Field(proof, "selection"), "model") == choice.Model &&
         Text(Field(proof, "selection"), "reasoningEffort") == choice.Effort &&
+        Array(proof, "userImages").Count() == userImages &&
         (source.Crops is not { Count: > 0 } crops ||
             Array(proof, "sourceImages").Select(item => item.ValueKind == JsonValueKind.String ? item.GetString() : null)
                 .SequenceEqual(crops.Select(crop => crop.Sha256), StringComparer.OrdinalIgnoreCase) &&
@@ -461,6 +510,8 @@ internal sealed partial class ResearchWindow
         streamRevision = -1;
         ClearDocument();
         selection = null;
+        draftImages.Clear();
+        UpdateDraftImagePanel();
         chosenModel = null;
         lastConversation = default;
         receipts.Clear();
@@ -474,6 +525,7 @@ internal sealed partial class ResearchWindow
         {
             if (id != null) await RefreshCurrentConversationAsync();
             await RestoreSessionFileAsync();
+            await RestoreDraftImagesAsync(lifetime.Token);
             await RenderAsync();
         }
         finally { SetBusy(false); }
@@ -562,7 +614,7 @@ internal sealed partial class ResearchWindow
             id = role + ":" + id;
             if (role == "user")
             {
-                rows.Add(new(id, role, DisplayQuestion(text), Original: text));
+                rows.Add(new(id, role, Flag(entry, "plainQuestion") ? text : DisplayQuestion(text), Original: text));
                 notes[id] = new(text, null, null);
                 continue;
             }
@@ -612,7 +664,7 @@ internal sealed partial class ResearchWindow
                 if (source.Source == null || !source.Source.DispatchVerified)
                     throw new InvalidDataException("没有可核对的本次发送收据。");
                 if (Text(action, "sourceID") != null) ShowSourceExcerpt(source.Source);
-                else if (source.Source.Pages.Count > 0) await OpenDocumentSourceAsync(source.Source);
+                else if (source.Source.Pages.Count > 0) await OpenVerifiedDocumentSourceAsync(source.Source);
                 else if (CleanSourceUrl(source.Source.Url) is string address) OpenExternal(address);
                 else if (ZoteroLink(source.Source.AppSourceLink) is string zotero)
                     selectionProvider.OpenZoteroSource(zotero, source.Source.ZoteroPairingId);

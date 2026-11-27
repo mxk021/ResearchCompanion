@@ -20,7 +20,7 @@ internal readonly record struct PdfRegion(double X, double Y, double Width, doub
 
 internal sealed record DocumentExcerpt(
     string FilePath, string Title, int Page, string Text, IReadOnlyList<PdfRegion> Regions, string Fingerprint,
-    PdfRegion? VisualRegion = null, string? Recognition = null);
+    PdfRegion? VisualRegion = null, string? Recognition = null, string? ObjectLabel = null);
 
 internal sealed record PdfOcrLine(string Text, PdfRegion Region);
 internal sealed record PdfOcrProgress(int Page, int PageCount);
@@ -28,7 +28,7 @@ internal sealed record PdfOcrResult(int MissingPages, int RecognizedPages);
 
 internal sealed record PagePreview(int Page, int Width, int Height, int Stride, byte[] Pixels);
 
-internal sealed class PdfEvidence
+internal sealed partial class PdfEvidence
 {
     private const int MaxFileBytes = 120 * 1024 * 1024;
     private const int MaxTextFileBytes = 4 * 1024 * 1024;
@@ -61,6 +61,8 @@ internal sealed class PdfEvidence
     private static readonly Regex RightColumn = Pattern(@"右\s*(?:侧|边)?\s*栏|\bright(?:[- ]hand)?\s+column\b");
     private static readonly Regex Terms = Pattern(@"[\p{IsCJKUnifiedIdeographs}]+|[\p{L}\p{N}]{2,}");
     private static readonly Regex Summary = Pattern(@"总结|概述|摘要|主要内容|讲了什么|\bsummari[sz](?:e|ation)\b|\bsummary\b");
+    private static readonly Regex FooterPageNumber = Pattern(
+        @"^\s*(?:\d{1,4}|(?:physical\s+)?page\s+\d{1,4}|第\s*\d{1,4}\s*页)\s*$");
     private static readonly HashSet<string> StopWords = new(StringComparer.OrdinalIgnoreCase)
     {
         "the", "and", "for", "what", "about", "how", "why", "this", "does", "with", "of", "is", "to",
@@ -347,7 +349,7 @@ internal sealed class PdfEvidence
                 }
                 var excerpt = VerifiedExcerpt(page, equationBody?.Start ?? line.Start, line.End, mayUseIsolatedLine: true);
                 if (equationBody != null) excerpt = excerpt with { Text = equationBody.Content.Text.TrimEnd() + " " + text };
-                matches.Add(excerpt with { VisualRegion = region });
+                matches.Add(excerpt with { VisualRegion = region, ObjectLabel = ObjectLabel(target.Type, target.Id) });
             }
         }
         return matches.Count switch
@@ -403,11 +405,15 @@ internal sealed class PdfEvidence
     }
 
     private IReadOnlyList<DocumentExcerpt> ExactPassage(PageText[] indexed, Match anchors, int column)
+        => ExactPassage(indexed, anchors.Groups["start"].Value, anchors.Groups["end"].Value, column);
+
+    private IReadOnlyList<DocumentExcerpt> ExactPassage(PageText[] indexed, string firstAnchor, string lastAnchor, int column,
+        bool excludeStart = false, bool excludeEnd = false, int? segmentLimit = null)
     {
-        var startText = FoldWhitespace(anchors.Groups["start"].Value).Value;
-        var endText = FoldWhitespace(anchors.Groups["end"].Value).Value;
-        if (startText.Length == 0 || endText.Length == 0 || startText.Length > 1000 || endText.Length > 1000)
-            throw new InvalidDataException("起止原句均须有文字且不超过 1000 字。");
+        var startText = FoldWhitespace(firstAnchor).Value;
+        var endText = FoldWhitespace(lastAnchor).Value;
+        if (startText.Length == 0 || endText.Length == 0 || startText.Length > 1024 || endText.Length > 1024)
+            throw new InvalidDataException("起止原句均须有文字且不超过 1024 字。");
 
         var source = column == 0 ? indexed : indexed.Select(page => page.ForColumn(column)).ToArray();
         var starts = new List<(int PageIndex, int Offset, int End)>();
@@ -427,18 +433,22 @@ internal sealed class PdfEvidence
         var end = ends[0];
         if (end.PageIndex < start.PageIndex ||
             (end.PageIndex == start.PageIndex && end.Offset < start.End) ||
-            end.PageIndex - start.PageIndex >= MaxPageRange)
+            (segmentLimit == null && end.PageIndex - start.PageIndex >= MaxPageRange))
             throw new InvalidDataException("起止原句位置先后有冲突，或跨页范围过长。");
 
         var excerpts = new List<DocumentExcerpt>();
         for (var i = start.PageIndex; i <= end.PageIndex; i++)
         {
             var page = source[i];
-            var lo = i == start.PageIndex ? start.Offset : 0;
-            var hi = i == end.PageIndex ? end.End : page.Text.Length;
-            excerpts.Add(VerifiedExcerpt(page, lo, hi));
+            var lo = i == start.PageIndex ? (excludeStart ? start.End : start.Offset) : 0;
+            var hi = i == end.PageIndex ? (excludeEnd ? end.Offset : end.End) : page.Text.Length;
+            if (hi >= lo && page.Text.AsSpan(lo, hi - lo).Trim().IsEmpty &&
+                (i == start.PageIndex && excludeStart || i == end.PageIndex && excludeEnd)) continue;
+            if (segmentLimit is int limit) excerpts.AddRange(SplitVerified(page, lo, hi, limit));
+            else excerpts.Add(VerifiedExcerpt(page, lo, hi));
         }
-        RequireBounded(excerpts);
+        if (excerpts.Count == 0) throw new InvalidDataException("排除端点后没有可核验的连续原文。");
+        if (segmentLimit == null) RequireBounded(excerpts);
         return excerpts;
     }
 
@@ -752,6 +762,16 @@ internal sealed class PdfEvidence
 
     private static PageText OrderPage(int number, LineContent[] lines, bool separatedRuns)
     {
+        // PDF streams can paint a narrow page number before the body. Recognize
+        // it only in the bottom margin and below all mapped running text.
+        var footer = lines.Where(line => !line.Fault && line.Region is { Y: >= 0.92, Width: <= 0.25 } &&
+            FooterPageNumber.IsMatch(line.Text)).ToArray();
+        if (footer.Length == 1)
+        {
+            var body = lines.Where(line => !ReferenceEquals(line, footer[0])).ToArray();
+            if (body.All(line => line.Region == null || line.Region.Value.Bottom <= footer[0].Region!.Value.Y))
+                lines = body.Append(footer[0]).ToArray();
+        }
         var withRegion = lines.Where(line => line.Region.HasValue && !string.IsNullOrWhiteSpace(line.Text)).ToArray();
         var divided = FindColumnSplit(withRegion);
         if (divided is null)

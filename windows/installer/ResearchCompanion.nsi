@@ -10,10 +10,10 @@ SetOverwrite on
 ShowInstDetails show
 ShowUninstDetails show
 
-VIProductVersion "${VERSION}"
+VIProductVersion "${FILE_VERSION}"
 VIAddVersionKey /LANG=1033 "ProductName" "Research Companion"
 VIAddVersionKey /LANG=1033 "FileDescription" "Research Companion Windows x64 Candidate"
-VIAddVersionKey /LANG=1033 "FileVersion" "${VERSION}"
+VIAddVersionKey /LANG=1033 "FileVersion" "${FILE_VERSION}"
 VIAddVersionKey /LANG=1033 "ProductVersion" "${VERSION}"
 VIAddVersionKey /LANG=1033 "LegalCopyright" "Research Companion contributors"
 

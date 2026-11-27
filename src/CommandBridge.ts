@@ -8,6 +8,7 @@ import { decodeInlineMaterial, type ResearchContext } from './ResearchContext.js
 import { decodePlanningDocument, type PlanningDocument } from './ResearchDocumentPlan.js'
 import type { RetirementRequest } from './ResearchRetirement.js'
 import type { ResearchHistoryRequest } from './ResearchSessionIndex.js'
+import { decodeResearchPDFBatch, type ResearchPDFBatch } from './ResearchHistory.js'
 
 type PromptImageMediaType = Extract<PromptContentPart, { type: 'image' }>['mediaType']
 
@@ -90,7 +91,7 @@ export interface CommandHandlers {
   researchDocumentPlan?: (request: OpenSessionCommand & { text: string; document: PlanningDocument; selection: ResearchSelection; signal: AbortSignal }) => Promise<unknown>
   researchRetirement?: (request: RetirementRequest) => Promise<unknown>
   researchHistory?: (request: ResearchHistoryRequest) => Promise<unknown>
-  researchPrompt?: (request: OpenSessionCommand & { requestId: string; text: string; mode: string; contextKey?: string; includeContext: boolean; expectedSelection?: ResearchSelection; material?: ResearchContext; documentImages: readonly PromptImage[] }) => Promise<unknown>
+  researchPrompt?: (request: OpenSessionCommand & { requestId: string; text: string; mode: string; guidance?: string; pdfBatch?: ResearchPDFBatch; contextKey?: string; includeContext: boolean; expectedSelection?: ResearchSelection; material?: ResearchContext; documentImages: readonly PromptImage[]; userImages: readonly PromptImage[] }) => Promise<unknown>
   capabilities?: () => readonly string[]
   fileCandidates?: (request: OpenSessionCommand & { query: string }) => Promise<{ candidates: readonly { path: string; kind: 'file' | 'directory' }[] }>
   skillCandidates?: (request: OpenSessionCommand) => Promise<{ skills: readonly { name: string; description: string; conflict: boolean }[] }>
@@ -117,8 +118,11 @@ interface CommandRequest {
   requestId?: unknown
   text?: unknown
   images?: unknown
+  userImages?: unknown
   query?: unknown
   mode?: unknown
+  guidance?: unknown
+  pdfBatch?: unknown
   contextKey?: unknown
   includeContext?: unknown
   material?: unknown
@@ -394,26 +398,37 @@ export class CommandBridge {
       if (action === 'researchPrompt' && this.handlers.researchPrompt) {
         if (request.includeContext !== undefined && typeof request.includeContext !== 'boolean') throw new CommandError('invalid-request', 'includeContext must be boolean')
         const contextKey = optionalStringField(request.contextKey, 'contextKey')
+        const guidance = optionalStringField(request.guidance, 'guidance')?.trim()
+        if (guidance && (guidance.length > 6000 || guidance.includes('\0'))) {
+          throw new CommandError('invalid-request', 'guidance exceeds limit or contains invalid characters')
+        }
+        const pdfBatch = decodeResearchPDFBatch(request.pdfBatch)
+        if (request.pdfBatch !== undefined && !pdfBatch) throw new CommandError('invalid-request', 'Invalid PDF batch')
         let material: ResearchContext | undefined
         if (request.material !== undefined) {
           if (contextKey || request.includeContext !== true) throw new CommandError('invalid-request', '材料不能与其他来源同时提交，且需明确开启带入。')
           try { material = decodeInlineMaterial(request.material) }
           catch (error) { throw new CommandError('invalid-request', error instanceof Error ? error.message : '材料无效。') }
         }
-        if (Array.isArray(request.images) && request.images.length > 4) {
+        const crops = imageArray(request.images, 'images')
+        const attached = imageArray(request.userImages, 'userImages')
+        if (crops.length > 4) {
           throw new CommandError('invalid-request', '原页裁图最多四处。')
         }
-        const documentImages = imageFields(request.images, this.handlers.imageAttachmentLimits)
+        const images = imageFields([...crops, ...attached], this.handlers.imageAttachmentLimits)
         const expectedSelection = selectionField(request.selection)
-        if (documentImages.length && (!material || !expectedSelection)) {
-          throw new CommandError('invalid-request', '原页裁图必须绑定确切模型和本轮原文。')
+        if (pdfBatch && (!material || !expectedSelection)) {
+          throw new CommandError('invalid-request', 'PDF tasks must bind an exact model and this segment’s material')
+        }
+        if (images.length && (!material || !expectedSelection)) {
+          throw new CommandError('invalid-request', '联合问答的图片必须绑定确切模型和本轮原文。')
         }
         this.respond(client.socket, id, await this.handlers.researchPrompt({
           workspaceId: stringField(request.workspaceId, 'workspaceId'), sessionId: stringField(request.sessionId, 'sessionId'),
           requestId: stringField(request.requestId, 'requestId'), text: optionalStringField(request.text, 'text') ?? '',
-          mode: optionalStringField(request.mode, 'mode') ?? 'ask', contextKey,
+          mode: optionalStringField(request.mode, 'mode') ?? 'ask', guidance, pdfBatch, contextKey,
           includeContext: request.includeContext !== false, ...(material ? { material } : {}),
-          expectedSelection, documentImages,
+          expectedSelection, documentImages: images.slice(0, crops.length), userImages: images.slice(crops.length),
         })); return
       }
       if (action === 'workspaces') {
@@ -540,15 +555,20 @@ function selectionField(value: unknown): ResearchSelection | undefined {
   return selection
 }
 
-function imageFields(value: unknown, limits: ImageAttachmentLimits): readonly PromptImage[] {
+function imageArray(value: unknown, field: string): readonly unknown[] {
   if (value === undefined) return []
-  if (!Array.isArray(value)) throw new CommandError('invalid-request', 'images must be an array')
-  if (value.length > limits.maxImagesPerMessage) {
+  if (!Array.isArray(value)) throw new CommandError('invalid-request', `${field} must be an array`)
+  return value
+}
+
+function imageFields(value: unknown, limits: ImageAttachmentLimits): readonly PromptImage[] {
+  const images = imageArray(value, 'images')
+  if (images.length > limits.maxImagesPerMessage) {
     throw new CommandError('session/attachment-invalid', 'Image batch exceeds the configured image-count limit.')
   }
 
   let aggregateBytes = 0
-  return value.map((candidate, index) => {
+  return images.map((candidate, index) => {
     if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) {
       throw new CommandError('invalid-request', `images[${index}] must be an object`)
     }

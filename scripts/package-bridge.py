@@ -18,7 +18,8 @@ options = parser.parse_args()
 target = options.output.resolve()
 target.parent.mkdir(parents=True, exist_ok=True)
 files = {name: root / name for name in ('package.json', 'cordis.patch.yml', 'LICENSE')}
-files['README.md'] = root / ('docs/SETUP.md' if options.public else 'README.md')
+public_guide = 'windows/README.md' if options.windows else 'docs/SETUP.md'
+files['README.md'] = root / (public_guide if options.public else 'README.md')
 for name in ('index', 'client', 'ResearchContext', 'ResearchSessionIndex'):
     files[f'lib/{name}.js'] = root / 'lib' / f'{name}.js'
 if options.windows:

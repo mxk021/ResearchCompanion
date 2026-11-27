@@ -102,7 +102,7 @@ test('plugin adapter calls official-style workspace and session services', async
       listProviders: () => [{ id: 'deepseek-account' }],
       listConfigurableProviders: () => [],
       listModels: async () => [{ id: 'deepseek-flash' }],
-      resolveModelInfo: async () => ({}),
+      resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }),
       resolveCallConfig: async selection => selection,
     },
     sessionFileReferences: { list: async (actualAgent, query) => {

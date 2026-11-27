@@ -175,8 +175,9 @@ def verify_payload(payload):
 
 
 def package(args):
-    if VERSION is None or not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", VERSION):
-        raise ValueError("Expected a four-part Windows application version in the project file.")
+    if VERSION is None or not re.fullmatch(r"\d+\.\d+\.\d+(?:\.\d+)?", VERSION):
+        raise ValueError("Expected a Windows application version in the project file.")
+    file_version = VERSION if VERSION.count(".") == 3 else f"{VERSION}.0"
     brand = args.brand_dir.resolve()
     build_brand(brand)
     if args.brand_only:
@@ -219,6 +220,7 @@ def package(args):
         run(
             args.makensis, "-V2", "-WX", "-INPUTCHARSET", "UTF8",
             f"-DVERSION={VERSION}",
+            f"-DFILE_VERSION={file_version}",
             f"-DPAYLOAD_RECEIPT={payload / 'InstallReceipt.txt'}",
             f"-DPAYLOAD_FILES={payload / '*'}", f"-DOUTPUT={installer}",
             f"-DICON={brand / 'ResearchCompanion.ico'}", f"-DLICENSE={ROOT / 'LICENSE'}",

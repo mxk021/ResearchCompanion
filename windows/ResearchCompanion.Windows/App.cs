@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Reflection;
 using System.Threading;
 using System.Windows;
 using Microsoft.Win32;
@@ -8,7 +9,7 @@ namespace ResearchCompanion.Windows;
 
 internal static class App
 {
-    internal static string Version => typeof(App).Assembly.GetName().Version!.ToString();
+    internal static string Version => typeof(App).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion;
 
     internal static readonly string Profile = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ResearchCompanion");

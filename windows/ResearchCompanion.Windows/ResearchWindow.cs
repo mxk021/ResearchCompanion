@@ -230,6 +230,7 @@ internal sealed partial class ResearchWindow : Window
         var footer = new DockPanel { Margin = new Thickness(3, 4, 0, 0), LastChildFill = true };
         var right = new StackPanel { Orientation = Orientation.Horizontal };
         DockPanel.SetDock(right, Dock.Right);
+        ConfigureImageInput(entry, right);
         right.Children.Add(Tool(cancel, () => { waiting?.Cancel(); return Task.CompletedTask; }));
         right.Children.Add(Tool(send, SendAsync));
         footer.Children.Add(right);
@@ -497,7 +498,8 @@ internal sealed partial class ResearchWindow : Window
     {
         materialName.Text = document == null
             ? attachedFileNeedsReview ? "已关联文件无法核对，请重新选择或移除" : "当前无附带文件"
-            : document.Title + (document.IsPdf ? " · " + document.PageCount + " 页" : " · 文本");
+            : document.Title + (document.IsPdf ? " · " + document.PageCount + " 页" : " · 文本") +
+                (zoteroDocument != null ? " · Zotero 已关联" : "");
         recognize.Visibility = previewDocument.Visibility = document?.IsPdf == true ? Visibility.Visible : Visibility.Collapsed;
         removeFile.Visibility = document != null || attachedFileNeedsReview ? Visibility.Visible : Visibility.Collapsed;
         removeSelection.Visibility = selection != null ? Visibility.Visible : Visibility.Collapsed;
@@ -528,6 +530,7 @@ internal sealed partial class ResearchWindow : Window
         try
         {
             document = await PdfEvidence.OpenAsync(path, lifetime.Token, WindowsPdfOcr.RecognizeAsync);
+            zoteroDocument = null;
             attachedFileNeedsReview = false;
             documentOcrRequested = false;
             include.IsChecked = true;
@@ -621,7 +624,11 @@ internal sealed partial class ResearchWindow : Window
                 }
                 else ShowPasteFallback(e.Message);
             }
-            if (selection != null) status.Text = selection.ProvenanceVerified ? "已读取选区" : "已读取选区 · 出处待核对";
+            if (selection != null)
+            {
+                status.Text = selection.ProvenanceVerified ? "已读取选区" : "已读取选区 · 出处待核对";
+                if (selection.Application == "Zotero") await AssociateZoteroDocumentAsync(selection.ZoteroPdf);
+            }
             UpdateMaterial();
             await RenderAsync();
         }

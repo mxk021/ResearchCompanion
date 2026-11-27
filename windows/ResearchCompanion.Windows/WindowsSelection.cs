@@ -23,7 +23,7 @@ namespace ResearchCompanion.Windows;
 
 public sealed record WindowsSelectionResult(
     string Text, string Application, string? Title, string? Url,
-    bool ProvenanceVerified, bool ClipboardWasReplaced, string? ZoteroPairingId = null);
+    bool ProvenanceVerified, bool ClipboardWasReplaced, string? ZoteroPairingId = null, WindowsZoteroPdf? ZoteroPdf = null);
 
 internal sealed class WindowsSelectionCaptureException(string message, bool canTryNativeCopy = false)
     : InvalidOperationException(message)
@@ -427,6 +427,7 @@ public sealed class WindowsSelection : IDisposable
         using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(pairing.Endpoint, "?selection=live&requestId=" + requestId.ToString("D")));
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", proof + "." + signature);
         request.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true, NoStore = true };
+        request.Headers.Add("X-Research-Companion-Local-PDF", "1");
         try
         {
             using var response = await ZoteroClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
@@ -472,8 +473,10 @@ public sealed class WindowsSelection : IDisposable
                 return null;
             var title = GetString(selection, "title");
             if (title is null || title.Length > 512) title = attempt.Source.Title;
-            return new WindowsSelectionResult(text, "Zotero", title,
-                ZoteroLocation(selection, key, GetString(capture, "method")), true, false, pairing.Identity);
+            var method = GetString(capture, "method");
+            var address = ZoteroLocation(selection, key, method);
+            var pdf = address != null && method != "document-dom" ? ReadZoteroPdf(selection, key, attachmentId) : null;
+            return new WindowsSelectionResult(text, "Zotero", title, address, true, false, pairing.Identity, pdf);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { return null; }
         catch (HttpRequestException) { return null; }
@@ -628,6 +631,23 @@ public sealed class WindowsSelection : IDisposable
         stream.ReadExactly(bytes);
         if (stream.ReadByte() != -1) throw new IOException("Profile record changed.");
         return bytes;
+    }
+
+    private static WindowsZoteroPdf? ReadZoteroPdf(JsonElement selection, string key, long attachmentId)
+    {
+        if (!selection.TryGetProperty("pdfFile", out var file) || file.ValueKind != JsonValueKind.Object ||
+            GetString(file, "attachmentKey") != key ||
+            GetString(file, "library") is not { } library || GetString(selection.GetProperty("location"), "library") != library ||
+            !file.TryGetProperty("attachmentID", out var id) || id.ValueKind != JsonValueKind.Number ||
+            !id.TryGetInt64(out var reported) || reported != attachmentId ||
+            WindowsZoteroPdf.LocalPath(GetString(file, "path")) is not { } path ||
+            !file.TryGetProperty("bytes", out var size) || size.ValueKind != JsonValueKind.Number ||
+            !size.TryGetInt64(out var bytes) || bytes <= 0 ||
+            !file.TryGetProperty("modifiedMs", out var timestamp) || timestamp.ValueKind != JsonValueKind.Number ||
+            !timestamp.TryGetInt64(out var modifiedMs))
+            return null;
+
+        return new WindowsZoteroPdf(library, key, attachmentId, path, bytes, modifiedMs);
     }
 
     private static string? ZoteroLocation(JsonElement selection, string key, string? method)

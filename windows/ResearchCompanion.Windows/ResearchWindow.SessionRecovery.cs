@@ -13,6 +13,7 @@ internal sealed partial class ResearchWindow
 {
     private bool documentOcrRequested;
     private bool attachedFileNeedsReview;
+    private SavedZoteroAttachment? zoteroDocument;
 
     private SessionRecovery? RecoveryFor(string? id) =>
         connection?.RecoveryHost is string host && workspace is string workspaceId
@@ -66,6 +67,7 @@ internal sealed partial class ResearchWindow
     private void ClearDocument()
     {
         document = null;
+        zoteroDocument = null;
         attachedFileNeedsReview = false;
         documentOcrRequested = false;
     }
@@ -75,7 +77,7 @@ internal sealed partial class ResearchWindow
         if (document is not { } file) return;
         RecoveryFor(session)?.Update(state => state with
         {
-            File = new(file.FilePath, file.Fingerprint, documentOcrRequested, include.IsChecked == true)
+            File = new(file.FilePath, file.Fingerprint, documentOcrRequested, include.IsChecked == true, zoteroDocument)
         });
     }
 
@@ -90,6 +92,7 @@ internal sealed partial class ResearchWindow
     private async Task RestoreSessionFileAsync()
     {
         if (RecoveryFor(session)?.Read().File is not { } saved || document != null) return;
+        zoteroDocument = saved.Zotero;
         try
         {
             status.Text = "正在核对会话已关联的文件…";
@@ -108,5 +111,48 @@ internal sealed partial class ResearchWindow
             status.Text = "无法核对已关联文件。请重新选择或移除此材料。";
         }
         UpdateMaterial();
+    }
+
+    private async Task AssociateZoteroDocumentAsync(WindowsZoteroPdf? locator)
+    {
+        if (locator == null || selection?.ZoteroPairingId is not { } pairing)
+        {
+            if (zoteroDocument != null) await RemoveSessionFileAsync();
+            status.Text = "已读取 Zotero 选区。未自动关联本机 PDF。";
+            return;
+        }
+
+        var association = new SavedZoteroAttachment(locator.Library, locator.AttachmentKey, locator.AttachmentId, pairing);
+        bool sameFile = document?.IsPdf == true &&
+            string.Equals(document.FilePath, locator.FilePath, StringComparison.OrdinalIgnoreCase);
+        bool recognizeScans = sameFile && documentOcrRequested;
+        try
+        {
+            status.Text = "正在核对 Zotero 的本机 PDF…";
+            bool reuse = sameFile && locator.MatchesFile();
+            if (reuse)
+            {
+                try { await document!.ValidateCurrentAsync(lifetime.Token); }
+                catch (InvalidDataException) { reuse = false; }
+            }
+            if (!reuse)
+            {
+                var indexed = await locator.OpenAsync(lifetime.Token, WindowsPdfOcr.RecognizeAsync);
+                if (recognizeScans) await indexed.RecognizeMissingPagesAsync(cancellationToken: lifetime.Token);
+                document = indexed;
+            }
+            documentOcrRequested = recognizeScans;
+            attachedFileNeedsReview = false;
+            zoteroDocument = association;
+            include.IsChecked = true;
+            SaveSessionFile();
+            status.Text = "已读取 Zotero 选区并关联同一 PDF。";
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException
+            or NotSupportedException or COMException or InvalidOperationException)
+        {
+            if (zoteroDocument != null) await RemoveSessionFileAsync();
+            status.Text = "已读取 Zotero 选区。无法核对该附件，请检查本机 PDF。";
+        }
     }
 }

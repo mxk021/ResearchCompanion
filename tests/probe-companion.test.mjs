@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
 import { chmod, mkdtemp, rm } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -8,8 +9,9 @@ import { BridgeClient, parseArgs, probe, verifyPrivateSocket, waitForAssistant }
 
 async function withSocket(responder, action) {
   const root = await mkdtemp(join(tmpdir(), 'companion-probe-'))
-  await chmod(root, 0o700)
-  const path = join(root, 'command.sock')
+  const isWindows = process.platform === 'win32'
+  if (!isWindows) await chmod(root, 0o700)
+  const path = isWindows ? '\\\\.\\pipe\\ResearchCompanion-probe-' + randomUUID() : join(root, 'command.sock')
   const sockets = new Set()
   const server = createServer(socket => {
     sockets.add(socket)
@@ -30,7 +32,7 @@ async function withSocket(responder, action) {
   let client
   try {
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(path, resolve) })
-    await chmod(path, 0o600)
+    if (!isWindows) await chmod(path, 0o600)
     client = new BridgeClient(path)
     await action(client, path, root)
   } finally {
@@ -69,7 +71,8 @@ test('default probe sends only read-only actions and reports no fabricated gener
   })
 })
 
-test('owner-only socket probe rejects a group-readable socket before any RPC', async () => {
+test('owner-only socket probe rejects a group-readable socket before any RPC',
+  { skip: process.platform === 'win32' }, async () => {
   await withSocket(() => assert.fail('No RPC should be sent'), async (_client, path) => {
     await verifyPrivateSocket(path)
     await chmod(path, 0o660)

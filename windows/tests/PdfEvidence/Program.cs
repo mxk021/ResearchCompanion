@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using ResearchCompanion.Windows;
 
 if (args.Length != 1 || !File.Exists(args[0]))
@@ -78,6 +79,99 @@ try
     await Reject(() => document.RetrieveAsync("读取第 1、3 页"), "多个页段", "compact disjoint scope");
     Verify((await document.RetrieveAsync("读取首页"))[0].Page == 1, "first page alias");
     Verify((await document.RetrieveAsync("查找 Frozen source"))[0].Text.Contains("Frozen source"), "lexical excerpts");
+    var partialTurn = await document.RetrieveTurnAsync("总结全文的研究发现");
+    Verify(partialTurn.Segments.Count == 1 && partialTurn.MissingPages.SequenceEqual([4]) &&
+        partialTurn.Segments[0].Select(excerpt => excerpt.Page).SequenceEqual([1, 2, 3]) &&
+        partialTurn.Coverage.Contains("部分证据") && partialTurn.Guidance?.Contains("第 4 页") == true,
+        "ordinary synthesis submits verified material only and labels missing pages");
+    await Reject(() => document.RetrieveTurnAsync("逐字翻译第 1–4 页"), "没有可核验",
+        "exact translation refuses a gap in the requested pages");
+    await Reject(() => document.RetrieveTurnAsync("说明第 4 页"), "没有可核对",
+        "partial analysis refuses a scope with no verified prose");
+    var direct = await figures.RetrieveTurnAsync("说明公式（3）");
+    var captionOnly = await figures.RetrieveTurnAsync("只翻译 Figure 1 的图注");
+    Verify(captionOnly.Segments[0].Single().VisualRegion == null && captionOnly.Segments[0].Single().Regions.Count == 1,
+        "explicit caption-only reading excludes the original graphic but retains the jump");
+    var followUp = await figures.RetrieveTurnAsync("这个公式有什么作用？", priorEvidence: direct.Segments[0]);
+    Verify(followUp.Segments[0].Single().ObjectLabel == "Equation (3)" &&
+        followUp.Segments[0].Single().VisualRegion == direct.Segments[0].Single().VisualRegion,
+        "same attached file re-resolves a prior object with original crop");
+    try
+    {
+        await document.RetrieveTurnAsync("这个公式有什么作用？", priorEvidence: direct.Segments[0]);
+        throw new InvalidOperationException("FAIL follow-up borrowed another fingerprint");
+    }
+    catch (DocumentPlanningNeededException)
+    {
+        Console.WriteLine("PASS object follow-up does not borrow another fingerprint");
+    }
+
+    var imageClause = await document.RetrieveTurnAsync(
+        "Translate the attached image. Summarize the PDF.", includingUserImages: true);
+    Verify(!imageClause.IsTranslation && imageClause.MissingPages.SequenceEqual([4]),
+        "image-only command does not downgrade partial PDF evidence");
+    var selectedOnly = await document.RetrieveTurnAsync("只用本次选区", selection: "Golden lens.");
+    Verify(selectedOnly.SelectionOnly && selectedOnly.Segments.Count == 0,
+        "explicit selection-only turn does not read document text");
+
+    var planning = await document.PlanningDocumentAsync("Golden lens.", ["Frozen source"], null, CancellationToken.None);
+    Verify((string?)planning["id"] == document.Fingerprint && (int?)planning["pages"] == 4 &&
+        !planning.ContainsKey("path"), "planner receives verified identity and no local file path");
+    using var searchPlan = JsonDocument.Parse("""{"action":"search","query":"Frozen source","needsMore":true}""");
+    var feedback = await document.ApplyPlanningResultAsync(searchPlan.RootElement,
+        "Translate the reading", "Golden lens. Copper rotation.");
+    Verify(feedback.RequiresMoreEvidence && feedback.PlanningFeedback.StartsWith("【已读取的证据】"),
+        "planner search is feedback and not a final exact translation");
+    using var useEvidencePlan = JsonDocument.Parse("""{"action":"useEvidence"}""");
+    await Reject(() => document.ApplyPlanningResultAsync(useEvidencePlan.RootElement, "Translate the reading", prior: feedback),
+        "没有足够", "unverified translation scope cannot be promoted to final evidence");
+    using var rangePlan = JsonDocument.Parse("""
+        {"action":"range","start":"Golden lens.","end":"Copper rotation.","pageStart":1,"pageEnd":2,"excludeStart":true,"excludeEnd":true}
+        """);
+    var plannedRange = await document.ApplyPlanningResultAsync(rangePlan.RootElement,
+        "Translate the reading", "Golden lens. Copper rotation.", feedback);
+    Verify(!plannedRange.RequiresMoreEvidence && plannedRange.IsTranslation &&
+        plannedRange.Segments[0].Select(excerpt => excerpt.Text).SequenceEqual(["Middle evidence one.", "Middle evidence two.\nEnd at"]),
+        "grounded planner endpoints and exact exclusion re-read original pages");
+    await Reject(() => document.ApplyPlanningResultAsync(rangePlan.RootElement, "Translate the reading"),
+        "逐字核验", "plan cannot invent an endpoint without grounding");
+    using var unrelatedPagesPlan = JsonDocument.Parse("""{"action":"pages","pageStart":3,"pageEnd":4}""");
+    var preservedScope = await document.ApplyPlanningResultAsync(unrelatedPagesPlan.RootElement, "逐字翻译第 1–2 页");
+    Verify(preservedScope.Segments[0].Select(excerpt => excerpt.Page).SequenceEqual([1, 2]),
+        "planner may not broaden a user's explicit native page scope");
+
+    var sectionsPath = Fixture("verified-sections.pdf");
+    MakePdf(sectionsPath, [Sheet((60, 730, "1 Introduction"), (60, 705, "Excluded opening."),
+        (60, 675, "2 Results"), (60, 650, "Included first result.")),
+        Sheet((60, 730, "2.1 Detailed results"), (60, 705, "Included detailed result."),
+            (60, 675, "3 Conclusion"), (60, 650, "Excluded conclusion."))]);
+    var sections = await PdfEvidence.OpenAsync(sectionsPath);
+    var section = await sections.RetrieveTurnAsync("翻译第 2 章");
+    Verify(section.Segments[0].Select(item => item.Page).SequenceEqual([1, 2]) &&
+        section.Segments[0].All(item => item.Text.Contains("Included") && !item.Text.Contains("Excluded")),
+        "numbered heading anchors preserve sections and nested headings");
+
+    var longPath = Fixture("long-evidence.pdf");
+    MakePdf(longPath, Enumerable.Range(1, 18).Select(number => Sheet((487, 34, $"Physical page {number}")) + Sheet(Enumerable.Range(1, 24)
+        .Select(row => (60, 755 - row * 27,
+            $"Page {number:D2} row {row:D2} orchard results for the researched study keep the original data unchanged."))
+        .ToArray())).ToArray());
+    var longFile = await PdfEvidence.OpenAsync(longPath);
+    var overview = await longFile.RetrieveTurnAsync("概括整篇论文的结果");
+    Verify(overview.Segments.Count == 1 && overview.Coverage.Contains("未覆盖完整正文") &&
+        overview.Segments[0].Any(item => item.Page == 1) && overview.Segments[0].Any(item => item.Page == 18),
+        "ordinary long-paper overview favors a single representative turn");
+    var longAnalysis = await longFile.RetrieveTurnAsync("完整读取第 1–4 页原文，不得遗漏，并总结所有证据的主要结果。");
+    Verify(longAnalysis.Segments.Count == 2 && longAnalysis.Segments.All(segment =>
+        segment.Sum(item => item.Text.Length + 100) <= 7_200) &&
+        longAnalysis.Segments.SelectMany(segment => segment).Last().Text.EndsWith("Physical page 4"),
+        "long exact analysis splits in two and places PDF page furniture in printed order");
+    var longTranslation = await longFile.RetrieveTurnAsync("Translate the whole PDF.");
+    Verify(longTranslation.Segments.Count > 1 && longTranslation.Segments.All(segment =>
+        segment.Sum(item => item.Text.Length + 100) <= 10_000) &&
+        longTranslation.Segments.SelectMany(segment => segment).Select(item => item.Page)
+            .Distinct().SequenceEqual(Enumerable.Range(1, 18)),
+        "complete long translation has ordered bounded segments without truncation");
 
     var aligned = Fixture("columns.pdf");
     var columnContent = Sheet(

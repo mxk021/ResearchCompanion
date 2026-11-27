@@ -50,6 +50,10 @@ public sealed class BridgeClient : IAsyncDisposable
     internal string CurrentHost => RecoveryHost ?? "instance:" + endpoint.InstanceId;
     public JsonElement AttachmentLimits => Capabilities.TryGetProperty("attachmentLimits", out var limits) ? limits : default;
     public bool SupportsDocumentImages => Supports("researchDocumentImages");
+    internal bool SupportsUserImages => Supports("researchUserImages");
+    internal bool SupportsPdfBatch => Supports("researchPdfBatch") && Supports("researchPromptGuidance");
+    internal bool SupportsPromptGuidance => Supports("researchPromptGuidance");
+    internal bool SupportsDocumentPlanning => Supports("researchDocumentPlan");
 
     private bool Supports(string feature) =>
         Capabilities.TryGetProperty("supports", out var supports) && supports.ValueKind == JsonValueKind.Array &&
@@ -137,7 +141,12 @@ public sealed class BridgeClient : IAsyncDisposable
 
     public Task<JsonElement> RequestAsync(string action, object? fields = null, CancellationToken ct = default)
     {
-        int timeout = action == "researchDocumentPlan" ? 120_000 : 25_000;
+        int timeout = action switch
+        {
+            "researchDocumentPlan" => 120_000,
+            "researchPrompt" or "prompt" => 35_000,
+            _ => 25_000
+        };
         return InvokeAsync(action, fields, timeout, ct);
     }
 
