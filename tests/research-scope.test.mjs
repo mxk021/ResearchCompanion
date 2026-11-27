@@ -316,6 +316,25 @@ test('source cannot be transmitted before an explicit current-paper preview key'
   })
 })
 
+test('discussion sends a normal question without fresh evidence and never weakens strict transport', async () => {
+  await harness(async ({ client, calls }) => {
+    const fields = {workspaceId:'research-workspace', sessionId:'research-session',
+      requestId:'discussion-no-evidence', text:'What determines the initial reference point?',
+      includeContext:false, evidencePolicy:'discussion'}
+    const { supports } = await client.request('capabilities')
+    assert.ok(supports.includes('researchDiscussionEvidence'))
+    await assert.rejects(client.request('researchPrompt', {...fields,evidencePolicy:'invalid'}), /evidence policy/i)
+    await assert.rejects(client.request('researchPrompt', {...fields,mode:'translate'}), /require source evidence/i)
+    await assert.rejects(client.request('researchPrompt', {...fields,includeContext:true}), /先预览/)
+    assert.equal(calls.some(call => call[0] === 'prompt'), false)
+    assert.equal((await client.request('researchPrompt',fields)).accepted,true)
+    const text = calls.find(call => call[0] === 'prompt')[1].content[0].text
+    assert.match(text, /一般知识/)
+    assert.match(text, /【论文原文，JSON 引用数据】\nnull\n/)
+    assert.ok(text.endsWith('\n' + fields.text))
+  })
+})
+
 test('research directory enumerates account routes only, with exact model abilities and real failure', async () => {
   await harness(async ({ client, state, calls }) => {
     const { catalog } = await client.request('modelCatalog')

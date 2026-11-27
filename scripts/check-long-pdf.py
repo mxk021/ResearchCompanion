@@ -33,6 +33,8 @@ def serve(listener, path, selection_check):
     plan_steps = {}
     cold_question = "有什么要留意的？"
     local_questions = {cold_question, "HYPERION", "请总结这篇论文的主要贡献。", "它有哪些局限？"}
+    unavailable_questions = {"按前面的讨论，这篇论文在实验设计上还有什么局限？", "请解释第1页"}
+    unavailable_calls = set()
     local_calls = []
     long_range = "请把从 OPENING THISTLE 到 PAGE_52_END 的原文逐段翻译成中文。"
     exact_parts = None
@@ -45,7 +47,8 @@ def serve(listener, path, selection_check):
             if action == "capabilities":
                 result.update(protocolVersion=1, commandSocket=True,
                               supports=["conversation", "researchContext", "researchPrompt", "researchMaterial", "modelCatalog",
-                                        "researchSelectModel", "researchDocumentPlan", "researchPromptGuidance", "researchPdfBatch"],
+                                        "researchSelectModel", "researchDocumentPlan", "researchPromptGuidance", "researchPdfBatch",
+                                        "researchDiscussionEvidence"],
                               instance=dict(instanceId="pdf-check", commandSocketPath=str(path), statusSocketPath=str(path) + "-status"))
             elif action == "workspaces":
                 result["workspaces"] = [dict(id="pdf", title="PDF fixture", path=str(path.parent),
@@ -103,11 +106,26 @@ def serve(listener, path, selection_check):
                 session = request["sessionId"]
                 history = replies[session]
                 result["selection"] = request["selection"]
-                material = dict(request["material"])
+                material = dict(request["material"]) if "material" in request else None
+                question = request["text"]
+                assert request["includeContext"] == (material is not None) and request["sessionId"] in sessions
+                if question in unavailable_questions:
+                    assert question not in unavailable_calls
+                    unavailable_calls.add(question)
+                    assert material is None and request.get("evidencePolicy") == "discussion" and request["mode"] == "ask"
+                    assert "images" not in request or not request["images"]
+                    assert "guidance" not in request and "pdfBatch" not in request
+                    question_id = "u-" + request["requestId"]
+                    history.append(dict(id=question_id, role="user", text=question, plainQuestion=True))
+                    history.append(dict(id="a-" + request["requestId"], role="assistant", text="Synthetic context-only reply.",
+                                        reply=dict(question=question, questionId=question_id, requestId=request["requestId"])))
+                    result["accepted"] = True
+                    wire.write(json.dumps(result, ensure_ascii=False).encode() + b"\n")
+                    wire.flush()
+                    continue
+                assert material is not None
                 assert set(material) <= {"source", "title", "scope", "text", "page"}
                 assert len(material["text"].encode("utf-16-le")) // 2 <= 24_000
-                assert request["includeContext"] and request["sessionId"] in sessions
-                question = request["text"]
                 guidance = request.get("guidance")
                 assert guidance is None or (0 < len(guidance.encode("utf-16-le")) // 2 <= 6000 and guidance not in question)
                 assert "【本轮仅有部分证据】" not in question and not re.search(r"第 [0-9]+/", question)
@@ -123,7 +141,8 @@ def serve(listener, path, selection_check):
                     key = session, batch["id"]
                     assert batches.setdefault(key, question) == question, "Internal steps must preserve the original visible question"
                 if question in local_questions:
-                    assert stage is None and question not in local_calls, "Each local summary or follow-up must admit one request"
+                    assert stage is None and question not in local_calls and request.get("evidencePolicy") == "discussion", \
+                        "Each local summary or follow-up must admit one discussion request"
                     local_calls.append(question)
                 if question == long_range:
                     if exact_parts is None:
@@ -131,7 +150,7 @@ def serve(listener, path, selection_check):
                     assert stage == "translation" and count == len(exact_parts)
                     assert material["text"] == exact_parts[part - 1], "The exact range changed at the wire boundary"
                 if "已有的有效证据" in question:
-                    assert guidance and "本轮仅有部分证据" in guidance and "第 2 页" in guidance
+                    assert guidance and request.get("evidencePolicy") == "discussion" and "第 2 页" in guidance
                     assert "PAGE_1_START" in material["text"] and "PAGE_2_START" not in material["text"]
                 if "用户修正并核验" in material.get("scope", ""):
                     assert guidance and "ABSENT" not in guidance
@@ -227,6 +246,7 @@ def serve(listener, path, selection_check):
     if not selection_check:
         assert grid_requests == 1, "Only the current, confirmed candidate may reach the provider."
         assert set(local_calls) == local_questions, "Expected local-only summary, follow-up, vague and lexical turns"
+        assert unavailable_calls == unavailable_questions, "An unusable PDF must not block a discussion turn."
     else:
         assert recovered_ack, "The incomplete acknowledgement was not retried with the saved request id."
 

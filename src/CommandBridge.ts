@@ -91,7 +91,7 @@ export interface CommandHandlers {
   researchDocumentPlan?: (request: OpenSessionCommand & { text: string; document: PlanningDocument; selection: ResearchSelection; signal: AbortSignal }) => Promise<unknown>
   researchRetirement?: (request: RetirementRequest) => Promise<unknown>
   researchHistory?: (request: ResearchHistoryRequest) => Promise<unknown>
-  researchPrompt?: (request: OpenSessionCommand & { requestId: string; text: string; mode: string; guidance?: string; pdfBatch?: ResearchPDFBatch; contextKey?: string; includeContext: boolean; expectedSelection?: ResearchSelection; material?: ResearchContext; documentImages: readonly PromptImage[]; userImages: readonly PromptImage[] }) => Promise<unknown>
+  researchPrompt?: (request: OpenSessionCommand & { requestId: string; text: string; mode: string; guidance?: string; pdfBatch?: ResearchPDFBatch; evidencePolicy?: 'discussion'; contextKey?: string; includeContext: boolean; expectedSelection?: ResearchSelection; material?: ResearchContext; documentImages: readonly PromptImage[]; userImages: readonly PromptImage[] }) => Promise<unknown>
   capabilities?: () => readonly string[]
   fileCandidates?: (request: OpenSessionCommand & { query: string }) => Promise<{ candidates: readonly { path: string; kind: 'file' | 'directory' }[] }>
   skillCandidates?: (request: OpenSessionCommand) => Promise<{ skills: readonly { name: string; description: string; conflict: boolean }[] }>
@@ -122,6 +122,7 @@ interface CommandRequest {
   query?: unknown
   mode?: unknown
   guidance?: unknown
+  evidencePolicy?: unknown
   pdfBatch?: unknown
   contextKey?: unknown
   includeContext?: unknown
@@ -396,6 +397,14 @@ export class CommandBridge {
       }
       if (action === 'researchPrompt' && this.handlers.researchPrompt) {
         if (request.includeContext !== undefined && typeof request.includeContext !== 'boolean') throw new CommandError('invalid-request', 'includeContext must be boolean')
+        const mode = optionalStringField(request.mode, 'mode') ?? 'ask'
+        const evidencePolicy = request.evidencePolicy
+        if (evidencePolicy !== undefined && evidencePolicy !== 'discussion') {
+          throw new CommandError('invalid-request', 'Invalid research evidence policy')
+        }
+        if (evidencePolicy === 'discussion' && (mode === 'translate' || request.pdfBatch !== undefined)) {
+          throw new CommandError('invalid-request', 'Exact translation and PDF batch tasks require source evidence')
+        }
         const contextKey = optionalStringField(request.contextKey, 'contextKey')
         const guidance = optionalStringField(request.guidance, 'guidance')?.trim()
         if (guidance && (guidance.length > 6000 || guidance.includes('\0'))) {
@@ -425,7 +434,7 @@ export class CommandBridge {
         this.respond(client.socket, id, await this.handlers.researchPrompt({
           workspaceId: stringField(request.workspaceId, 'workspaceId'), sessionId: stringField(request.sessionId, 'sessionId'),
           requestId: stringField(request.requestId, 'requestId'), text: optionalStringField(request.text, 'text') ?? '',
-          mode: optionalStringField(request.mode, 'mode') ?? 'ask', guidance, pdfBatch, contextKey,
+          mode, guidance, pdfBatch, evidencePolicy, contextKey,
           includeContext: request.includeContext !== false, ...(material ? { material } : {}),
           expectedSelection, documentImages: images.slice(0, crops.length), userImages: images.slice(crops.length),
         })); return

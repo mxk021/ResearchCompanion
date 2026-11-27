@@ -22,10 +22,12 @@ struct ResearchPDFRequest: Sendable {
     let address: ResearchPDFAddress
     let objects: [ResearchPDFObjectID]
     let untypedObjects: [ResearchPDFObjectID]
+    let algorithmMentions: [String]
     let symbolRequirements: [Symbol]
     let requiresObjectRelationship: Bool
     let requiresProseDefinitions: Bool
     let requestsAdjacentDefinitions: Bool
+    let requiresExactEvidence: Bool
     let allowsPartialEvidence: Bool
     let output: Output
 
@@ -37,9 +39,13 @@ struct ResearchPDFRequest: Sendable {
         self.address = address
         let requested = Self.outsidePassage(question, address: address)
         let instruction = includingUserImages ? Self.documentInstruction(requested) : requested
+        let outputInstruction = instruction.replacingOccurrences(
+            of: #"(?i)(?:不(?:用|要|需要|必)|无需)\s*(?:逐字)?\s*(?:精确引用|准确引用|引用原文|翻译|摘录|照录)|\b(?:do not|don't|no need to)\s+(?:translate|quote|transcribe)\b"#,
+            with: "", options: .regularExpression)
         objects = address.addressesPassage ? [] : ResearchPDFObjectID.addresses(in: instruction)
         untypedObjects = address.addressesPassage || !objects.isEmpty
             ? [] : ResearchPDFObjectID.untypedEquationList(in: instruction)
+        algorithmMentions = address.addressesPassage ? [] : Self.algorithms(in: instruction)
         let definesSymbols = Self.matches(#"是什么|什么量|是指|含义|代表什么|表示什么|定义|起什么作用|作用在哪|怎么设定|如何设定|各自的作用|解释.{0,7}(?:变量|符号|参数)|\b(?:denote(?:s)?|represent(?:s)?|definition|defined|what does|what is|explain (?:the )?(?:variable|symbol|parameter))\b"#,
                                           instruction)
         symbolRequirements = definesSymbols ? Self.symbols(in: instruction) : []
@@ -54,15 +60,15 @@ struct ResearchPDFRequest: Sendable {
                          instruction)
 
         let action: Output.Action
-        if Self.matches(#"翻译|译[成为出]|翻[成为]|\btranslat(?:e|ion)\b"#, instruction) { action = .translate }
-        else if Self.matches(#"摘[录出]|抄[录出]|照录|提取|逐字|读出|\b(?:quote|transcribe|extract|verbatim|read)\b"#, instruction) { action = .quote }
+        if Self.matches(#"翻译|译[成为出]|翻[成为]|\b(?:translate|(?:provide|give|need|want|request) (?:a |the )?translation)\b"#, outputInstruction) { action = .translate }
+        else if Self.matches(#"摘录|抄[录出写]|照录|逐字|读出|(?:摘出|提取)\s*(?:论文)?(?:原文|正文|完整文本|文字)|\b(?:quote|transcribe|verbatim|read out|extract (?:the )?(?:original|text|exact wording))\b"#, outputInstruction) { action = .quote }
         else if Self.matches(#"比较|对比|对照|\bcompar(?:e|ison)\b"#, instruction) { action = .compare }
         else if Self.matches(#"解释|说明|\bexplain\b"#, instruction) { action = .explain }
         else { action = .answer }
         let unit: Output.Unit
-        if Self.matches(#"逐段|paragraph by paragraph"#, instruction) { unit = .paragraph }
-        else if Self.matches(#"逐句|sentence by sentence"#, instruction) { unit = .sentence }
-        else if Self.matches(#"逐字|word for word"#, instruction) { unit = .word }
+        if Self.matches(#"逐段|paragraph by paragraph"#, outputInstruction) { unit = .paragraph }
+        else if Self.matches(#"逐句|sentence by sentence"#, outputInstruction) { unit = .sentence }
+        else if Self.matches(#"逐字|word for word"#, outputInstruction) { unit = .word }
         else { unit = .passage }
         let caption = Self.matches(#"图注|\bcaption(?:s)?\b"#, instruction)
         let limitsCaption = Self.matches(#"(?:只|仅)(?:需|要)?[^。!?]{0,28}图注|\b(?:caption\s+only|(?:only|just)\s+(?:the\s+)?caption)\b|^\s*(?:图注|caption)[。.!]?\s*$"#,
@@ -76,10 +82,16 @@ struct ResearchPDFRequest: Sendable {
             captionOnly: !address.addressesPassage && caption &&
                 (limitsCaption || !asksForGraphic && (action == .quote || action == .translate)),
             preserveFormulae: Self.matches(#"(?:保留|包含|包括)[^。！？]{0,12}(?:公式|原式)|(?:公式|原式)[^。！？]{0,8}(?:保留|也要)|\b(?:include|preserve)\s+(?:the\s+)?(?:equations?|formulae|formulas)\b"#, instruction))
-        // Discussion can use independently mapped excerpts. Exact spans,
-        // specified objects and formula/definition tasks keep their stronger
-        // evidence requirements even when called "analysis".
-        allowsPartialEvidence = action != .translate && action != .quote && unit == .passage &&
+        let requestsVerbatimLocation: Bool
+        if case .quotation = address { requestsVerbatimLocation = true }
+        else { requestsVerbatimLocation = false }
+        requiresExactEvidence = action == .translate || action == .quote || unit == .word ||
+            requestsVerbatimLocation || Self.matches(
+                #"必须完整|完整(?:原文|正文|原式)|不得遗漏|不遗漏|不增不减|精确引用|准确引用|只(?:给|要|看)原文|原文引用|原样(?:给出|输出|照录)|(?:列出|写出|给出|展示|保留)\s*(?:其|该|(?:[两多\d]+条)|(?:公式|方程)[^。！？]{0,12}的?)?原式|(?:只|仅)(?:能|可)?(?:根据|依据|使用|引用|参考)[^。！？]{0,12}(?:论文|本文|PDF|原文)|\b(?:without omissions|word for word|exact wording|original wording|(?:show|copy|give|preserve) (?:the )?original (?:equation|formula)|(?:only|solely) (?:use|rely on|based on) (?:the )?(?:paper|document|pdf|original text))\b"#,
+                outputInstruction)
+        // Precise addressing keeps stronger extraction checks. Submission
+        // can still use other sources when the user requests discussion.
+        allowsPartialEvidence = !requiresExactEvidence && unit == .passage &&
             !address.addressesPassage && objects.isEmpty && untypedObjects.isEmpty && !definesSymbols &&
             ResearchPDFAddress.paragraphs(in: instruction) == nil &&
             ResearchPDFAddress.explicitSection(instruction) == nil && !Self.matches(ResearchPDFAddress.columns, instruction) &&
@@ -106,6 +118,22 @@ struct ResearchPDFRequest: Sendable {
 
     private static func matches(_ pattern: String, _ text: String) -> Bool {
         ResearchPDFAddress.captures(pattern, in: text) != nil
+    }
+
+    // Algorithms are searchable text labels. The visual object index does not
+    // attest that a mention or an adjacent passage is complete pseudocode.
+    private static let algorithm = try! NSRegularExpression(
+        pattern: #"(?:\balgorithm\s+|算法\s*)[(（]?\s*(\d+(?:[.-]\d+)*[a-z]?)(?![\p{Latin}\d])"#,
+        options: .caseInsensitive)
+
+    static func algorithms(in text: String) -> [String] {
+        var labels: [String] = []
+        for hit in algorithm.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+            guard let number = Range(hit.range(at: 1), in: text) else { continue }
+            let label = "Algorithm " + text[number].lowercased()
+            if !labels.contains(label) { labels.append(label) }
+        }
+        return labels
     }
 
     private static func documentInstruction(_ instruction: String) -> String {

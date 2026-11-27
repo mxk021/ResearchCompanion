@@ -59,3 +59,16 @@ test('translation and explanation preserve the actual typed range and restrictio
     assert.ok(researchPrompt(question, mode, material, DEFAULT_PERSONA).endsWith('\n'+question))
   }
 })
+
+test('ordinary discussion can answer from history and knowledge with no claimed PDF evidence', () => {
+  const question = 'How is the reference point chosen?'
+  const prompt = researchPrompt(question, 'ask', null, DEFAULT_PERSONA, undefined, undefined, undefined, 'discussion')
+  assert.match(prompt, /相关上下文/)
+  assert.match(prompt, /不能充当新原文或本轮核验/)
+  assert.match(prompt, /【论文原文，JSON 引用数据】\nnull\n/)
+  assert.ok(prompt.endsWith('\n' + question))
+  const material = decodeInlineMaterial({source:'PDF',title:'Example',text:'source',scope:'File page 2'})
+  assert.match(researchPrompt(question, 'ask', material, DEFAULT_PERSONA), /只依据给出的材料原文/)
+  assert.match(researchPrompt(question, 'translate', material, DEFAULT_PERSONA, undefined, undefined, undefined, 'discussion'),
+    /只依据给出的材料原文/)
+})

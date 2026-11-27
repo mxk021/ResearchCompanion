@@ -42,6 +42,7 @@ struct ResearchPDFQueryCheck {
         try check.testMissingReversedAmbiguousAndUnreliableNeverFallBackToRanking()
         try check.testRangeChecksMissingPagesAfterLocatingTheEndpoints()
         try check.testSynthesisKeepsVerifiedRegionsAndReportsLocalGaps()
+        try check.testDiscussionEvidenceIsOptionalWithoutBypassingExactRequests()
         try check.testRangeUsesTheLocalMapWithoutSkippingDamagedGlyphs()
         try check.testPairedRangeCandidates()
         try check.testNaturalRangeCommandsAndCorrections()
@@ -217,6 +218,40 @@ struct ResearchPDFQueryCheck {
         try check(Set(nativePacket.pdfPositions?.map(\.page) ?? []) == [1, 3])
         try check(nativePacket.evidenceChecks?.contains { $0.status == .missing && $0.target.contains("第 2 页") } == true)
         print("PASS partial PDF synthesis, omitted blocks, clipped display math and unindexable page, exact/translation denial and source mappings.")
+    }
+
+    func testDiscussionEvidenceIsOptionalWithoutBypassingExactRequests() throws {
+        let followUp = ResearchPDFRequest("这个固定参考点如何确定，是人为规定的吗？")
+        for question in [followUp.question, "解释公式（4）里 λ 为什么变化", "总结第 2 节的算法",
+                         "提取这段的要点", "不用精确引用，解释方法", "Read the PDF and explain the result",
+                         "What does translation invariance mean in this proof?"] {
+            try check(!ResearchPDFRequest(question).requiresExactEvidence)
+        }
+        for question in ["请精确引用第 2 页的原文", "请给出逐字原文，不得遗漏",
+                         "请逐段翻译第 2 页原文", "分析并保留公式（1）的原式",
+                         "请逐段分析从“OPENING THISTLE”到“PAGE_52_END”的完整原文。",
+                         "只根据论文解释，不能补充其他信息", "Quote the exact wording"] {
+            try check(ResearchPDFRequest(question).requiresExactEvidence)
+        }
+        let original = "Algorithm 4 uses the current outer iterate as its reference point. This update occurs before constructing the quadratic approximation."
+        let unreliable = "This reference point is an arbitrary constant and never changes. This is an unreadable candidate."
+        let document = try index([
+            page(1, [block(original), block(unreliable, reliable: false, source: original.utf16.count + 2)]),
+            page(2, [], state: .needsOCR)
+        ])
+        let algorithm = ResearchPDFRequest("这个算法4与图3是什么关系？")
+        try check(algorithm.algorithmMentions == ["Algorithm 4"] && !algorithm.requiresExactEvidence)
+        let recovered = try unwrap(document.fallbackConversationEvidence(followUp, contextTerms: "outer iterate"))
+        try check(recovered.scope.contains("所问内容未完整核验"))
+        try check(recovered.evidenceChecks?.contains { $0.kind == .content && $0.status == .missing } == true)
+        try check(recovered.verifiedExcerpts?.compactMap { $0.text(in: recovered.text) } == [original])
+        try check(recovered.pdfPositions?.first?.page == 1 && !recovered.text.contains(unreliable))
+        let supplemental = try unwrap(document.fallbackConversationEvidence(algorithm))
+        try check(supplemental.text.contains(original) &&
+                  supplemental.evidenceChecks?.contains { $0.target.contains("Algorithm 4") && $0.status == .missing } == true)
+        let unreadable = try index([page(1, [], state: .needsOCR)])
+        try check(try unreadable.fallbackConversationEvidence(followUp) == nil)
+        try check(try document.fallbackConversationEvidence(ResearchPDFRequest("逐字摘录第 2 页")) == nil)
     }
 
     func testRangeUsesTheLocalMapWithoutSkippingDamagedGlyphs() throws {

@@ -307,7 +307,7 @@ extension ResearchPDFIndex {
         }
         guard bodyLength >= 80, !requirePageCoverage || bodyPages.count * 2 >= expectedPages.count,
               relevantEntries.map({ entries in body.contains { entries.contains($0.entry) } }) != false else {
-            throw ResearchMaterialError.message("部分原文无法核验，剩余正文不足以支持这次总结或分析。本次未发送，请缩小范围或核对原页。")
+            throw InsufficientEvidence("部分原文无法核验，剩余正文不足以支持这次总结或分析。本次未发送，请缩小范围或核对原页。")
         }
 
         var gaps: [ResearchPDFEvidenceCheck] = []
@@ -328,7 +328,7 @@ extension ResearchPDFIndex {
             gaps.append(.init(kind: .visual, target: locations(omittedEquations) + "的行间公式原式", status: .missing))
         }
         let omitted = ResearchMaterial.bounded(gaps.map(\.target).joined(separator: "、"), limit: 300)
-        let partialScope = "部分证据 · 仅依据已核验摘录 · 缺失：" + omitted
+        let partialScope = "部分证据 · 附有已核验摘录 · 缺失：" + omitted
         let verifiedLocation = ResearchPDFEvidenceCheck(kind: .location, target: "所附摘录的原文页位", status: .verified)
         return try materials(preserved, scope: partialScope, limit: limit, independent: true,
                              requestCheck: verifiedLocation).map {
@@ -923,6 +923,34 @@ extension ResearchPDFIndex {
         return evidence
     }
 
+    /// When the requested source could not be established, return only
+    /// verifiable related passages and retain the missing-source status.
+    func fallbackConversationEvidence(_ request: ResearchPDFRequest, selection: ResearchMaterial? = nil,
+                                      contextTerms: String? = nil,
+                                      limit budget: Int = ResearchMaterial.maximumLength) throws -> ResearchMaterial? {
+        guard !request.requiresExactEvidence else { return nil }
+        let limit = min(budget, ResearchMaterial.maximumLength - (selection.map { $0.text.utf16.count + 750 } ?? 0))
+        guard limit > 512 else { return nil }
+        let clues = [selection?.text, contextTerms].compactMap { $0.map { String($0.prefix(600)) } }.joined(separator: "\n")
+        do {
+            var evidence = try ranked(request.question, background: clues.isEmpty ? nil : clues,
+                                      allowsPartialEvidence: true, limit: limit,
+                                      algorithms: Set(request.algorithmMentions))
+            evidence.scope = ResearchMaterial.bounded("所问内容未完整核验 · " + evidence.scope, limit: 510)
+            evidence.evidenceChecks = (evidence.evidenceChecks ?? []) + [
+                .init(kind: .content, target: request.algorithmMentions.isEmpty
+                      ? "所问内容的完整原文依据" : request.algorithmMentions.joined(separator: "、") + " 的完整原文",
+                      status: .missing)
+            ]
+            if let selection { return try selection.withBackgroundEvidence(evidence) }
+            return evidence
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return nil
+        }
+    }
+
     private func rankedContext(_ request: ResearchPDFRequest, selection: ResearchMaterial?, limit: Int) throws -> ResearchMaterial? {
         do {
             return try ranked(request.question, background: selection.map { String($0.text.prefix(1_200)) },
@@ -1008,7 +1036,7 @@ extension ResearchPDFIndex {
     }
 
     private static let concepts: [[String]] = [
-        ["方法", "技术", "method", "methods", "approach", "algorithm", "technique", "framework"],
+        ["方法", "技术", "算法", "method", "methods", "approach", "algorithm", "technique", "framework"],
         ["传统", "常规", "baseline", "conventional", "traditional", "standard"],
         ["贡献", "创新", "contribution", "contributions", "propose", "proposed", "introduce", "novel"],
         ["局限", "局限性", "限制", "不足", "limitation", "limitations", "limited", "challenge", "however", "future"],
@@ -1018,6 +1046,9 @@ extension ResearchPDFIndex {
         ["计算复杂度", "时间复杂度", "复杂度", "渐近", "complexity", "asymptotic", "flops"],
         ["梯度下降", "gradient", "descent"],
         ["收敛", "convergence", "converge", "converges"],
+        ["参考点", "锚点", "reference", "anchor", "auxiliary"],
+        ["迭代", "iteration", "iterate", "iterative"],
+        ["初始化", "initialization", "initialize", "initialise"],
         ["摘要", "abstract"], ["引言", "介绍", "introduction"],
         ["结论", "conclusion", "conclusions"], ["附录", "appendix", "appendices"],
         ["讨论", "discussion"], ["厚掩模", "thick", "mask"]
@@ -1029,7 +1060,7 @@ extension ResearchPDFIndex {
     }
 
     private func ranked(_ question: String, background: String?, allowsPartialEvidence: Bool = false,
-                        limit: Int = ResearchMaterial.maximumLength) throws -> ResearchMaterial {
+                        limit: Int = ResearchMaterial.maximumLength, algorithms: Set<String> = []) throws -> ResearchMaterial {
         var weights = [String: Double]()
         if let background {
             for w in Self.termCounts(background).keys { weights[w] = 0.65 }
@@ -1075,6 +1106,12 @@ extension ResearchPDFIndex {
                 let tf = Double(count)
                 score += weight * tf * 2.2 / (tf + lengthPenalty)
             }
+            if !algorithms.isEmpty && (p.terms["algorithm"] != nil || p.terms["算法"] != nil) {
+                let passage = (entry.text as NSString).substring(with: p.slice.range)
+                let requested = algorithms.intersection(ResearchPDFRequest.algorithms(in: passage))
+                score += Double(requested.count) * 6
+                matches.formUnion(requested)
+            }
             guard score > 0, allowsPartialEvidence ||
                   block.lines.allSatisfy({ line in
                       line.regionVerified != false && (!line.orderUncertain || block.lines.count == 1 && line.regionVerified == true)
@@ -1104,7 +1141,7 @@ extension ResearchPDFIndex {
             selected.append(id)
         }
         include(best.passage)
-        for terms in facets {
+        for terms in facets + algorithms.sorted().map({ Set([$0]) }) {
             if let candidate = ranked.first(where: { !$0.matched.isDisjoint(with: terms) }) { include(candidate.passage) }
         }
         for hit in ranked.prefix(10) where hit.score >= best.score * 0.18 { include(hit.passage) }

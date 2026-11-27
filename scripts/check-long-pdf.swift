@@ -416,7 +416,17 @@ struct LongPDFCheck {
         client.refreshResearch()
         try await wait("idle after cancel") { !client.conversationRunning }
         try Data("replaced synthetic file".utf8).write(to: file, options: .atomic)
-        client.draft = "第52页，请用旧缓存吗？"
+        let noPDFQuestion = "按前面的讨论，这篇论文在实验设计上还有什么局限？"
+        let beforeUnverifiedPDF = client.conversationMessages.count
+        client.draft = noPDFQuestion
+        client.submitResearch()
+        try await wait("a changed PDF continues the conversation without stale source material") {
+            !client.hasPendingSubmission && client.conversationMessages.count == beforeUnverifiedPDF + 2
+        }
+        expectPair(after: beforeUnverifiedPDF, question: noPDFQuestion)
+        let unverifiedReply = client.conversationMessages.last!.reply!
+        precondition(unverifiedReply.material == nil && store.read(session: client.sessionID!, reply: unverifiedReply) == nil)
+        client.draft = "请逐字引用第52页的完整原文。"
         client.submitResearch()
         try await wait("replacement") { !client.pdfRequestRunning && !client.loadingResearchFile }
         precondition(client.materialError?.contains("无法读取") == true && client.fixedMaterial == nil)
@@ -457,9 +467,17 @@ struct LongPDFCheck {
         try await wait("all-image import") { !client.loadingResearchFile }
         precondition(client.fixedMaterial?.text == "" && !client.hasSendableResearchMaterial)
         let priorReplies = client.conversationMessages.count
-        client.draft = "请解释第1页"
+        let scannedQuestion = "请解释第1页"
+        client.draft = scannedQuestion
         client.submitResearch()
-        precondition(client.lastError?.contains("尚无可发送的正文") == true && client.conversationMessages.count == priorReplies)
+        try await wait("unreadable scan allows discussion without fabricated evidence") {
+            !client.hasPendingSubmission && client.conversationMessages.count == priorReplies + 2
+        }
+        expectPair(after: priorReplies, question: scannedQuestion)
+        precondition(client.conversationMessages.last?.reply?.material == nil)
+        client.draft = "请逐字引用第1页。"
+        client.submitResearch()
+        precondition(client.lastError?.contains("尚无可发送的正文") == true && client.conversationMessages.count == priorReplies + 2)
         client.recognizePDFScans()
         try await wait("all-image OCR") { !client.loadingResearchFile }
         precondition(client.fixedMaterial?.text.isEmpty == true && client.fixedMaterial?.pdfIndex?.pages.first?.text.contains("9375") == true && client.hasSendableResearchMaterial)
