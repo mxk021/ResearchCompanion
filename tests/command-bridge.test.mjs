@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { CommandBridge } from '../lib/index.js'
+import { CommandBridge, createHarnessInstanceDescriptor, HarnessInstanceManifest } from '../lib/index.js'
+import { authenticateTestPipe } from './windows-test-pipe.mjs'
 
 const snapshot = {
   state: 'thinking',
@@ -38,6 +39,15 @@ function waitForServer(path) {
   })
 }
 
+async function commandEndpoint(root) {
+  if (process.platform !== 'win32') return { socketPath: join(root, 'command.sock') }
+  const instance = createHarnessInstanceDescriptor()
+  const discovery = new HarnessInstanceManifest(instance, root)
+  discovery.publish()
+  const manifest = JSON.parse(await readFile(discovery.path, 'utf8'))
+  return { socketPath: instance.commandSocketPath, instance, manifest }
+}
+
 function readLines(socket) {
   let buffer = ''
   const waiting = []
@@ -62,7 +72,7 @@ function send(socket, nextLine, id, action, fields = {}) {
 
 test('command bridge serves capabilities, subscription snapshots, and serialized prompt commands', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-pet-command-'))
-  const socketPath = join(root, 'command.sock')
+  const { socketPath, instance, manifest } = await commandEndpoint(root)
   let active = 0
   let maxActive = 0
   const prompts = []
@@ -96,10 +106,11 @@ test('command bridge serves capabilities, subscription snapshots, and serialized
       return { accepted: true, sessionId: request.sessionId }
     },
     snapshotFor: () => snapshot,
-  }, socketPath)
+  }, socketPath, instance)
   bridge.start()
 
   const socket = await waitForServer(socketPath)
+  await authenticateTestPipe(socket, manifest)
   const nextLine = readLines(socket)
   const capabilities = await send(socket, nextLine, 'cap', 'capabilities')
   assert.equal(capabilities.ok, true)
@@ -161,8 +172,10 @@ test('command bridge serves capabilities, subscription snapshots, and serialized
   assert.equal(taskEvent.event, 'tasks')
   assert.equal(taskEvent.tasks[0].title, 'Task')
 
-  const permissions = (await stat(socketPath)).mode & 0o777
-  assert.equal(permissions, 0o600)
+  if (process.platform !== 'win32') {
+    const permissions = (await stat(socketPath)).mode & 0o777
+    assert.equal(permissions, 0o600)
+  }
 
   socket.destroy()
   bridge.stop()
@@ -171,7 +184,7 @@ test('command bridge serves capabilities, subscription snapshots, and serialized
 
 test('command bridge rejects malformed JSON without taking down the socket', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-pet-command-invalid-'))
-  const socketPath = join(root, 'command.sock')
+  const { socketPath, instance, manifest } = await commandEndpoint(root)
   const bridge = new CommandBridge({
     imageAttachmentLimits: imageLimits(),
     listWorkspaces: async () => [],
@@ -180,9 +193,10 @@ test('command bridge rejects malformed JSON without taking down the socket', asy
     openSession: async request => ({ accepted: true, sessionId: request.sessionId }),
     prompt: async request => ({ accepted: true, sessionId: request.sessionId }),
     snapshotFor: () => undefined,
-  }, socketPath)
+  }, socketPath, instance)
   bridge.start()
   const socket = await waitForServer(socketPath)
+  await authenticateTestPipe(socket, manifest)
   const nextLine = readLines(socket)
   socket.write('not-json\n')
   const invalid = await nextLine()
@@ -197,7 +211,7 @@ test('command bridge rejects malformed JSON without taking down the socket', asy
 
 test('command bridge enforces deployment image limits and remains usable after oversized input', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-pet-command-images-'))
-  const socketPath = join(root, 'command.sock')
+  const { socketPath, instance, manifest } = await commandEndpoint(root)
   const bridge = new CommandBridge({
     imageAttachmentLimits: imageLimits({ maxImageBytes: 4, maxImagesPerMessage: 2, maxMessageImageBytes: 3 }),
     listWorkspaces: async () => [],
@@ -213,9 +227,10 @@ test('command bridge enforces deployment image limits and remains usable after o
       return { accepted: true, sessionId: request.sessionId }
     },
     snapshotFor: () => undefined,
-  }, socketPath)
+  }, socketPath, instance)
   bridge.start()
   const socket = await waitForServer(socketPath)
+  await authenticateTestPipe(socket, manifest)
   const nextLine = readLines(socket)
   const fields = {
     workspaceId: 'workspace-test', sessionId: 'session-test', requestId: 'request-test', text: '',

@@ -1,5 +1,6 @@
 import type { Socket } from 'node:net'
 import { UnixSocketServer } from './UnixSocketServer.js'
+import { windowsPipeAccess, type HarnessInstanceDescriptor } from './HarnessInstance.js'
 
 /** The newline-delimited local bridge payload shared with DSH Pet.app. */
 export interface MoodBridgePayload {
@@ -32,11 +33,13 @@ export class LocalStateBridge {
   constructor(
     readSnapshot: () => MoodBridgePayload,
     socketPath: string,
+    instance?: HarnessInstanceDescriptor,
   ) {
     this.readSnapshot = readSnapshot
     this.socketServer = new UnixSocketServer({
       socketPath,
       label: 'local bridge',
+      windowsAccess: windowsPipeAccess(instance),
       onConnection: client => {
         this.clients.add(client)
         client.setNoDelay(true)

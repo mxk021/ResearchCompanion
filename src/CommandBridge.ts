@@ -2,7 +2,7 @@ import type { Socket } from 'node:net'
 import type { PromptContentPart } from '@deepseek-ai/dsh-api-session-controller'
 import { UnixSocketServer } from './UnixSocketServer.js'
 import type { MoodBridgePayload } from './LocalStateBridge.js'
-import type { HarnessInstanceDescriptor } from './HarnessInstance.js'
+import { windowsPipeAccess, type HarnessInstanceDescriptor } from './HarnessInstance.js'
 import { decodeResearchSelection, type ResearchSelection } from './ResearchModels.js'
 import { decodeInlineMaterial, type ResearchContext } from './ResearchContext.js'
 import { decodePlanningDocument, type PlanningDocument } from './ResearchDocumentPlan.js'
@@ -175,6 +175,7 @@ export class CommandBridge {
     this.socketServer = new UnixSocketServer({
       socketPath,
       label: 'command bridge',
+      windowsAccess: windowsPipeAccess(instance),
       onConnection: socket => this.attachClient(socket),
       onStop: () => {
         for (const client of this.clients) client.socket.destroy()

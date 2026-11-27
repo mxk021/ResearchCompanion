@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { clearAmbientHarnessEnv } from './ambient-env.mjs'
+import { authenticateTestPipe } from './windows-test-pipe.mjs'
 
 clearAmbientHarnessEnv()
 
@@ -203,9 +204,11 @@ test('plugin adapter calls official-style workspace and session services', async
     plugin.apply(ctx)
     const instance = await waitForManifest(instanceDirectory)
     assert.equal(instance.kind, 'unknown')
-    assert.equal(instance.statusSocketPath.endsWith('-s.sock'), true)
-    assert.equal(instance.commandSocketPath.endsWith('-c.sock'), true)
+    const suffix = process.platform === 'win32' ? '' : '.sock'
+    assert.ok(instance.statusSocketPath.endsWith('-s' + suffix))
+    assert.ok(instance.commandSocketPath.endsWith('-c' + suffix))
     const socket = await waitForServer(instance.commandSocketPath)
+    await authenticateTestPipe(socket, instance)
     const nextLine = nextJsonLine(socket)
 
     const listed = await command(socket, nextLine, 'list', 'workspaces')

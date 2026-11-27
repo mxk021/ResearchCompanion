@@ -25,7 +25,13 @@ async function startup() {
         if (Zotero.DataDirectory.dir !== EXPECTED_DATA) throw new Error('Unexpected data directory');
         const win = Zotero.getMainWindow();
         // The private library links to an existing PDF. The reader never writes the source.
-        const attachment = await Zotero.Attachments.linkFromFile({file: Zotero.File.pathToFile(FIXTURE_PDF)});
+        const parent = new Zotero.Item('journalArticle');
+        parent.setField('title', 'Synthetic Orchard Reference');
+        parent.setCreators([{firstName: 'Ada', lastName: 'Fixture', creatorType: 'author'}]);
+        await parent.saveTx();
+        const attachment = await Zotero.Attachments.linkFromFile({
+            file: Zotero.File.pathToFile(FIXTURE_PDF), parentItemID: parent.id
+        });
         const reader = await Zotero.Reader.open(attachment.id, {pageIndex: FIXTURE_PAGE});
         await reader._initPromise;
         let view, doc, text;
@@ -112,7 +118,9 @@ async function startup() {
         const live = await call(liveQuery());
         const ordinary = await call('');
         const auto = await call(liveQuery(), true);
-        const pdfFile = JSON.parse(auto[2]).liveSelection?.pdfFile;
+        const captured = JSON.parse(auto[2]).liveSelection;
+        const pdfFile = captured?.pdfFile;
+        const paper = JSON.parse(ordinary[2]).paper;
         const nativeFile = await IOUtils.stat(FIXTURE_PDF);
         await select(start, start + 1);
         const secondNative = view._selectionRanges.map(r => r.text).join('\\n');
@@ -151,6 +159,11 @@ async function startup() {
             mirrorDiffers: initialMirror !== expected,
             selectionUnits: initialNative.length,
             attachmentAndPage, opensOnPage,
+            parentAndChild: ordinary[0] === 200 && attachment.parentItem?.id === parent.id &&
+                paper?.key === parent.key && paper?.title === 'Synthetic Orchard Reference' &&
+                paper?.authors.join(',') === 'Ada Fixture' && paper?.attachmentID === attachment.id &&
+                paper?.attachmentKey === attachment.key && captured?.title === paper.title &&
+                captured?.capture.attachmentID === attachment.id && reader.itemID === attachment.id,
             optInLocalPDF: live[0] === 200 && !JSON.parse(live[2]).liveSelection?.pdfFile &&
                 auto[0] === 200 && pdfFile?.path === FIXTURE_PDF && pdfFile?.bytes === nativeFile.size &&
                 pdfFile?.modifiedMs === nativeFile.lastModified && pdfFile?.attachmentID === attachment.id &&
@@ -202,7 +215,8 @@ def verify(executable, fixture, root, package, expected_text, page):
     env = dict(os.environ, MOZ_HEADLESS='1', MOZ_NO_REMOTE='1', MOZ_CRASHREPORTER_DISABLE='1', TMPDIR=str(root))
     result_file = profile / 'fixture-result.json'
     with (root / 'launch.log').open('w') as log:
-        proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env, start_new_session=True)
+        proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env,
+                                start_new_session=os.name != 'nt')
         try:
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline and proc.poll() is None and not result_file.exists():
@@ -213,17 +227,23 @@ def verify(executable, fixture, root, package, expected_text, page):
             print(json.dumps(result))
             expected = dict(version=version, focused=True, liveExact=True, previewExact=True,
                             switchingExact=True, repeatExact=True, verifiedCapture=True,
-                            emptyRejected=True, noCache=True, attachmentAndPage=True, optInLocalPDF=True)
+                            emptyRejected=True, noCache=True, attachmentAndPage=True, optInLocalPDF=True, parentAndChild=True)
             if (any(result.get(k) != v for k, v in expected.items()) or result.get('opensOnPage') is False
                     or page > 1 and result.get('opensOnPage') is not True):
                 raise SystemExit('The native reader result differed from the expected selection.')
         finally:
             if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGTERM)
+                if os.name == 'nt':
+                    proc.terminate()
+                else:
+                    os.killpg(proc.pid, signal.SIGTERM)
                 try:
                     proc.wait(timeout=6)
                 except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    if os.name == 'nt':
+                        proc.kill()
+                    else:
+                        os.killpg(proc.pid, signal.SIGKILL)
                     proc.wait()
 
 

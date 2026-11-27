@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { connect, createServer, type Server, type Socket } from 'node:net'
 import { chmodSync, existsSync, lstatSync, mkdirSync, renameSync, unlinkSync, type Stats } from 'node:fs'
 import { dirname } from 'node:path'
+import { isWindowsPipePath, type WindowsPipeAccess } from './WindowsPipeAccess.js'
 
 interface SocketIdentity {
   dev: number
@@ -14,18 +15,21 @@ export interface UnixSocketServerOptions {
   label: string
   onConnection: (socket: Socket) => void
   onStop: () => void
+  windowsAccess?: WindowsPipeAccess
 }
 
 /**
- * Owns one user-local Unix socket with stale-owner probing and replacement
- * protection. Both the command channel and the read-only status channel use
- * the same lifecycle rules; their client protocols stay in their own classes.
+ * Owns one user-local endpoint. Unix sockets retain stale-owner and replacement
+ * protection; Windows pipes authenticate each connection before protocol data.
+ * The command and status protocols stay in their respective bridge classes.
  */
 export class UnixSocketServer {
   private readonly socketPath: string
   private readonly label: string
   private readonly onConnection: (socket: Socket) => void
   private readonly onStop: () => void
+  private readonly windowsAccess: WindowsPipeAccess | undefined
+  private handshakes = new Set<Socket>()
   private server: Server | undefined
   private ownsSocket = false
   private probeGeneration = 0
@@ -37,10 +41,15 @@ export class UnixSocketServer {
     this.label = options.label
     this.onConnection = options.onConnection
     this.onStop = options.onStop
+    this.windowsAccess = options.windowsAccess
   }
 
   start(onReady?: () => void): void {
     if (this.server || this.probing) return
+    if (process.platform === 'win32') {
+      this.listenWindows(onReady)
+      return
+    }
     mkdirSync(dirname(this.socketPath), { recursive: true })
 
     if (existsSync(this.socketPath)) {
@@ -83,9 +92,15 @@ export class UnixSocketServer {
     this.probeGeneration += 1
     this.probing = false
     this.onStop()
+    for (const socket of this.handshakes) socket.destroy()
+    this.handshakes.clear()
     const server = this.server
     this.server = undefined
     if (!server) return
+    if (process.platform === 'win32') {
+      server.close()
+      return
+    }
     const replacement = preserveReplacement(this.socketPath, this.socketIdentity)
     server.close()
     if (replacement !== undefined) {
@@ -95,6 +110,32 @@ export class UnixSocketServer {
     }
     this.ownsSocket = false
     this.socketIdentity = undefined
+  }
+
+  private listenWindows(onReady?: () => void): void {
+    const access = this.windowsAccess
+    if (!access || !isWindowsPipePath(this.socketPath)) {
+      throw new Error('Refusing an unauthenticated Windows bridge pipe')
+    }
+    const generation = this.probeGeneration
+    const server = createServer(socket => {
+      this.handshakes.add(socket)
+      socket.once('close', () => this.handshakes.delete(socket))
+      access.authorize(socket, this.socketPath, () => {
+        this.handshakes.delete(socket)
+        if (generation === this.probeGeneration) this.onConnection(socket)
+        else socket.destroy()
+      })
+    })
+    server.maxConnections = 32
+    server.on('error', error => {
+      console.warn(`[dsh-pet] ${this.label} unavailable: ${error.message}`)
+    })
+    server.listen(this.socketPath, () => {
+      if (generation === this.probeGeneration) onReady?.()
+      else server.close()
+    })
+    this.server = server
   }
 
   private listen(onReady?: () => void): void {

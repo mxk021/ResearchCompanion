@@ -9,6 +9,7 @@ import { apply } from '../lib/index.js'
 import { researchPrompt, DEFAULT_PERSONA } from '../lib/ResearchContext.js'
 import { BridgeClient } from '../scripts/probe-companion.mjs'
 import { clearAmbientHarnessEnv } from './ambient-env.mjs'
+import { authenticateTestPipe } from './windows-test-pipe.mjs'
 
 clearAmbientHarnessEnv()
 
@@ -177,6 +178,7 @@ async function harness(run) {
     apply(ctx)
     const manifest = await manifestAt(process.env.DSH_PET_INSTANCE_DIRECTORY)
     client = new BridgeClient(manifest.commandSocketPath)
+    await authenticateTestPipe(client.socket, manifest)
     await run({ client, state, routes, calls, research, original, ctx, eventHandlers, researchPath })
   } finally {
     client?.close()
@@ -325,6 +327,9 @@ test('discussion sends a normal question without fresh evidence and never weaken
     assert.ok(supports.includes('researchDiscussionEvidence'))
     await assert.rejects(client.request('researchPrompt', {...fields,evidencePolicy:'invalid'}), /evidence policy/i)
     await assert.rejects(client.request('researchPrompt', {...fields,mode:'translate'}), /require source evidence/i)
+    await assert.rejects(client.request('researchPrompt', {...fields, pdfBatch:{
+      id:'00000000-0000-0000-0000-000000000001', stage:'work', index:1, count:2,
+    }}), /require source evidence/i)
     await assert.rejects(client.request('researchPrompt', {...fields,includeContext:true}), /先预览/)
     assert.equal(calls.some(call => call[0] === 'prompt'), false)
     assert.equal((await client.request('researchPrompt',fields)).accepted,true)
@@ -332,6 +337,44 @@ test('discussion sends a normal question without fresh evidence and never weaken
     assert.match(text, /一般知识/)
     assert.match(text, /【论文原文，JSON 引用数据】\nnull\n/)
     assert.ok(text.endsWith('\n' + fields.text))
+  })
+})
+
+test('discussion admits a document follow-up without falsely attaching or verifying evidence', async () => {
+  await harness(async ({ client, calls, eventHandlers }) => {
+    const target = { workspaceId: 'research-workspace', sessionId: 'research-session' }
+    const selection = { provider: 'chatgpt', model: 'gpt-test', reasoningEffort: 'medium' }
+    await client.request('researchSelectModel', { ...target, selection })
+    assert.ok((await client.request('capabilities')).supports.includes('researchDiscussionEvidence'))
+    const material = {
+      source: 'PDF', title: 'Synthetic', scope: '相关原文摘录 · 文件页 2',
+      text: 'Algorithm 1 initializes a reference point. Figure 3 shows an example.'
+    }
+    const first = { ...target, selection, requestId: 'ordinary-visual', text: '解释一下算法1和图3',
+      includeContext: true, material, evidencePolicy: 'discussion' }
+    const followUp = { ...target, selection, requestId: 'ordinary-follow-up', text: '固定参考点u如何确定，人为规定？',
+      includeContext: false, evidencePolicy: 'discussion' }
+    assert.equal((await client.request('researchPrompt', first)).accepted, true)
+    assert.equal((await client.request('researchPrompt', followUp)).accepted, true)
+    const prompts = calls.filter(([name]) => name === 'prompt').map(([, value]) => value)
+    assert.equal(prompts.length, 2)
+    assert.deepEqual(prompts.map(value => value.sessionId), [target.sessionId, target.sessionId])
+    assert.ok(prompts[0].content[0].text.includes(material.text))
+    const serialized = prompts[1].content[0].text
+    assert.ok(serialized.endsWith('【用户问题】\n' + followUp.text))
+    assert.match(serialized, /相关上下文/)
+    assert.match(serialized, /不能充当新原文或本轮核验/)
+    assert.match(serialized, /JSON 引用数据】\nnull/)
+    assert.ok(!serialized.includes(material.text))
+    const stream = eventHandlers.get('llm/stream')[0]
+    const messages = [{ role: 'user', source: { kind: 'user', rpcId: followUp.requestId },
+      content: [{ type: 'text', text: serialized }] }]
+    await consumeStream(stream, { ...selection, sessionId: target.sessionId, messages })
+    assert.equal((await client.request('conversation', { ...target, requestId: followUp.requestId })).dispatchEvidence, null)
+    await assert.rejects(
+      client.request('researchPrompt', { ...followUp, requestId: 'strict-translation', mode: 'translate' }),
+      /require source evidence/i)
+    assert.equal(calls.filter(([name]) => name === 'prompt').length, 2)
   })
 })
 
@@ -768,5 +811,45 @@ test('one research turn binds the PDF evidence and user image as distinct ordere
     assert.deepEqual(proof.userImages, [sha(storedPNGs[1])])
     assert.deepEqual(proof.images, [sha(storedPNGs[0])])
     assert.equal(proof.sha256, sha(objectMaterial.text))
+  })
+})
+
+test('the PDF batch wire contract keeps work out of the transcript and returns its completed part by request ID', async () => {
+  await harness(async ({ client, state, calls, eventHandlers }) => {
+    const capabilities = await client.request('capabilities')
+    assert.ok(capabilities.supports.includes('researchPromptGuidance'))
+    assert.ok(capabilities.supports.includes('researchPdfBatch'))
+    await client.request('workspaces')
+    await client.request('researchSelectModel', { ...documentTarget, selection: textSelection })
+    const requestId = 'dsh-pet-00000000-0000-0000-0000-000000000011'
+    const pdfBatch = { id: '00000000-0000-0000-0000-000000000012', stage: 'work', index: 1, count: 2 }
+    const request = { ...documentTarget, requestId, selection: textSelection, mode: 'ask',
+      text: 'Compare the hypotheses.', guidance: 'Summarize only this segment.', pdfBatch,
+      includeContext: true, material: objectMaterial }
+    await assert.rejects(client.request('researchPrompt', { ...request, pdfBatch: { ...pdfBatch, index: 3 } }), /Invalid PDF batch/)
+    await assert.rejects(client.request('researchPrompt', { ...request, material: undefined, includeContext: false }), /PDF tasks must bind/)
+    assert.equal(calls.some(([kind]) => kind === 'prompt'), false)
+    assert.equal((await client.request('researchPrompt', request)).accepted, true)
+    const content = calls.find(([kind]) => kind === 'prompt')[1].content
+    assert.match(content[0].text, /"guidance":"Summarize only this segment\."/)
+    const emit = frame => eventHandlers.get('agent/assistant-stream')[0]({
+      agent: { session: { id: documentTarget.sessionId } }, frame: { attemptId: 'work-part', ...frame },
+    })
+    emit({ type: 'start' })
+    emit({ type: 'chunk', index: 1, chunk: { type: 'text-delta', index: 0, text: 'Internal evidence.' } })
+    const active = await client.request('conversation', { ...documentTarget, requestId })
+    assert.equal(active.stream.message, null)
+    assert.equal(active.completedPart, undefined)
+    state.records = [
+      { seq: 1, type: 'turn/start', data: { turn: 1 } },
+      { seq: 2, type: 'user/message', data: { id: 'batch-question', source: { kind: 'user', rpcId: requestId }, content } },
+      { seq: 3, type: 'assistant/message', data: { turn: 1, message: { id: 'batch-answer', content: [{ type: 'text', text: 'Internal evidence.' }] } } },
+      { seq: 4, type: 'turn/end', data: { reason: { kind: 'completed' } } },
+    ]
+    const done = await client.request('conversation', { ...documentTarget, requestId })
+    assert.deepEqual(done.completedPart, { requestId, text: 'Internal evidence.' })
+    assert.deepEqual(done.messages, [])
+    const mismatchedRequest = await client.request('conversation', { ...documentTarget, requestId: 'not-the-batch-part' })
+    assert.equal(mismatchedRequest.completedPart, undefined)
   })
 })

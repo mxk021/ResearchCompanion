@@ -16,7 +16,7 @@ import type {} from '@deepseek-ai/dsh-workspace'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { createHash, randomUUID } from 'node:crypto'
-import { basename, join, resolve } from 'node:path'
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
 import { mkdir, readFile } from 'node:fs/promises'
 import { ResearchRetirement } from './ResearchRetirement.js'
@@ -111,12 +111,21 @@ export function apply(ctx: Context): void {
   // All pet commands are scoped to one new workspace; existing sessions stay private.
   const legacyWorkspace = join(homedir(), 'Documents', 'Codex', 'ResearchCompanionWorkspace')
   const registeredLegacy = ctx.workspaceRegistry.list().some(workspace => workspace.path === legacyWorkspace)
+  const localWorkspace = process.platform === 'win32'
+    ? join(instanceDiscoveryDirectory(), '..', 'Workspace')
+    : join(homedir(), 'Library', 'Application Support', 'Research Companion', 'Workspace')
   const researchWorkspacePath = resolve(process.env.DSH_RESEARCH_WORKSPACE ?? (registeredLegacy ? legacyWorkspace
-    : join(homedir(), 'Library', 'Application Support', 'Research Companion', 'Workspace')))
+    : localWorkspace))
   let researchWorkspaceId: string | undefined
   let researchCanonicalPath = researchWorkspacePath
   const workspaceReady = mkdir(researchWorkspacePath, { recursive: true, mode: 0o700 })
     .then(() => ctx.workspaceRegistry.create(researchWorkspacePath, '科研助手')).then(workspace => { researchWorkspaceId = String(workspace.id); researchCanonicalPath = workspace.path; return workspace })
+  const isResearchDirectory = (cwd: string): boolean => {
+    const absolute = resolve(cwd)
+    if (process.platform !== 'win32') return absolute === researchCanonicalPath || absolute.startsWith(researchCanonicalPath + '/')
+    const subpath = relative(researchCanonicalPath, absolute)
+    return subpath === '' || (subpath !== '..' && !subpath.startsWith('..' + sep) && !isAbsolute(subpath))
+  }
   const contextProvider = new ZoteroContextProvider()
   const persona = async (): Promise<string> => {
     try {
@@ -269,7 +278,7 @@ export function apply(ctx: Context): void {
       ? snapshotOf(globalState)
       : snapshotForSession(activeSessionId)
 
-  const localBridge = new LocalStateBridge(snapshot, instance.statusSocketPath)
+  const localBridge = new LocalStateBridge(snapshot, instance.statusSocketPath, instance)
 
   const workspaceForSummary = (sessionId: string) => ctx.workspaceRegistry.list().find(workspace =>
     workspace.sessionIds.some(candidate => String(candidate) === sessionId),
@@ -471,7 +480,7 @@ export function apply(ctx: Context): void {
   ctx.on('agent/pre-step', async (request: any, next: () => Promise<any>) => {
     const sessionId = String(request.agent?.session?.id ?? request.agent?.id ?? '')
     const cwd = request.agent?.session?.header?.cwd ?? request.agent?.session?.cwd
-    const scoped = isResearchWorkspace(workspaceForSession(sessionId) ?? '') || (typeof cwd === 'string' && (resolve(cwd) === researchCanonicalPath || resolve(cwd).startsWith(researchCanonicalPath + '/')))
+    const scoped = isResearchWorkspace(workspaceForSession(sessionId) ?? '') || (typeof cwd === 'string' && isResearchDirectory(cwd))
     if (scoped && !accountProviderAllowed(request.modelSelection?.provider, llm())) {
       throw new Error('Research Companion refuses API-key model routes; check the DSH account or ChatGPT subscription.')
     }
@@ -819,8 +828,9 @@ export function apply(ctx: Context): void {
       ...(resolveAvailable && typeof files?.list === 'function' ? ['fileCandidates'] : []),
       ...(resolveAvailable && typeof skills?.list === 'function' && typeof commands?.list === 'function' ? ['skillCandidates'] : []),
       ...(typeof (ctx.sessionController as unknown as { projections?: unknown }).projections === 'function' ? ['taskPreview'] : []),
-      'researchContext', 'researchPrompt', 'conversation', 'researchStream', 'researchMaterial', 'researchPromptGuidance',
-      'researchPdfBatch', 'researchDiscussionEvidence',
+      // The Windows client reads its authenticated Zotero selection before constructing inline material.
+      ...(process.platform === 'win32' ? [] : ['researchContext']),
+      'researchPrompt', 'conversation', 'researchStream', 'researchMaterial', 'researchDiscussionEvidence', 'researchPromptGuidance', 'researchPdfBatch',
       ...(imageUploads() ? ['researchDocumentImages', 'researchUserImages'] : []),
       ...(researchSessionQuery() !== undefined && archiveSessionIDs() !== undefined ? ['researchHistory'] : []),
       ...(retirement.available(optionalService) ? ['researchSafeDelete','research.retirement.offline.v1'] : []),

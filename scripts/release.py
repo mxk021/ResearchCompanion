@@ -48,8 +48,11 @@ def build_bridge(temp, payload, offline, test_env):
     for name in ('markdown.js', 'vendor/katex/katex.min.js', 'vendor/markdown-it/browser/markdown-it.umd.min.js'):
         relative = Path('Resources/Transcript') / name
         copy_to_stage(ROOT / relative, build / relative)
-    run('pnpm', 'install', '--frozen-lockfile', '--ignore-scripts', *(['--offline'] if offline else []), cwd=build)
-    run('pnpm', 'exec', 'tsc', '-p', 'tsconfig.build.json', cwd=build)
+    pnpm = shutil.which('pnpm')
+    if pnpm is None:
+        raise SystemExit('Install pnpm before building the research bridge.')
+    run(pnpm, 'install', '--frozen-lockfile', '--ignore-scripts', *(['--offline'] if offline else []), cwd=build)
+    run(pnpm, 'exec', 'tsc', '-p', 'tsconfig.build.json', cwd=build)
     run('node', 'scripts/build-local.mjs', cwd=build)
     run('node', '--test', *sorted((build / 'tests').glob('*.test.mjs')), cwd=build, env=test_env)
     run('node', '--test', 'zotero-context-bridge/tests/bridge.test.cjs', env=test_env)
@@ -57,6 +60,28 @@ def build_bridge(temp, payload, offline, test_env):
     target = payload / f"{package['name']}-{package['version']}.tgz"
     run(PYTHON, build / 'scripts/package-bridge.py', '--public', '--output', target, cwd=build)
     return target
+
+
+def isolated_environment(test_home):
+    env = {key: value for key, value in os.environ.items() if not key.upper().startswith('DSH_')}
+    env.update(HOME=str(test_home), CFFIXED_USER_HOME=str(test_home))
+    if os.name == 'nt':
+        for name, relative in [('USERPROFILE', '.'), ('APPDATA', 'AppData/Roaming'), ('LOCALAPPDATA', 'AppData/Local')]:
+            path = test_home / relative
+            path.mkdir(parents=True, exist_ok=True)
+            env[name] = str(path)
+    return env
+
+
+def bridge_only(options):
+    dest = options.output.resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='rc-bridge-', dir='/private/tmp' if sys.platform == 'darwin' else None) as directory:
+        temp = Path(directory)
+        test_home = temp / 'home'
+        test_home.mkdir(mode=0o700)
+        archive = build_bridge(temp, dest, options.offline, isolated_environment(test_home))
+    print(archive)
 
 
 def native_checks(temp, env, clt_only):
@@ -154,8 +179,6 @@ def package(options):
     arch = platform.machine()
     if platform.system() != 'Darwin':
         raise SystemExit('This packaging command requires macOS.')
-    if options.tag and options.tag != f"v{META['version']}":
-        raise SystemExit('Requested tag and release.json version differ.')
     if options.notary_profile and options.clt_only:
         raise SystemExit('The notarized release path requires the full Xcode test gate.')
     if options.notary_profile and options.identity == '-':
@@ -188,9 +211,8 @@ def package(options):
             link = test_home / relative
             link.parent.mkdir(parents=True, exist_ok=True)
             link.symlink_to(system_cache, target_is_directory=True)
-        env = {k: v for k, v in os.environ.items() if not k.startswith('DSH_')}
-        env.update(HOME=str(test_home), CFFIXED_USER_HOME=str(test_home),
-                   SDKROOT=os.environ.get('SDKROOT') or output('xcrun', '--sdk', 'macosx', '--show-sdk-path'),
+        env = isolated_environment(test_home)
+        env.update(SDKROOT=os.environ.get('SDKROOT') or output('xcrun', '--sdk', 'macosx', '--show-sdk-path'),
                    CLANG_MODULE_CACHE_PATH=str(temp / 'clang'), SWIFTPM_MODULECACHE_OVERRIDE=str(temp / 'modules'))
         bridge = build_bridge(temp, payload, options.offline, env)
         binary = native_checks(temp, env, options.clt_only)
@@ -254,7 +276,16 @@ if __name__ == '__main__':
     parser.add_argument('--tag', help='Require this tag to match release.json')
     parser.add_argument('--identity', default='-', help='Developer ID Application signing identity; omit for ad-hoc')
     parser.add_argument('--notary-profile', help='Explicitly submit the DMG to Apple using this Keychain profile')
-    parser.add_argument('--offline', action='store_true', help='Use integrity-locked pnpm packages and a local PDFium archive')
+    parser.add_argument('--offline', action='store_true', help='Use integrity-locked pnpm packages and, for a DMG, local PDFium')
+    parser.add_argument('--bridge-only', action='store_true', help='Build and test the same public bridge on macOS or Windows')
     parser.add_argument('--pdfium-archive', type=Path, help='Use the SHA-256 pinned PDFium archive from disk')
     parser.add_argument('--clt-only', action='store_true', help='Draft verification on Command Line Tools without XCTest')
-    package(parser.parse_args())
+    options = parser.parse_args()
+    if options.tag and options.tag != f"v{META['version']}":
+        raise SystemExit('Requested tag and release.json version differ.')
+    if options.bridge_only:
+        if options.identity != '-' or options.notary_profile or options.clt_only or options.pdfium_archive:
+            parser.error('macOS app options apply to DMG builds only.')
+        bridge_only(options)
+    else:
+        package(options)

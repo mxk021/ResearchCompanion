@@ -61,3 +61,7 @@ lib/
 *.pem
 *.xcuserstate
 xcuserdata/
+
+!/windows/
+/windows/**/bin/
+/windows/**/obj/

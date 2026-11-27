@@ -431,6 +431,22 @@ test('active PDF path and file version are returned only to a paired, opt-in liv
   assert.equal(body(await read()).liveSelection.pdfFile.path, linked);
   attachment.attachmentPath = 'AAAAlegacyAliasMustNotBeMigrated';
   assert.equal(body(await read()).liveSelection.pdfFile, undefined);
+  f.sandbox.Services.appinfo = {OS:'WINNT'};
+  const windowsPDF = 'C:\\Library\\linked.pdf';
+  f.types.set(windowsPDF, 'regular');
+  f.fileStats.set(windowsPDF, {bytes:12, modifiedMs:1794700000001});
+  attachment.attachmentPath = windowsPDF;
+  assert.equal(body(await read()).liveSelection.pdfFile.path, windowsPDF);
+  for (const invalid of [
+    '\\\\server\\share\\linked.pdf', '\\\\?\\C:\\Library\\linked.pdf',
+    'C:linked.pdf', 'C:\\Library\\..\\linked.pdf', 'C:\\Library\\linked.pdf:stream.pdf'
+  ]) {
+    f.types.set(invalid, 'regular');
+    f.fileStats.set(invalid, {bytes:12, modifiedMs:1794700000001});
+    attachment.attachmentPath = invalid;
+    assert.equal(body(await read()).liveSelection.pdfFile, undefined, invalid);
+  }
+  delete f.sandbox.Services.appinfo;
   attachment.attachmentPath = '/linked/linked.pdf';
   reader._item = {...attachment, key:'DIFF0001'};
   assert.equal(body(await read()).liveSelection.pdfFile, undefined);

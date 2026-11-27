@@ -81,8 +81,16 @@ function localPDF(attachment) {
       ? Zotero.Attachments.resolveRelativePath(raw)
       : raw;
   }
-  if (typeof path !== "string" || !path.startsWith("/") || !/[.]pdf$/i.test(path) ||
+  if (typeof path !== "string" || !/[.]pdf$/i.test(path) ||
       path.length > 4096 || /[\u0000-\u001f\u007f]/.test(path)) return undefined;
+  if (Services.appinfo?.OS === "WINNT") {
+    // Zotero supplies drive-rooted paths on Windows. Leave network shares,
+    // device aliases, alternate streams and parent traversal out of the locator.
+    if (!/^[a-z]:[\\/]/i.test(path) || /[:<>|?*"]/.test(path.slice(2)) ||
+        path.slice(3).split(/[\\/]/).some(part => !part || /[. ]$/.test(part))) return undefined;
+  } else if (!path.startsWith("/")) {
+    return undefined;
+  }
   const file = checkedExistingPath(path, "regular");
   if (!file) return undefined;
   const bytes = file.fileSize;

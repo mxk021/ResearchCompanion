@@ -1,13 +1,17 @@
-# 构建与发布
+# 构建、验收和发布
 
-在 Git 的干净检出目录运行以下命令。从源码重建 v0.3.4 时先检出 `v0.3.4` 标签，开发分支可运行同一脚本。需要 macOS、完整 Xcode（含 SwiftPM、XCTest 和当前 macOS SDK）、Python 3.9 或更新版本、Node 和 pnpm。版本要求见 `package.json`，依赖按 `pnpm-lock.yaml` 安装。首次安装锁定依赖需要访问 npm。构建与测试不需要 DSH 登录或模型额度。
+从干净的 Git 检出目录构建。两个平台从 `release.json` 读取应用版本，共用 `package.json`、`pnpm-lock.yaml`、`src/` 和 `zotero-context-bridge/`。安装包使用同一份科研桥 0.2.9 和 Zotero 扩展 0.1.7。首次安装锁定的构建依赖需要访问对应的包仓库。构建与本地自动化不需要 DSH 登录或模型额度。
+
+## macOS arm64
+
+需要完整 Xcode（含 SwiftPM、XCTest 和当前 macOS SDK）、Python 3.9 或更新版本、Node 24.22.3 和 pnpm 11.25.0。
 
 ```sh
 python3 scripts/release.py
 (cd dist && shasum -a 256 -c *.sha256)
 ```
 
-`release.json` 管理 App 版本、bundle ID 和最低系统版本。打包将同一个三段数字版本写入 macOS 的 `CFBundleShortVersionString` 与 `CFBundleVersion`。从旧整数构建号迁移时，退出 App 后原位替换安装包，在「关于科研助手」核对新版本。科研桥和可选 Zotero 扩展独立维护各自的协议版本。构建当前 CPU 架构的 DMG，根据架构单独验证。当前安装包为 arm64。每次输出到空目标，可用 `--output` 指定其他目录。已有本地 pnpm 缓存的维护者可用 `--offline`。
+`release.json` 同时管理 macOS bundle ID 和最低系统版本。打包将应用版本写入 `CFBundleShortVersionString` 与 `CFBundleVersion`。构建在当前 CPU 架构生成 DMG，根据架构单独验证。候选安装包为 arm64。每次输出到空目标，可用 `--output` 指定其他目录。已有本地 pnpm 缓存的维护者可用 `--offline`。
 
 构建在临时目录编译科研桥和 App，运行 Swift、WebKit、PDF、桥协议和 Zotero 测试，检查 App 签名及架构，实际只读挂载并核对安装盘，再生成 SHA-256。运行 AppKit/WebKit 测试需要可用的 macOS 图形登录会话。没有完整 Xcode 的维护机可用 `--clt-only` 构建社区测试包。该选项跳过 XCTest，记录测试结果时请注明。可用 `SDKROOT` 指定已安装且与编译器匹配的 SDK。这些步骤不向 `/Applications` 安装，不访问个人 DSH 配置或调用任何模型。
 
@@ -53,14 +57,17 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 
 还可使用开发工具把 `scripts/check-public-setup.swift` 与 `Sources/DSHPet/ResearchSetup.swift` 一起编译，并设置 `RC_TEST_SETUP_CHECK` 指向生成的检查程序。此时同一次检查还会校验公开包内置归档和连接设置实际识别的安装或升级状态。
 
-## 发布版本
+## Windows x64
 
-v0.3.4 采用 App 版本号及构建号 `0.3.4`。公开包内的 App 采用 ad hoc 签名，未经 Apple 公证。首次打开可能被 Gatekeeper 拦截，公开包升级或从本机签名包更换为公开包后可能需要重新授予辅助功能权限。常规 CI 只做构建和校验，发布由维护者在仓库中操作。
+使用与 macOS 相同的 Node、pnpm 和共享科研桥构建命令。Windows 打包器读取 `release.json`，把 `0.4.2` 用于产品与安装包，用 `0.4.2.0` 写入 PE 数值版本。原生安装和 WinRT OCR、UI Automation、命名管道等功能需要 Windows 环境验证。[Windows 依赖及构建步骤](../windows/README.md#构建)
 
-1. 核对候选提交、版本标签和构建输入。在审核过的干净检出目录运行 `python3 scripts/audit-source.py --history`，检查暂存区与本地引用可达的提交。另行复核截图、第三方声明，以及 GitHub 上的附件、Actions 日志和产物。
-2. 核对标签指向实际构建提交，并验证原始镜像。脚本的 `--tag` 只检查版本字符串。已有标签的版本保留原提交和原附件，软件实现变更应更新版本并打新标签。
-3. 将通过验证的 DMG 和 `.sha256` 上传到对应 Release。发行说明列出测试环境、签名和公证状态、需另装的宿主、账号要求与实机验收范围。[v0.3.4 发行页](https://github.com/mxk021/ResearchCompanion/releases/tag/v0.3.4)
-4. 发布后以该仓库可见性允许的权限重新下载附件。核对 SHA-256，挂载镜像并验证 App 的版本、架构、签名和安装内容。[GitHub Releases](https://github.com/mxk021/ResearchCompanion/releases)
+## 候选验收与公开发布
+
+`release/v0.4.2` 用于整合与验收。CI 检查 macOS 和 Windows 的原生构建、安装包与校验文件。公开 macOS 构型采用 ad hoc 签名，Windows 构型无 Authenticode 签名。
+
+1. 在候选提交运行 `python3 -B scripts/audit-source.py --history --ref HEAD`，检查暂存树及该提交的可达历史。另行复核第三方许可、包内文件和可公开的 CI 输出。
+2. 公开发布前，核对标签、安装包和校验文件对应同一候选提交。macOS 脚本的 `--tag` 校验版本字符串。已有标签和历史发行附件继续保留。
+3. 由维护者从通过验收的候选建立 Release，并说明签名、公证、外部宿主及实机覆盖范围。公开后重新下载、核对 SHA-256，并验证包内程序和组件。[GitHub Releases](https://github.com/mxk021/ResearchCompanion/releases)
 
 ## 可选的 Developer ID 签名与 Apple 公证
 
