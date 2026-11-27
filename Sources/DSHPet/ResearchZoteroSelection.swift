@@ -1,6 +1,40 @@
 import CryptoKit
 import Foundation
 
+/// A local locator returned only by Zotero's authenticated, active-reader capture.
+struct ResearchZoteroPDF: Decodable, Equatable, Sendable {
+    struct Identity: Codable, Equatable, Sendable {
+        let library: String
+        let attachmentKey: String
+        let attachmentID: Int
+    }
+
+    let library: String
+    let attachmentKey: String
+    let attachmentID: Int
+    let path: String
+    let bytes: Int64
+    let modifiedMs: Int64
+
+    var identity: Identity { Identity(library: library, attachmentKey: attachmentKey, attachmentID: attachmentID) }
+
+    var localURL: URL? {
+        guard path.hasPrefix("/"), path.utf16.count <= 4096, bytes > 0,
+              path.rangeOfCharacter(from: .controlCharacters) == nil,
+              !path.split(separator: "/").contains(where: { $0 == "." || $0 == ".." }) else { return nil }
+        // macOS standardization can remove /private from an existing file's
+        // spelling. Keep the exact locator returned by the authenticated reader.
+        let url = URL(fileURLWithPath: path)
+        return url.pathExtension.lowercased() == "pdf" && url.path == path ? url : nil
+    }
+
+    func matches(_ stamp: ResearchFileReference.FileStamp) -> Bool {
+        guard bytes == stamp.size else { return false }
+        let milliseconds = Double(stamp.modifiedSeconds) * 1_000 + Double(stamp.modifiedNanos / 1_000_000)
+        return abs(milliseconds - Double(modifiedMs)) <= 1
+    }
+}
+
 /// Uses the same owner-only local pairing as the existing DSH bridge. No library records are opened.
 enum ResearchZoteroSelection {
     private struct Pairing: Decodable { let token: String; let endpoint: String? }
@@ -17,6 +51,7 @@ enum ResearchZoteroSelection {
             let title: String
             let capture: Capture?
             let location: ResearchZoteroLocation?
+            let pdfFile: ResearchZoteroPDF?
         }
         let ok: Bool
         let error: String?
@@ -86,6 +121,11 @@ enum ResearchZoteroSelection {
             material.zoteroLocation = .init(library: location.library, attachmentKey: location.attachmentKey,
                                             pageIndex: pageIndex, pageLabel: verifiedLabel)
             material.page = verifiedLabel
+            if capture.method != "document-dom", let file = selection.pdfFile,
+               file.library == location.library, file.attachmentKey == capture.attachmentKey,
+               file.attachmentID == capture.attachmentID, file.localURL != nil {
+                material.zoteroPDF = file
+            }
         }
         return material
     }
@@ -107,6 +147,7 @@ enum ResearchZoteroSelection {
         let url = URL(string: "http://127.0.0.1:\(port)/dsh-companion/context?selection=live&requestId=\(requestID.uuidString.lowercased())")!
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 2)
         request.setValue("Bearer " + proof + "." + signature, forHTTPHeaderField: "Authorization")
+        request.setValue("1", forHTTPHeaderField: "X-Research-Companion-Local-PDF")
         let config = URLSessionConfiguration.ephemeral
         config.httpShouldSetCookies = false
         config.urlCredentialStorage = nil

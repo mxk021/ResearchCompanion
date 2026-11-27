@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
 
 // Node 24 runs the pure TypeScript source directly; no bundled test-only copy.
-import { decodeResearchHistory } from '../src/ResearchHistory.ts'
+import { decodeResearchHistory, projectResearchHistory } from '../src/ResearchHistory.ts'
 import { researchPrompt } from '../src/ResearchContext.ts'
 
 const user = (id, text, kind = 'user') => ({ id, content: [{ type: 'text', text }], source: { kind, rpcId: `request-${id}` } })
@@ -144,4 +144,55 @@ test('a clipped or ambiguous turn does not assign another prompt as a source', (
   for (const prefix of [questions, [event(2, 'turn/start', { turn: 1 }), ...questions]]) {
     assert.equal(decodeResearchHistory([...prefix, current]).at(-1).reply, undefined)
   }
+})
+
+test('prepared research turns display and copy only the user question', () => {
+  const question = '概括论文。\n\n【用户问题】\n这是问题的一部分。'
+  const context = { key: 'example', title: 'Example', text: 'Verified excerpt.', available: true }
+  const preparation = 'Internal preparation\n\n【用户问题】\nDo not expose'
+  const prompt = user('guided', researchPrompt(question, 'ask', context, 'Persona', undefined, preparation))
+  prompt.source.rpcId = 'dsh-pet-00000000-0000-0000-0000-000000000001'
+  const result = answer(4, 'result', 'Matched answer')
+  result.event.data.turn = 1
+  for (const records of [[splice(1, 'next-turn', 0, undefined, [prompt])],
+    [event(2, 'turn/start', { turn: 1 }), event(3, 'user/message', prompt), result]]) {
+    const decoded = decodeResearchHistory(records)
+    assert.deepEqual(decoded[0], { role: 'user', id: 'guided', text: question, plainQuestion: true })
+    assert.equal(JSON.stringify(decoded).includes('Internal preparation'), false)
+    if (decoded[1]) assert.equal(decoded[1].reply.material.text, 'Verified excerpt.')
+  }
+})
+
+test('background PDF turns stay out of history and ordered translations share one answer', () => {
+  const batch = { id: '46e05000-1234-4000-8000-38717c5900ff', count: 2 }
+  const question = '请翻译全部。'
+  const part = (seq, stage, index, content, finish = 'completed') => {
+    const id = 'dsh-pet-00000000-0000-0000-0000-00000000000' + index
+    const material = { key: 'segment-' + index, title: 'Example', text: 'Original page ' + index, available: true }
+    const prompt = user('part-' + index, researchPrompt(question, 'ask', material, 'Persona', undefined,
+      'Internal processing', { ...batch, stage, index }))
+    prompt.source.rpcId = id
+    const reply = answer(seq + 3, 'reply-' + index, content)
+    reply.event.data.turn = seq
+    return [
+      splice(seq, 'next-turn', 0, undefined, [prompt]), event(seq + 1, 'turn/start', { turn: seq }),
+      event(seq + 2, 'user/message', prompt), reply, event(seq + 4, 'turn/end', { reason: { kind: finish } }),
+    ]
+  }
+  const preparation = part(1, 'work', 1, 'Internal reply')
+  const first = part(10, 'translation', 1, '第一段。')
+  const second = part(20, 'translation', 2, '第二段。')
+  const requestId = 'dsh-pet-00000000-0000-0000-0000-000000000002'
+  assert.deepEqual(decodeResearchHistory(preparation), [])
+  const incomplete = projectResearchHistory([...preparation, ...first, ...second.slice(0, -1)], requestId)
+  assert.equal(incomplete.messages[1].text, '第一段。\n\n已取得 1/2 段翻译。')
+  assert.equal(incomplete.completedPart, undefined)
+  const complete = projectResearchHistory([...preparation, ...first, ...second], requestId)
+  assert.equal(complete.messages.length, 2)
+  assert.equal(complete.messages[0].text, question)
+  assert.equal(complete.messages[1].text, '第一段。\n\n第二段。')
+  assert.equal(complete.messages[1].reply.material.text, 'Original page 1')
+  assert.deepEqual(complete.completedPart, {requestId, text: '第二段。'})
+  const clipped = decodeResearchHistory(second)
+  assert.equal(clipped[1].text, '第二段。\n\n已取得 1/2 段翻译。')
 })

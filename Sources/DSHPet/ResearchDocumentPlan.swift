@@ -33,8 +33,10 @@ struct ResearchDocumentPlan: Decodable {
     }
 
     func read(index: ResearchPDFIndex, question input: String, selection: ResearchMaterial?,
-              requireSelection: Bool, verifiedFeedback: String? = nil, chosenRangeID: String? = nil) throws -> [ResearchMaterial] {
+              requireSelection: Bool, verifiedFeedback: String? = nil, chosenRangeID: String? = nil,
+              allowsPartialEvidence: Bool = false) throws -> [ResearchMaterial] {
         try Task.checkCancellation()
+        let partial = allowsPartialEvidence && ResearchPDFRequest(input).allowsPartialEvidence
         switch action {
         case .range:
             func grounded(_ anchor: String?) -> String? {
@@ -56,19 +58,21 @@ struct ResearchDocumentPlan: Decodable {
                                        selectionHint: selection?.text, chosenRangeID: chosenRangeID)
         case .pages:
             guard let pages = try pageRange(in: index) else { throw ResearchMaterialError.message("缺少所请求的文件页序。") }
-            let result = try index.readPages(pages)
+            let result = try index.readPages(pages, allowsPartialEvidence: partial)
             if requireSelection, let selection {
                 guard result.count == 1 else { throw ResearchMaterialError.message("所选页段与选区合计过长，请缩小对照页段。") }
                 return [try selection.withBackgroundEvidence(result[0])]
             }
             return result
-        case .whole: return try index.segments()
+        case .whole: return try index.segments(allowsPartialEvidence: partial)
         case .search, .combined:
             guard let query, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw ResearchMaterialError.message("模型没有给出可执行的检索词。")
             }
             let combined = requireSelection || action == .combined
-            let evidence = try index.searchEvidence(query, selection: combined ? selection.map { String($0.text.prefix(1200)) } : nil)
+            let evidence = try index.searchEvidence(query,
+                selection: combined ? selection.map { String($0.text.prefix(1200)) } : nil,
+                allowsPartialEvidence: partial)
             if combined {
                 guard let selection else { throw ResearchMaterialError.message("本次没有可对照的选区。") }
                 return [try selection.withBackgroundEvidence(evidence)]
@@ -87,8 +91,16 @@ struct ResearchDocumentPlan: Decodable {
 
     /// Evidence from two independent searches stays labelled as excerpts, including all corresponding source positions.
     static func accumulated(_ prior: ResearchMaterial?, _ next: ResearchMaterial) throws -> ResearchMaterial {
-        guard let prior, prior.text != next.text, prior.source == "PDF 文件", next.source == prior.source,
+        guard let prior, prior.source == "PDF 文件", next.source == prior.source,
               prior.fileReference == next.fileReference else { return next }
+        let checks = (prior.evidenceChecks ?? []) + (next.evidenceChecks ?? []).filter {
+            prior.evidenceChecks?.contains($0) != true
+        }
+        if prior.text == next.text {
+            var material = next
+            material.evidenceChecks = checks.isEmpty ? nil : checks
+            return material
+        }
         let prefix = prior.text + "\n\n【追加查阅】\n"
         let text = prefix + next.text
         guard text.utf16.count <= ResearchMaterial.maximumLength else {
@@ -97,10 +109,14 @@ struct ResearchDocumentPlan: Decodable {
         let positions = (prior.pdfPositions ?? []) + (next.pdfPositions ?? [])
         let pages = ResearchPDFIndex.pageList(positions.map(\.page))
         let excerpts = (prior.verifiedExcerpts ?? []) + (next.verifiedExcerpts ?? []).map { $0.shifted(by: prefix.utf16.count) }
+        let missing = checks.filter { $0.status != .verified }.map(\.target)
+        let scope = "两次检索所得的独立摘录 · 文件页 " + pages +
+            (missing.isEmpty ? "" : " · 部分证据 · 缺失：" + missing.joined(separator: "、"))
         return ResearchMaterial(source: next.source, title: next.title, text: text,
-                                scope: "两次检索所得的独立摘录 · 文件页 " + pages,
+                                scope: ResearchMaterial.bounded(scope, limit: 512),
                                 fileReference: next.fileReference, pdfPages: pages, pdfPositions: positions,
-                                verifiedExcerpts: excerpts.isEmpty ? nil : excerpts)
+                                verifiedExcerpts: excerpts.isEmpty ? nil : excerpts,
+                                evidenceChecks: checks.isEmpty ? nil : checks)
     }
 }
 

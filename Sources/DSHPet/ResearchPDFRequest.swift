@@ -26,15 +26,17 @@ struct ResearchPDFRequest: Sendable {
     let requiresObjectRelationship: Bool
     let requiresProseDefinitions: Bool
     let requestsAdjacentDefinitions: Bool
+    let allowsPartialEvidence: Bool
     let output: Output
 
     var requestedSymbols: [String] { symbolRequirements.map(\.name) }
 
-    init(_ question: String, address parsedAddress: ResearchPDFAddress? = nil) {
+    init(_ question: String, address parsedAddress: ResearchPDFAddress? = nil, includingUserImages: Bool = false) {
         self.question = question
         let address = parsedAddress ?? ResearchPDFAddress.parse(question)
         self.address = address
-        let instruction = Self.outsidePassage(question, address: address)
+        let requested = Self.outsidePassage(question, address: address)
+        let instruction = includingUserImages ? Self.documentInstruction(requested) : requested
         objects = address.addressesPassage ? [] : ResearchPDFObjectID.addresses(in: instruction)
         untypedObjects = address.addressesPassage || !objects.isEmpty
             ? [] : ResearchPDFObjectID.untypedEquationList(in: instruction)
@@ -74,6 +76,16 @@ struct ResearchPDFRequest: Sendable {
             captionOnly: !address.addressesPassage && caption &&
                 (limitsCaption || !asksForGraphic && (action == .quote || action == .translate)),
             preserveFormulae: Self.matches(#"(?:保留|包含|包括)[^。！？]{0,12}(?:公式|原式)|(?:公式|原式)[^。！？]{0,8}(?:保留|也要)|\b(?:include|preserve)\s+(?:the\s+)?(?:equations?|formulae|formulas)\b"#, instruction))
+        // Discussion can use independently mapped excerpts. Exact spans,
+        // specified objects and formula/definition tasks keep their stronger
+        // evidence requirements even when called "analysis".
+        allowsPartialEvidence = action != .translate && action != .quote && unit == .passage &&
+            !address.addressesPassage && objects.isEmpty && untypedObjects.isEmpty && !definesSymbols &&
+            ResearchPDFAddress.paragraphs(in: instruction) == nil &&
+            ResearchPDFAddress.explicitSection(instruction) == nil && !Self.matches(ResearchPDFAddress.columns, instruction) &&
+            !Self.matches(#"不要(?:总结|分析)|无需(?:总结|分析)|必须完整|不得遗漏|不遗漏|逐页|逐条|精确引用|准确引用|只(?:给|要|看)原文|原文引用|公式|原式|方程|算式|推导|变量|正则式|等式|不等式|定理|引理|\b(?:do not|don.t)\s+(?:summari[sz]e|analy[sz]e)\b|\b(?:formulae?|formulas|equations?|derivations?|variables?|theorems?|lemmas?|proof|verbatim|without omissions)\b"#,
+                          instruction)
+
     }
 
     /// A general search can supply useful excerpts without authenticating the
@@ -94,6 +106,21 @@ struct ResearchPDFRequest: Sendable {
 
     private static func matches(_ pattern: String, _ text: String) -> Bool {
         ResearchPDFAddress.captures(pattern, in: text) != nil
+    }
+
+    private static func documentInstruction(_ instruction: String) -> String {
+        // A standalone instruction about a user's picture cannot set the
+        // precision required of the PDF text. Mixed or ambiguous clauses keep
+        // the original checks, and the model still receives the full question.
+        let separated = instruction.replacingOccurrences(of: #"(?<=\.)\s+(?=[A-Z])"#, with: "\n", options: .regularExpression)
+        let clauses = separated.split { "。！!？?；;\n".contains($0) }
+        let document = clauses.map(String.init).filter { clause in
+            let userImage = matches(#"用户(?:提供的?|附加的?)?(?:附图|图片|图像|截屏|截图)|(?:本轮|随附|上传|附加|提供)(?:的|过的)?(?:附图|图片|图像|截屏|截图)|\b(?:attached|uploaded|user[- ]provided)\s+(?:images?|photos?|pictures?|screenshots?)\b"#, clause)
+            let otherSource = matches(#"原文|论文|本文|文献|文档|文件|选区|页码|第\s*\d+\s*页|\b(?:PDF|paper|document|excerpt|selection|source\s+text|pages?\s*\d+)\b"#, clause)
+            return !userImage || otherSource
+        }
+        if document.isEmpty || document.count == clauses.count { return instruction }
+        return document.joined(separator: "\n")
     }
 
     private static func outsidePassage(_ question: String, address: ResearchPDFAddress) -> String {

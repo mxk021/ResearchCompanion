@@ -122,7 +122,7 @@ enum ResearchProtocol {
                   let text = row["text"] as? String else { throw ResearchProtocolError.malformed }
             // The JSON excerpt can itself contain the marker as ordinary text.
             // A raw newline-delimited marker can only be emitted by the bridge.
-            let question = role == "user" ? (
+            let question = role == "user" && row["plainQuestion"] as? Bool != true ? (
                 text.range(of: "\n\n【用户问题】\n") ??
                     (text.contains("\n【原文】") ? text.range(of: "\n【用户问题】") : nil)
             ) : nil

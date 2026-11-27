@@ -17,7 +17,9 @@ python3 scripts/release.py
 
 打包时按可执行文件架构获取 PDFium 8165 的发布档，并使用 `scripts/pdfium_bundle.py` 中的固定 SHA-256 校验。可用 `--pdfium-archive <发布档路径>` 复用已经下载的同架构档案。`scripts/release.py --offline` 使用这项参数与本地 pnpm 缓存。App 运行、读取论文和裁图均在本机进行。[PDFium 发布档及许可](THIRD_PARTY.md)
 
-如果只更新本机 Zotero 选区扩展，在项目根目录运行 `python3 zotero-context-bridge/build.py --output <暂存目录>/research-companion-context-0.1.6.xpi`。通过 Zotero 插件管理器安装同标识的新版后，可以删除暂存 XPI。
+如果只更新本机 Zotero 选区扩展，在项目根目录运行 `python3 zotero-context-bridge/build.py --output <暂存目录>/research-companion-context-0.1.7.xpi`。通过 Zotero 插件管理器安装同标识的新版后，可以删除暂存 XPI。0.1.7 向已配对的科研助手提供当前打开的本地 PDF 版本信息，用于取词后自动建立全文索引。较早扩展仍可取词。
+
+0.4.1 的 PDF、选区与图片联合问答需要支持 `researchUserImages` 的科研桥 0.2.7，以及明确支持图片的会话模型。原页裁图和用户附图共用单轮附件限额，并各自保留用途标识。材料超出限额时保留草稿，请减少附图或缩小问题范围。
 
 文献验证可把 `scripts/check-paper-sample.swift` 与 App 的 Swift 源一同编译，排除 `DSHPetMain.swift`，通过正常打包脚本组装成临时 App。以命令行运行 App 内可执行文件，传入获准使用的 PDF、题目和空的临时输出目录。核对原页、提取文字、裁图和来源坐标；区分自动结果与人工复查。提交复现时使用合成材料，临时 PDF 和裁图可在验收后清理。
 

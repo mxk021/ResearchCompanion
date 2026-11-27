@@ -230,11 +230,25 @@ struct ResearchComposerView: View {
 
     private var composer: some View {
         VStack(spacing: 3) {
+            if !command.draftImages.isEmpty {
+                ScrollView(.horizontal) {
+                    HStack(spacing: 8) {
+                        ForEach(command.draftImages) { image in
+                            ResearchDraftImagePreview(image: image, palette: palette, canRemove: command.canEditDraftImages) {
+                                command.removeDraftImage(image.id)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                }
+                .scrollIndicators(.hidden)
+                .padding(.top, 5)
+            }
             DSHPetTextView(text: $command.draft, command: command, selectedSkillPrefix: $command.selectedSkillPrefix,
                 measuredHeight: Binding(get: { model.composerInputHeight }, set: { model.setComposerInputHeight($0) }),
                 placeholder: "输入问题",
                 onSubmit: { command.submitResearch() }, onEscape: { model.collapseComposer(reason: .textEscape) },
-                focusRequest: model.composerFocusRequest)
+                focusRequest: model.composerFocusRequest, acceptsImageAttachments: true)
                 .frame(height: max(54, model.composerInputHeight))
                 .padding(.horizontal, 4)
             HStack(alignment: .center) {
@@ -252,6 +266,13 @@ struct ResearchComposerView: View {
                         .controlSize(.small)
                         .help("先核对历史。此操作只清除待核对状态，已被接收的请求仍可继续。")
                 }
+                Button { chooseImages() } label: {
+                    Image(systemName: "photo")
+                }
+                .buttonStyle(ResearchToolbarButton(filled: true))
+                .disabled(!command.canImportDraftImages)
+                .accessibilityLabel("附加图片")
+                .accessibilityHint("选择图片，也可将图片拖入输入区或粘贴。")
                 Button { command.submitResearch() } label: {
                     Label("发送", systemImage: "arrow.up")
                         .font(.system(size: 12, weight: .semibold))
@@ -272,7 +293,23 @@ struct ResearchComposerView: View {
         }
     }
 
+    private func chooseImages() {
+        guard command.canImportDraftImages, command.beginResearchFileChoice() else { return }
+        let panel = NSOpenPanel()
+        panel.message = "选择要带入本轮问题的图片。"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = ResearchDraftImageInput.contentTypes
+        let finish: (NSApplication.ModalResponse) -> Void = { response in
+            command.finishDraftImageChoice(response == .OK ? panel.urls : [])
+        }
+        if let parent = NSApp.keyWindow { panel.beginSheetModal(for: parent, completionHandler: finish) }
+        else { panel.begin(completionHandler: finish) }
+    }
+
     private var statusText: String? {
+        if command.importingDraftImages { return "正在准备图片预览…" }
         if command.submissionStatus == .submitting { return "正在准备或提交请求…" }
         if command.hasPendingSubmission, command.submissionStatus == .unconfirmed || !command.pdfRequestRunning {
             return "提交结果未确认。请先刷新对话，核对后再继续。"
@@ -284,9 +321,9 @@ struct ResearchComposerView: View {
             return command.conversationStream?.text.isEmpty == false ? "正在输出回答…" : "已提交 · 等待模型回复…"
         }
         if command.pdfRequestRunning { return command.pdfRequestStatus ?? "正在准备原文…" }
-        if command.submissionStatus == .submitted { return "已提交" }
+        if command.submissionStatus == .submitted, command.draftImages.isEmpty { return "已提交" }
         return command.continuationWarning ?? command.lastError ?? command.pdfRequestStatus
-            ?? command.submissionStatus.label ?? command.busyMessage
+            ?? command.draftImageSendIssue ?? command.submissionStatus.label ?? command.busyMessage
             ?? command.conversationError.map { "会话错误：\($0)" }
     }
 
@@ -305,6 +342,53 @@ struct ResearchComposerView: View {
         }
         .font(.system(size: 11)).foregroundStyle(palette.secondary)
         .padding(.trailing, 8) // Space for the native resize grip outside links.
+    }
+}
+
+private struct ResearchDraftImagePreview: View {
+    let image: DSHPetDraftImage
+    let palette: ResearchPalette
+    let canRemove: Bool
+    let remove: () -> Void
+    @State private var thumbnail: NSImage?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ZStack(alignment: .topTrailing) {
+                RoundedRectangle(cornerRadius: 8).fill(palette.rail)
+                if let thumbnail {
+                    Image(nsImage: thumbnail)
+                        .resizable().scaledToFit()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityLabel("图片预览：\(image.name)")
+                } else {
+                    Image(systemName: "photo")
+                        .foregroundStyle(palette.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityHidden(true)
+                }
+                Button(action: remove) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14, weight: .semibold))
+                        .padding(4)
+                        .foregroundStyle(Color.primary, palette.raised)
+                }
+                .buttonStyle(.plain)
+                .disabled(!canRemove)
+                .accessibilityLabel("移除图片：\(image.name)")
+            }
+            .frame(width: 90, height: 59)
+            .clipShape(.rect(cornerRadius: 8))
+            Text(image.name)
+                .font(.system(size: 10)).foregroundStyle(palette.secondary)
+                .lineLimit(1).truncationMode(.middle).frame(width: 90, alignment: .leading)
+        }
+        .task(id: image.id) {
+            let url = image.fileURL
+            let preview = await Task.detached(priority: .userInitiated) { ResearchDraftImageInput.preview(at: url) }.value
+            guard !Task.isCancelled, let preview else { return }
+            thumbnail = NSImage(cgImage: preview, size: .zero)
+        }
     }
 }
 

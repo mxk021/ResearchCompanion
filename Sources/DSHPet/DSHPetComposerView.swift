@@ -307,6 +307,7 @@ struct DSHPetTextView: NSViewRepresentable {
     let onSubmit: () -> Void
     let onEscape: () -> Void
     let focusRequest: Int
+    var acceptsImageAttachments = false
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -337,6 +338,19 @@ struct DSHPetTextView: NSViewRepresentable {
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
         scroll.documentView = textView
+        if acceptsImageAttachments {
+            let coordinator = context.coordinator
+            textView.imagePasteboardTypes = ResearchDraftImageInput.pasteboardTypes
+            textView.imagePasteboardHandler = { [weak coordinator] board in
+                coordinator?.parent.command.addImageFromPasteboard(board) ?? false
+            }
+            textView.imageDragOperation = { [weak coordinator] board in
+                guard let coordinator, ResearchDraftImageInput.hasImage(on: board) else { return nil }
+                return coordinator.parent.command.canImportDraftImages ? .copy : []
+            }
+            let existing = textView.registeredDraggedTypes
+            textView.registerForDraggedTypes(existing + textView.imagePasteboardTypes.filter { !existing.contains($0) })
+        }
 
         DispatchQueue.main.async {
             scroll.window?.makeFirstResponder(textView)

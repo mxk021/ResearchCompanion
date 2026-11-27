@@ -20,6 +20,8 @@ struct ResearchMaterial: Equatable, Sendable {
     var fileReference: ResearchFileReference? = nil
     var localWebURL: String? = nil
     var zoteroLocation: ResearchZoteroLocation? = nil
+    // Captured for local attachment binding only. It is never a bridge field.
+    var zoteroPDF: ResearchZoteroPDF? = nil
     var selectionIsComplete = false
     var pdfIndex: ResearchPDFIndex? = nil
     var pdfPages: String? = nil
@@ -106,7 +108,9 @@ struct ResearchMaterial: Equatable, Sendable {
             throw ResearchMaterialError.message("完整选区与相关文件摘录合计超出单次材料上限。请缩小选区或单独提问。")
         }
         let origin = reviewedOrder ? "经用户对照采用的候选顺序。 " : ""
-        let scope = Self.bounded(origin + "主要来源为" + source + "选区；另附会话文件「" + background.title + "」" + range + "的相关摘录。", limit: 512)
+        let gaps = (background.evidenceChecks ?? []).filter { $0.status != .verified }
+        let coverage = gaps.isEmpty ? "" : "部分文件证据 · 缺失：" + Self.bounded(gaps.map(\.target).joined(separator: "、"), limit: 260) + "。"
+        let scope = Self.bounded(origin + coverage + "主要来源为" + source + "选区；另附会话文件「" + background.title + "」" + range + "的相关摘录。", limit: 512)
         let excerpts = (verifiedExcerpts ?? []).map { $0.shifted(by: selectionHeading.utf16.count) }
             + (background.verifiedExcerpts ?? []).map { $0.shifted(by: prefix.utf16.count, kind: .context) }
         return Self(id: id, source: "选区与会话文件", title: title, text: body, scope: scope, url: url, page: page,

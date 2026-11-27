@@ -82,12 +82,28 @@ extension ResearchPDFIndex {
         return .message((whole ? "无法核验整个文件。" : "所问页段不完整。") + "文件第 \(Self.pageList(missing)) 页缺少可核对的正文。" + next)
     }
 
+    private struct LocalVerificationGap: LocalizedError {
+        let page: Int
+        let block: Int
+        let reason: String
+        var errorDescription: String? {
+            "文件第 \(page) 页第 \(block) 块无法可靠核验：\(reason)。已保留问题，请在原 PDF 核对。"
+        }
+    }
+
+    private struct Verification {
+        var slices: [ResearchPDFSlice] = []
+        var omitted: [Int: Set<Int>] = [:]
+    }
+
     /// Validate the exact UTF-16 intersections, not every expression and diagram on the page.
     /// An unplaced glyph can belong anywhere; an old index without local geometry stays fail-closed.
+    @discardableResult
     private func verified(_ slices: [ResearchPDFSlice], scope: String, limit: Int, independent: Bool = false,
-                          requestCheck: ResearchPDFEvidenceCheck? = nil) throws {
+                          requestCheck: ResearchPDFEvidenceCheck? = nil, skipLocalGaps: Bool = false) throws -> Verification {
         guard !slices.isEmpty else { throw ResearchMaterialError.message("没有可核对的目标正文。") }
         var reviewPages = Set<Int>()
+        var verification = Verification()
         var lineCount = 0
         var visionPage: PDFDocument?
         var visionOpened = false
@@ -147,70 +163,83 @@ extension ResearchPDFIndex {
             try Task.checkCancellation()
             let entry = corpus.entries[slice.entry]
             let page = pages[entry.page - 1], block = page.blocks[entry.block]
-            func unavailable(_ detail: String) -> ResearchMaterialError {
-                .message("文件第 \(entry.page) 页第 \(entry.block + 1) 块无法可靠核验：\(detail)。已保留问题，请在原 PDF 核对。")
+            func unavailable(_ detail: String) -> LocalVerificationGap {
+                .init(page: entry.page, block: entry.block + 1, reason: detail)
             }
-            guard page.reliableOrder || page.hasLocalOrderMap else {
-                throw unavailable("存在无法定位的文字或版面缺少局部坐标")
-            }
-            var selectedLines = 0
-            var localAmbiguity = false
-            let lines = selected[sliceIndex]
-            for (lineIndex, line) in lines.enumerated() {
-                lineCount += 1
-                selectedLines += 1
-                guard line.reliable, !line.bounds.isEmpty, !line.bounds.isInfinite else {
-                    throw unavailable("选中行的字形位置或文字识别置信度不足")
+            do {
+                guard page.reliableOrder || page.hasLocalOrderMap else {
+                    throw unavailable("存在无法定位的文字或版面缺少局部坐标")
                 }
-                if page.state == .needsOCR && !ResearchMaterial.hasReadableText(line.text) {
-                    throw unavailable("请求范围内含无法从文字层核对的原始字形")
-                }
-                if !page.reliableOrder || !block.reliable || line.orderUncertain || line.regionVerified == false {
-                    guard page.hasLocalOrderMap else { throw unavailable("当前块缺少独立的局部核验") }
-                    if line.ocr {
-                        // A recognised string cannot prove an uncertain geometric sequence or
-                        // that two overlapping OCR regions cover all underlying words.
-                        throw unavailable("OCR 行缺少可交叉核对的文字层")
+                var selectedLines = 0
+                var localAmbiguity = false
+                let lines = selected[sliceIndex]
+                for (lineIndex, line) in lines.enumerated() {
+                    lineCount += 1
+                    selectedLines += 1
+                    guard line.reliable, !line.bounds.isEmpty, !line.bounds.isInfinite else {
+                        throw unavailable("选中行的字形位置或文字识别置信度不足")
                     }
-                    var joined = false
-                    if line.orderUncertain && requestCheck != nil {
-                        if lineIndex > 0 {
-                            joined = try confirmsSplitRow(lines[lineIndex - 1], entry: entry, line, nextEntry: entry, page: page)
-                        } else if sliceIndex > 0, let before = selected[sliceIndex - 1].last {
-                            joined = try confirmsSplitRow(before, entry: corpus.entries[slices[sliceIndex - 1].entry],
-                                                          line, nextEntry: entry, page: page)
-                        }
-                        if !joined, lineIndex + 1 < lines.count {
-                            joined = try confirmsSplitRow(line, entry: entry, lines[lineIndex + 1], nextEntry: entry, page: page)
-                        } else if !joined, lineIndex + 1 == lines.count, sliceIndex + 1 < slices.count,
-                                  let after = selected[sliceIndex + 1].first {
-                            joined = try confirmsSplitRow(line, entry: entry, after,
-                                nextEntry: corpus.entries[slices[sliceIndex + 1].entry], page: page)
-                        }
+                    if page.state == .needsOCR && !ResearchMaterial.hasReadableText(line.text) {
+                        throw unavailable("请求范围内含无法从文字层核对的原始字形")
                     }
-                    if !joined && (line.regionVerified == false || line.regionVerified != true && (line.orderUncertain || !page.reliableOrder)) {
-                        if try !confirmGlyphs(line.text, bounds: line.bounds, on: page) {
-                            // OCR may verify a glyph, but does not determine the
-                            // order of overlapping regions on a typeset page.
-                            if requestCheck != nil, line.orderUncertain, page.geometry != nil {
-                                throw unavailable("两套文字层对选中行的字形或顺序未能取得一致结果")
+                    if !page.reliableOrder || !block.reliable || line.orderUncertain || line.regionVerified == false {
+                        guard page.hasLocalOrderMap else { throw unavailable("当前块缺少独立的局部核验") }
+                        if line.ocr {
+                            // A recognised string cannot prove an uncertain geometric sequence or
+                            // that two overlapping OCR regions cover all underlying words.
+                            throw unavailable("OCR 行缺少可交叉核对的文字层")
+                        }
+                        var joined = false
+                        if line.orderUncertain && requestCheck != nil {
+                            if lineIndex > 0 {
+                                joined = try confirmsSplitRow(lines[lineIndex - 1], entry: entry, line, nextEntry: entry, page: page)
+                            } else if !skipLocalGaps, sliceIndex > 0, let before = selected[sliceIndex - 1].last {
+                                joined = try confirmsSplitRow(before, entry: corpus.entries[slices[sliceIndex - 1].entry],
+                                                              line, nextEntry: entry, page: page)
                             }
-                            guard remainingVisionChecks > 0 else { throw unavailable("待核对的行超出本次局部复核上限") }
-                            remainingVisionChecks -= 1
-                            if !visionOpened {
-                                visionOpened = true
-                                visionPage = reference.verifiedPDF().flatMap { PDFDocument(data: $0.1) }
-                            }
-                            guard let original = visionPage?.page(at: entry.page - 1),
-                                  try Self.confirmNativeLineByOCR(line, page: original) else {
-                                throw unavailable("局部选区、原生文字与页面字形未能取得一致结果")
+                            if !joined, lineIndex + 1 < lines.count {
+                                joined = try confirmsSplitRow(line, entry: entry, lines[lineIndex + 1], nextEntry: entry, page: page)
+                            } else if !skipLocalGaps, !joined, lineIndex + 1 == lines.count, sliceIndex + 1 < slices.count,
+                                      let after = selected[sliceIndex + 1].first {
+                                joined = try confirmsSplitRow(line, entry: entry, after,
+                                    nextEntry: corpus.entries[slices[sliceIndex + 1].entry], page: page)
                             }
                         }
+                        if !joined && (line.regionVerified == false || line.regionVerified != true && (line.orderUncertain || !page.reliableOrder)) {
+                            if try !confirmGlyphs(line.text, bounds: line.bounds, on: page) {
+                                // OCR may verify a glyph, but does not determine the
+                                // order of overlapping regions on a typeset page.
+                                if requestCheck != nil, line.orderUncertain, page.geometry != nil {
+                                    throw unavailable("两套文字层对选中行的字形或顺序未能取得一致结果")
+                                }
+                                guard remainingVisionChecks > 0 else { throw unavailable("待核对的行超出本次局部复核上限") }
+                                remainingVisionChecks -= 1
+                                if !visionOpened {
+                                    visionOpened = true
+                                    visionPage = reference.verifiedPDF().flatMap { PDFDocument(data: $0.1) }
+                                }
+                                guard let original = visionPage?.page(at: entry.page - 1),
+                                      try Self.confirmNativeLineByOCR(line, page: original) else {
+                                    throw unavailable("局部选区、原生文字与页面字形未能取得一致结果")
+                                }
+                            }
+                        }
+                        if line.orderUncertain && !joined { localAmbiguity = true }
                     }
-                    if line.orderUncertain && !joined { localAmbiguity = true }
                 }
+                if localAmbiguity && (!independent || selectedLines > 1) {
+                    if skipLocalGaps { throw unavailable("相邻文字的顺序有歧义") }
+                    reviewPages.insert(entry.page)
+                }
+                if skipLocalGaps {
+                    guard selectedLines > 0, sourcePositions(entry: entry, local: slice.range).isEmpty == false else {
+                        throw unavailable("原文片段未能映射到原页")
+                    }
+                    verification.slices.append(slice)
+                }
+            } catch let gap as LocalVerificationGap where skipLocalGaps {
+                verification.omitted[gap.page, default: []].insert(gap.block)
             }
-            if localAmbiguity && (!independent || selectedLines > 1) { reviewPages.insert(entry.page) }
         }
         // An exact quotation wholly inside one geometrically confirmed line involves no inter-line ordering.
         if !reviewPages.isEmpty && lineCount > 1 {
@@ -219,6 +248,93 @@ extension ResearchPDFIndex {
             let candidates = try materials(slices, scope: scope + " · 经用户对照采用的候选顺序", limit: limit,
                                            independent: independent, requestCheck: tentative)
             throw ResearchPDFReviewRequired(reason: reason, pages: reviewPages.sorted(), materials: candidates)
+        }
+        if !skipLocalGaps { verification.slices = slices }
+        return verification
+    }
+
+    /// Keep omissions out of the submitted text. Only original lines whose
+    /// geometry and glyph checks passed can enter the usual materials path.
+    private func synthesisMaterials(_ slices: [ResearchPDFSlice], expectedPages: Set<Int>,
+                                    scope: String, limit: Int, independent: Bool = false,
+                                    requirePageCoverage: Bool = true, relevantEntries: Set<Int>? = nil,
+                                    requestCheck: ResearchPDFEvidenceCheck? = nil) throws -> [ResearchMaterial] {
+        let unreadable = unavailable.intersection(expectedPages)
+        let candidates = slices.filter { !unreadable.contains(corpus.entries[$0.entry].page) }
+        guard !candidates.isEmpty else {
+            if !unreadable.isEmpty { throw missingPages(Array(unreadable), whole: false) }
+            throw ResearchMaterialError.message("未取得可核验的正文。本次未发送。")
+        }
+        let result = try verified(candidates, scope: scope, limit: limit, independent: independent,
+                                  requestCheck: requestCheck, skipLocalGaps: true)
+        if unreadable.isEmpty, result.omitted.isEmpty {
+            return try materials(result.slices, scope: scope, limit: limit, independent: independent,
+                                 requestCheck: requestCheck)
+        }
+
+        // A verified text line can still be only the numerator of a displayed
+        // equation. Partial synthesis uses prose and captions; standalone math
+        // belongs to the whole, visually checked object path.
+        var equationBlocks: [Int: Set<Int>] = [:]
+        for (id, matches) in objects.objects where id.kind == .equation {
+            for equation in matches where expectedPages.contains(equation.page) {
+                guard let region = equation.visual?.bounds else { continue }
+                for line in equation.primary {
+                    guard let number = line.position.blockIndex,
+                          region.contains(pages[equation.page - 1].blocks[number].bounds) else { continue }
+                    equationBlocks[equation.page, default: []].insert(number)
+                }
+            }
+        }
+        var omittedEquations: [Int: Set<Int>] = [:]
+        let preserved = result.slices.filter {
+            let entry = corpus.entries[$0.entry]
+            let block = pages[entry.page - 1].blocks[entry.block]
+            if block.kind == .formula || equationBlocks[entry.page]?.contains(entry.block) == true {
+                omittedEquations[entry.page, default: []].insert(entry.block + 1)
+                return false
+            }
+            return true
+        }
+        let body = preserved.filter {
+            let entry = corpus.entries[$0.entry]
+            return pages[entry.page - 1].blocks[entry.block].kind == .body
+        }
+        let bodyPages = Set(body.map { corpus.entries[$0.entry].page })
+        let bodyLength = body.reduce(0) { count, slice in
+            let text = (corpus.entries[slice.entry].text as NSString).substring(with: slice.range)
+            return count + text.unicodeScalars.filter(CharacterSet.alphanumerics.contains).count
+        }
+        guard bodyLength >= 80, !requirePageCoverage || bodyPages.count * 2 >= expectedPages.count,
+              relevantEntries.map({ entries in body.contains { entries.contains($0.entry) } }) != false else {
+            throw ResearchMaterialError.message("部分原文无法核验，剩余正文不足以支持这次总结或分析。本次未发送，请缩小范围或核对原页。")
+        }
+
+        var gaps: [ResearchPDFEvidenceCheck] = []
+        if !unreadable.isEmpty {
+            gaps.append(.init(kind: .content, target: "文件第 \(Self.pageList(Array(unreadable))) 页正文", status: .missing))
+        }
+        func locations(_ blocks: [Int: Set<Int>]) -> String {
+            let listed = blocks.keys.sorted().prefix(6).map { page in
+                "文件第 \(page) 页第 \(Self.pageList(Array(blocks[page, default: []]))) 块"
+            }
+            let remaining = blocks.count > listed.count ? "等 \(blocks.count) 页" : ""
+            return listed.joined(separator: "、") + remaining
+        }
+        if !result.omitted.isEmpty {
+            gaps.append(.init(kind: .content, target: locations(result.omitted), status: .missing))
+        }
+        if !omittedEquations.isEmpty {
+            gaps.append(.init(kind: .visual, target: locations(omittedEquations) + "的行间公式原式", status: .missing))
+        }
+        let omitted = ResearchMaterial.bounded(gaps.map(\.target).joined(separator: "、"), limit: 300)
+        let partialScope = "部分证据 · 仅依据已核验摘录 · 缺失：" + omitted
+        let verifiedLocation = ResearchPDFEvidenceCheck(kind: .location, target: "所附摘录的原文页位", status: .verified)
+        return try materials(preserved, scope: partialScope, limit: limit, independent: true,
+                             requestCheck: verifiedLocation).map {
+            var packet = $0
+            packet.evidenceChecks = (packet.evidenceChecks ?? []) + gaps
+            return packet
         }
     }
 
@@ -509,17 +625,21 @@ extension ResearchPDFIndex {
         }
     }
 
-    func readPages(_ range: ClosedRange<Int>) throws -> [ResearchMaterial] {
+    func readPages(_ range: ClosedRange<Int>, allowsPartialEvidence: Bool = false) throws -> [ResearchMaterial] {
         try validatePages(range)
+        let scope = "按文件页序连续取出的原文"
+        let slices = corpus.entries.indices.filter { range.contains(corpus.entries[$0].page) }.map(corpus.full)
+        if allowsPartialEvidence {
+            return try synthesisMaterials(slices, expectedPages: Set(range), scope: scope, limit: 7_200)
+        }
         let missing = unavailable.filter(range.contains)
         guard missing.isEmpty else { throw missingPages(Array(missing), whole: false) }
-        let slices = corpus.entries.indices.filter { range.contains(corpus.entries[$0].page) }.map(corpus.full)
         try verified(slices, scope: "按文件页序读取", limit: 7_200)
-        return try materials(slices, scope: "按文件页序连续取出的原文", limit: 7_200)
+        return try materials(slices, scope: scope, limit: 7_200)
     }
 
-    func searchEvidence(_ query: String, selection: String? = nil) throws -> ResearchMaterial {
-        try ranked(query, background: selection)
+    func searchEvidence(_ query: String, selection: String? = nil, allowsPartialEvidence: Bool = false) throws -> ResearchMaterial {
+        try ranked(query, background: selection, allowsPartialEvidence: allowsPartialEvidence)
     }
 
     var documentOutline: [String] {
@@ -591,7 +711,8 @@ extension ResearchPDFIndex {
         return start..<end
     }
 
-    private func locatedSlices(_ question: String, requestCheck: ResearchPDFEvidenceCheck? = nil) throws -> [ResearchPDFSlice]? {
+    private func locatedSlices(_ question: String, requestCheck: ResearchPDFEvidenceCheck? = nil,
+                               allowsPartialEvidence: Bool = false) throws -> (slices: [ResearchPDFSlice], pages: Set<Int>)? {
         let pageFilter = try physicalPages(question)
         let section = ResearchPDFAddress.explicitSection(question)
         let col = ResearchPDFAddress.captures(ResearchPDFAddress.columns, in: question)?.first?.lowercased()
@@ -613,7 +734,9 @@ extension ResearchPDFIndex {
         var physical = pageFilter ?? Set(ids.map { corpus.entries[$0].page })
         if chapters != nil, let lo = physical.min(), let hi = physical.max() { physical.formUnion(lo...hi) }
         let missing = unavailable.intersection(physical)
-        guard missing.isEmpty else { throw missingPages(Array(missing), whole: false) }
+        guard allowsPartialEvidence && paragraphs == nil || missing.isEmpty else {
+            throw missingPages(Array(missing), whole: false)
+        }
         if let paragraphs {
             if (pageFilter?.count ?? 0) > 1 { throw ResearchMaterialError.message("请明确需要哪一页的该段文字。") }
             let body = ids.filter { id in
@@ -634,9 +757,11 @@ extension ResearchPDFIndex {
             }
         }
         let slices = ids.map(corpus.full)
-        try verified(slices, scope: "按指定页、栏或章节读取", limit: ResearchMaterial.maximumLength,
-                     requestCheck: requestCheck)
-        return slices
+        if !allowsPartialEvidence || paragraphs != nil {
+            try verified(slices, scope: "按指定页、栏或章节读取", limit: ResearchMaterial.maximumLength,
+                         requestCheck: requestCheck)
+        }
+        return (slices, physical)
     }
 
     func prepare(_ question: String, selectionHint: String? = nil, chosenRangeID: String? = nil,
@@ -646,7 +771,7 @@ extension ResearchPDFIndex {
     }
 
     func prepare(_ request: ResearchPDFRequest, selectionHint: String? = nil, chosenRangeID: String? = nil,
-                 correctedAnchors: ResearchPDFAnchors? = nil) throws -> [ResearchMaterial] {
+                 correctedAnchors: ResearchPDFAnchors? = nil, backgroundKeywords: String? = nil) throws -> [ResearchMaterial] {
         switch request.address {
         case let .anchors(range):
             let explicitPages = try physicalPages(range.prefix)
@@ -720,11 +845,18 @@ extension ResearchPDFIndex {
         let requirement = ResearchPDFEvidenceCheck(kind: .location,
             target: ResearchPDFAddress.paragraphs(in: request.question) == nil ? "所问的文件页、栏或章节" : "所问的自然段",
             status: .verified)
-        if let slices = try locatedSlices(request.question, requestCheck: requirement) {
-            return try materials(slices, scope: "按指定文件页、栏或章节取出的原文",
-                                 limit: ResearchMaterial.maximumLength, requestCheck: requirement)
+        if let location = try locatedSlices(request.question, requestCheck: requirement,
+                                             allowsPartialEvidence: request.allowsPartialEvidence) {
+            let scope = "按指定文件页、栏或章节取出的原文"
+            if request.allowsPartialEvidence {
+                return try synthesisMaterials(location.slices, expectedPages: location.pages, scope: scope,
+                                              limit: ResearchMaterial.maximumLength, requestCheck: requirement)
+            }
+            return try materials(location.slices, scope: scope, limit: ResearchMaterial.maximumLength,
+                                 requestCheck: requirement)
         }
-        return [request.requiringDefinitions(in: try ranked(request.question, background: nil))]
+        return [request.requiringDefinitions(in: try ranked(request.question, background: backgroundKeywords,
+                                                          allowsPartialEvidence: request.allowsPartialEvidence))]
     }
 
     func retrieve(_ question: String, backgroundKeywords: String? = nil) throws -> ResearchMaterial {
@@ -733,21 +865,109 @@ extension ResearchPDFIndex {
             guard result.count == 1, let value = result.first else { throw ResearchMaterialError.message("目标范围需要 \(result.count) 段，请使用文档分段处理。") }
             return value
         }
-        let address = ResearchPDFAddress.parse(question)
-        switch address {
+        let request = ResearchPDFRequest(question)
+        switch request.address {
         case .anchors, .quotation:
-            let result = try prepare(question)
+            let result = try prepare(request)
             guard result.count == 1, let value = result.first else { throw ResearchMaterialError.message("指定原文超过一次选区问答的上限，请单独处理文件。") }
             return value
-        default: return try ranked(question, background: backgroundKeywords)
+        default:
+            return try ranked(question, background: backgroundKeywords, allowsPartialEvidence: request.allowsPartialEvidence)
         }
     }
 
-    func segments() throws -> [ResearchMaterial] {
-        guard unavailable.isEmpty else { throw missingPages(Array(unavailable), whole: true) }
+    func segments(allowsPartialEvidence: Bool = false, limit: Int = 7_200) throws -> [ResearchMaterial] {
+        let scope = "整篇按文件页序连续分段，已排除页眉页脚"
         let slices = corpus.entries.indices.map(corpus.full)
-        try verified(slices, scope: "按整篇文件页序读取", limit: 7_200)
-        return try materials(slices, scope: "整篇按文件页序连续分段，已排除页眉页脚", limit: 7_200)
+        if allowsPartialEvidence {
+            return try synthesisMaterials(slices, expectedPages: Set(pages.map(\.number)), scope: scope, limit: limit)
+        }
+        guard unavailable.isEmpty else { throw missingPages(Array(unavailable), whole: true) }
+        try verified(slices, scope: "按整篇文件页序读取", limit: limit)
+        return try materials(slices, scope: scope, limit: limit)
+    }
+
+    /// One native material packet for ordinary document discussion.
+    func conversationEvidence(_ request: ResearchPDFRequest, selection: ResearchMaterial? = nil,
+                              preferOverview: Bool = false) throws -> ResearchMaterial {
+        let limit = ResearchMaterial.maximumLength - (selection.map { $0.text.utf16.count + 750 } ?? 0)
+        guard limit > 512 else { throw ResearchMaterialError.message("选区太长，无法同时带入文件摘录。请缩小选区。") }
+        let evidence: ResearchMaterial
+        if !request.allowsPartialEvidence {
+            let strict = try prepare(request, selectionHint: selection?.text,
+                                     backgroundKeywords: selection.map { String($0.text.prefix(1_200)) })
+            guard strict.count == 1, let item = strict.first, item.text.utf16.count <= limit else {
+                throw ResearchMaterialError.message("已核验原文超出本轮材料容量。请缩小所问范围。")
+            }
+            evidence = item
+        } else {
+            let location = try locatedSlices(request.question, allowsPartialEvidence: true)
+            let expected = location?.pages ?? Set(pages.map(\.number))
+            let all = location?.slices ?? corpus.entries.indices.map(corpus.full)
+            let cost = all.reduce(into: 0) { $0 += $1.range.length + 55 }
+            let check = ResearchPDFEvidenceCheck(kind: .location, target: "所附摘录的原文页位", status: .verified)
+            if cost <= limit {
+                let packets = try synthesisMaterials(all, expectedPages: expected,
+                    scope: "按文件页序提供正文及可读附注", limit: limit, requestCheck: check)
+                guard packets.count == 1, let item = packets.first else {
+                    throw ResearchMaterialError.message("已核验原文超出本轮材料容量。请缩小所问范围。")
+                }
+                evidence = item
+            } else if location == nil, !preferOverview, let hits = try rankedContext(request, selection: selection, limit: limit) {
+                evidence = hits
+            } else {
+                evidence = try representativeEvidence(expected, limit: limit, check: check)
+            }
+        }
+        if let selection { return try selection.withBackgroundEvidence(evidence) }
+        return evidence
+    }
+
+    private func rankedContext(_ request: ResearchPDFRequest, selection: ResearchMaterial?, limit: Int) throws -> ResearchMaterial? {
+        do {
+            return try ranked(request.question, background: selection.map { String($0.text.prefix(1_200)) },
+                              allowsPartialEvidence: true, limit: limit)
+        } catch is InsufficientEvidence { return nil }
+    }
+
+    private func representativeEvidence(_ expected: Set<Int>, limit: Int,
+                                        check: ResearchPDFEvidenceCheck) throws -> ResearchMaterial {
+        let candidates = corpus.passages.map(\.slice).filter { slice in
+            let entry = corpus.entries[slice.entry]
+            guard expected.contains(entry.page), !unavailable.contains(entry.page) else { return false }
+            let kind = pages[entry.page - 1].blocks[entry.block].kind
+            return (kind == .body && slice.range.length >= 70) || kind == .heading || kind == .caption || kind == .table
+        }
+        let perPage = Dictionary(grouping: candidates) { corpus.entries[$0.entry].page }
+        let available = perPage.keys.sorted()
+        let count = min(available.count, max(1, limit / 800))
+        let groups = (0..<count).map { slot in
+            perPage[available[slot * (available.count - 1) / max(1, count - 1)], default: []]
+        }
+        var remaining = limit
+        var sampled: [ResearchPDFSlice] = []
+        for offset in 0..<(groups.map(\.count).max() ?? 0) {
+            for group in groups where group.indices.contains(offset) {
+                let slice = group[offset]
+                let cost = slice.range.length + 55
+                guard cost <= remaining else { continue }
+                sampled.append(slice)
+                remaining -= cost
+            }
+            try Task.checkCancellation()
+            if remaining < 120 { break }
+        }
+        sampled.sort { $0.entry == $1.entry ? $0.range.location < $1.range.location : $0.entry < $1.entry }
+        let coverage = "按文件页抽取代表性原文（未发送整篇正文）"
+        let packets = try synthesisMaterials(sampled, expectedPages: expected, scope: coverage,
+            limit: limit, independent: true, requirePageCoverage: false, requestCheck: check)
+        guard packets.count == 1, var packet = packets.first else {
+            throw ResearchMaterialError.message("没有足够的可核对文件摘录。")
+        }
+        if !packet.scope.hasPrefix(coverage) {
+            packet.scope = ResearchMaterial.bounded(coverage + " · " + packet.scope, limit: 510)
+        }
+        return packet
     }
 }
 
@@ -803,7 +1023,13 @@ extension ResearchPDFIndex {
         ["讨论", "discussion"], ["厚掩模", "thick", "mask"]
     ]
 
-    private func ranked(_ question: String, background: String?) throws -> ResearchMaterial {
+    private struct InsufficientEvidence: LocalizedError {
+        let errorDescription: String?
+        init(_ message: String) { errorDescription = message }
+    }
+
+    private func ranked(_ question: String, background: String?, allowsPartialEvidence: Bool = false,
+                        limit: Int = ResearchMaterial.maximumLength) throws -> ResearchMaterial {
         var weights = [String: Double]()
         if let background {
             for w in Self.termCounts(background).keys { weights[w] = 0.65 }
@@ -815,7 +1041,8 @@ extension ResearchPDFIndex {
             for word in concept { weights[word] = max(weights[word] ?? 0, 0.6) }
         }
         for w in direct { weights[w] = 1 }
-        let explicit = try locatedSlices(question)
+        let location = try locatedSlices(question, allowsPartialEvidence: allowsPartialEvidence)
+        let explicit = location?.slices
         let allowed = explicit.map { Set($0.map(\.entry)) }
         struct Hit {
             let passage: Int
@@ -837,7 +1064,8 @@ extension ResearchPDFIndex {
             let entry = corpus.entries[p.slice.entry]
             let page = pages[entry.page - 1]
             let block = page.blocks[entry.block]
-            guard allowed?.contains(p.slice.entry) != false, block.reliable, !unavailable.contains(entry.page) else { continue }
+            guard allowed?.contains(p.slice.entry) != false, allowsPartialEvidence || block.reliable,
+                  !unavailable.contains(entry.page) else { continue }
             var matches: Set<String> = []
             var score = 0.0
             let lengthPenalty = 1.2 * (0.35 + 0.65 * Double(p.count) / 72)
@@ -847,7 +1075,7 @@ extension ResearchPDFIndex {
                 let tf = Double(count)
                 score += weight * tf * 2.2 / (tf + lengthPenalty)
             }
-            guard score > 0,
+            guard score > 0, allowsPartialEvidence ||
                   block.lines.allSatisfy({ line in
                       line.regionVerified != false && (!line.orderUncertain || block.lines.count == 1 && line.regionVerified == true)
                   }) else { continue }
@@ -857,20 +1085,20 @@ extension ResearchPDFIndex {
             ranked.append(Hit(passage: id, score: score, matched: matches))
         }
         ranked.sort { $0.score == $1.score ? $0.passage < $1.passage : $0.score > $1.score }
-        if ranked.isEmpty, let explicit, background != nil {
+        if ranked.isEmpty, let explicit, background != nil, !allowsPartialEvidence {
             let value = try materials(explicit, scope: "明确指定的文件位置", limit: 4_000)
             guard value.count == 1, let material = value.first else { throw ResearchMaterialError.message("指定页段过长，且未找到与选区匹配的证据。") }
             return material
         }
         guard let best = ranked.first else {
-            throw ResearchMaterialError.message("已检索可读全文，未找到足以核对问题的相关段落。请提供原文术语、页码或章节。")
+            throw InsufficientEvidence("已检索可读全文，未找到足以核对问题的相关段落。请提供原文术语、页码或章节。")
         }
         var selected: [Int] = []
-        var budget = background == nil ? 10_500 : 3_500
+        var budget = min(limit, background == nil ? 10_500 : 3_500)
         func include(_ id: Int) {
             guard corpus.passages.indices.contains(id), !selected.contains(id) else { return }
             let slice = corpus.passages[id].slice
-            let cost = slice.range.length + 42
+            let cost = slice.range.length + 55
             guard cost <= budget else { return }
             budget -= cost
             selected.append(id)
@@ -900,8 +1128,16 @@ extension ResearchPDFIndex {
         let slices = selected.sorted().map { corpus.passages[$0].slice }
         let scope = unavailable.isEmpty ? "相关证据摘录；各处独立核对，未覆盖之处证据不足" :
             "可读页的相关证据摘录；文件第 \(Self.pageList(Array(unavailable))) 页不可核对"
-        try verified(slices, scope: scope, limit: ResearchMaterial.maximumLength, independent: true)
-        guard let value = try materials(slices, scope: scope, limit: ResearchMaterial.maximumLength, independent: true).first else {
+        if allowsPartialEvidence {
+            let scoredEntries = Set(ranked.prefix(10).map { corpus.passages[$0.passage].slice.entry })
+            let pageScope = location?.pages ?? Set(pages.map(\.number))
+            let packets = try synthesisMaterials(slices, expectedPages: pageScope, scope: scope,
+                limit: limit, independent: true, requirePageCoverage: false,
+                relevantEntries: scoredEntries)
+            if let value = packets.first { return value }
+        }
+        try verified(slices, scope: scope, limit: limit, independent: true)
+        guard let value = try materials(slices, scope: scope, limit: limit, independent: true).first else {
             throw ResearchMaterialError.message("找不到可核对的文件证据。")
         }
         return value

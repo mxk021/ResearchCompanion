@@ -1,7 +1,7 @@
 {
   "name": "dsh-research-companion",
   "description": "macOS research assistant bridge for a local DeepSeek Harness Desktop.",
-  "version": "0.2.6",
+  "version": "0.2.8",
   "type": "module",
   "keywords": [
     "dsh-plugin",

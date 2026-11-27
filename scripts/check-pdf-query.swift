@@ -41,6 +41,7 @@ struct ResearchPDFQueryCheck {
         try check.testBodyCitationAtTheTopOfAPageIsNotARunningHeader()
         try check.testMissingReversedAmbiguousAndUnreliableNeverFallBackToRanking()
         try check.testRangeChecksMissingPagesAfterLocatingTheEndpoints()
+        try check.testSynthesisKeepsVerifiedRegionsAndReportsLocalGaps()
         try check.testRangeUsesTheLocalMapWithoutSkippingDamagedGlyphs()
         try check.testPairedRangeCandidates()
         try check.testNaturalRangeCommandsAndCorrections()
@@ -114,6 +115,108 @@ struct ResearchPDFQueryCheck {
         try rejects(try doc.prepare("从 START 到 TAIL 的全部内容"), containing: "第 4 页")
         try rejects(try doc.prepare("从 START 到 MISSING 的全部内容"), containing: "缺少可核对")
         try rejects(try doc.segments(), containing: "无法核验整个文件")
+    }
+
+    func testSynthesisKeepsVerifiedRegionsAndReportsLocalGaps() throws {
+        let first = "The calibration experiment measures beam stability across a baseline and an independent reference channel."
+        let final = "The observed calibration drift was limited to the first trial. Later measurements agreed within the uncertainty bounds."
+        let disputed = "Unverified calibration box: a decorative overlay obscures the words."
+        let clipped = "Attention(Q,K,V) = softmax(QKT"
+        var formula = block(clipped, source: first.utf16.count + disputed.utf16.count + 4)
+        formula.kind = .formula
+        let doc = try index([
+            page(1, [block(first), block(disputed, reliable: false, source: first.utf16.count + 2), formula]),
+            page(2, [], state: .needsOCR),
+            page(3, [block(final)])
+        ])
+        let request = ResearchPDFRequest("请总结这份全文的校准方法和结果。")
+        try check(request.allowsPartialEvidence)
+        try check(ResearchPDFRequest("请根据文件第 1–3 页已有的有效证据，总结这套装置的实验结论，标出未能核验的页。只作简短总结。").allowsPartialEvidence)
+        let mixed = "请结合论文和文字选区，根据文件第 1–3 页已有的有效证据总结研究方法。请读出每张用户附图中的校对码和颜色。"
+        let joint = ResearchPDFRequest(mixed, includingUserImages: true)
+        try check(joint.allowsPartialEvidence && joint.question == mixed)
+        try check(!ResearchPDFRequest(mixed).allowsPartialEvidence)
+        try check(!ResearchPDFRequest(mixed + "。逐字照录文件第 1–3 页原文，不得遗漏。", includingUserImages: true).allowsPartialEvidence)
+        try check(!ResearchPDFRequest("总结这一研究。逐字摘录论文原文和用户附图上的文字。", includingUserImages: true).allowsPartialEvidence)
+        try check(ResearchPDFRequest("Summarize pages 1 to 3 of the PDF. Read the uploaded image label.", includingUserImages: true).allowsPartialEvidence)
+        try rejects(try doc.segments(), containing: "无法核验整个文件")
+        try rejects(try doc.readPages(1...3), containing: "第 2 页")
+        try rejects(try doc.prepare("请摘录第1页原文。"), containing: "第 2 块")
+        try rejects(try doc.prepare("请逐句翻译第1到3页原文。"), containing: "第 2 页")
+        for question in ["分析并保留公式（1）的原式", "总结后逐句翻译全文", "请总结并精确引用原文",
+                         "分析全文但不得遗漏", "第1页第2段的分析", "总结第2节", "分析第1页右栏", "请只给原文",
+                         "Summarize the derivation", "Do not summarize."] {
+            try check(!ResearchPDFRequest(question).allowsPartialEvidence)
+        }
+        let material = try unwrap(doc.segments(allowsPartialEvidence: request.allowsPartialEvidence).first)
+        try check(material.scope.contains("部分证据") && material.scope.contains("文件第 2 页正文")
+                  && material.scope.contains("文件第 1 页第 2 块"))
+        try check(material.pdfPositions?.map(\.page) == [1, 3] && material.pdfPages == "1、3")
+        try check(material.text.contains(first) && material.text.contains(final)
+                  && !material.text.contains(disputed) && !material.text.contains(clipped))
+        try check(material.verifiedExcerpts?.compactMap { $0.text(in: material.text) } == [first, final])
+        try check(material.evidenceChecks?.filter { $0.status == .missing }.count == 3)
+        try check(material.evidenceChecks?.contains { $0.kind == .visual && $0.status == .missing
+                  && $0.target.contains("第 3 块的行间公式原式") } == true)
+        let scoped = try unwrap(doc.prepare("分析第1到3页的校准方法。").first)
+        try check(scoped.scope.contains("缺失") && scoped.pdfPositions?.map(\.page) == [1, 3])
+        let ranked = try unwrap(doc.prepare("总结 calibration 结果。").first)
+        try check(ranked.scope.contains("第 1 页第 2 块") && !ranked.text.contains(disputed))
+        let plan = ResearchDocumentPlan(action: .pages, pageStart: 1, pageEnd: 3)
+        try check(try plan.read(index: doc, question: "概括 calibration", selection: nil,
+                                requireSelection: false, allowsPartialEvidence: true).first?.pdfPages == "1、3")
+        try rejects(try plan.read(index: doc, question: "逐句翻译 calibration", selection: nil,
+                                  requireSelection: false, allowsPartialEvidence: true), containing: "第 2 页")
+        let selected = try ResearchMaterial.selection(first, source: "Synthetic", title: "Selected")
+        let combined = try selected.withBackgroundEvidence(scoped)
+        try check(combined.scope.contains("部分文件证据") && combined.evidenceChecks == scoped.evidenceChecks)
+        let followUp = ResearchPDFRequest("为什么这样设计？")
+        try check(followUp.allowsPartialEvidence)
+        let single = try doc.conversationEvidence(followUp, selection: selected)
+        try check(single.scope.contains("部分文件证据") && single.backgroundPositions?.map(\.page) == [1, 3])
+        try check(single.text.contains(final) && !single.text.contains(disputed) && !single.text.contains(clipped))
+        try check(single.evidenceChecks?.contains { $0.status == .missing } == true)
+        let large = try index((1...10).map { number in
+            page(number, [block(String(repeating: "The measured variance was compared to an independent calibration. ", count: 45))])
+        })
+        let wholeQuestion = "请通读这篇论文，用中文概括问题、方法、主要实验结论和局限。关键结论注明 PDF 文件页码。"
+        let overviewIntent = ResearchPDFIndex.wholeTask(wholeQuestion, mode: .ask)
+        try check(overviewIntent == .analysis)
+        let overview = try large.conversationEvidence(ResearchPDFRequest(wholeQuestion), preferOverview: overviewIntent == .analysis)
+        try check(overview.scope.contains("代表性原文") && overview.text.utf16.count <= ResearchMaterial.maximumLength)
+        try check(overview.pdfPositions?.first?.page == 1 && overview.pdfPositions?.last?.page == 10)
+        let accumulated = try ResearchDocumentPlan.accumulated(ranked, scoped)
+        try check(accumulated.evidenceChecks?.contains { $0.status == .missing } == true)
+
+        let inadequate = try index([page(1, [block("Only a short mention.")]), page(2, [], state: .needsOCR)])
+        try rejects(try inadequate.segments(allowsPartialEvidence: true), containing: "剩余正文不足")
+
+        // Independently exercise the file parser with real PDF bytes and an
+        // unindexable physical page between two readable pages.
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("rc-partial-" + UUID().uuidString + ".pdf")
+        defer { try? FileManager.default.removeItem(at: file) }
+        var box = CGRect(x: 0, y: 0, width: 612, height: 792)
+        let drawing = CGContext(consumer: CGDataConsumer(url: file as CFURL)!, mediaBox: &box, nil)!
+        let font = CTFontCreateWithName("Helvetica" as CFString, 10, nil)
+        for lines in [[first, "A matched photodiode provides the calibration reference."],
+                      [],
+                      [final, "This establishes only the uncertainty under these conditions."]] {
+            drawing.beginPDFPage(nil)
+            for (index, line) in lines.enumerated() {
+                drawing.textPosition = CGPoint(x: 44, y: 704 - index * 17)
+                CTLineDraw(CTLineCreateWithAttributedString(NSAttributedString(string: line,
+                    attributes: [.init(kCTFontAttributeName as String): font])), drawing)
+            }
+            drawing.endPDFPage()
+        }
+        drawing.closePDF()
+        let native = try ResearchPDFIndex.read(file, title: "Synthetic calibration") { _ in }
+        try rejects(try native.segments(), containing: "第 2 页")
+        let nativePacket = try unwrap(native.segments(allowsPartialEvidence: true).first)
+        try check(nativePacket.text.contains(first) && nativePacket.text.contains(final))
+        try check(Set(nativePacket.pdfPositions?.map(\.page) ?? []) == [1, 3])
+        try check(nativePacket.evidenceChecks?.contains { $0.status == .missing && $0.target.contains("第 2 页") } == true)
+        print("PASS partial PDF synthesis, omitted blocks, clipped display math and unindexable page, exact/translation denial and source mappings.")
     }
 
     func testRangeUsesTheLocalMapWithoutSkippingDamagedGlyphs() throws {
@@ -534,6 +637,8 @@ struct ResearchPDFQueryCheck {
         let missingSymbols = try a.objectEvidence([fifteenth], question: "解释公式15")
         try check(missingSymbols.needsVisual && missingSymbols.images.isEmpty && missingSymbols.material.text.contains("缺少完整公式"))
         try check(missingSymbols.material.verifiedExcerpts?.contains { $0.kind == .body } != true)
+        try rejects(try DSHPetCommandClient.readPDFObjects(a, ids: [fifteenth], question: "解释公式15",
+                                                          allowImages: false, selection: nil), containing: "目标证据未完整核验")
         let spatial = try a.objectEvidence([fifteenth], includeImages: true, question: "解释公式15")
         try check(spatial.images.count == 1 && spatial.images[0].starts(with: [0xff, 0xd8]))
         try check(spatial.material.pdfPositions != spatial.material.backgroundPositions)

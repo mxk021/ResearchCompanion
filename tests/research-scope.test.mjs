@@ -566,10 +566,13 @@ test('dispatch verification fingerprints only evidence actually present at the a
     assert.equal(await get(),null)
     const stream = eventHandlers.get('llm/stream')[0]
     const prompt = calls.filter(([name])=>name==='prompt').at(-1)[1].content[0].text
-    const input = prompt.replace(material.text,'SYNTHETIC changed by fixture after admission')
-    const messages = [{role:'user',source:{kind:'user',rpcId:requestId},content:[{type:'text',text:input}]}]
-    await consumeStream(stream, {...selection,sessionId:target.sessionId,messages})
-    const quote = 'SYNTHETIC changed by fixture after admission'
+    const requestWith = text => ({...selection, sessionId: target.sessionId,
+      messages: [{role:'user', source:{kind:'user', rpcId:requestId}, content:[{type:'text', text}]}]})
+    await assert.rejects(consumeStream(stream, requestWith(prompt.replace(material.text,
+      'SYNTHETIC changed by fixture after admission'))), /原文与本轮快照不一致/)
+    assert.equal(await get(), null)
+    await consumeStream(stream, requestWith(prompt))
+    const quote = material.text
     const { requestedAt, dispatchedAt, timing, ...evidence } = await get()
     assert.deepEqual(evidence,{requestId,selection,sha256:createHash('sha256').update(quote).digest('hex'),utf16Length:quote.length})
     assert.ok(requestedAt <= dispatchedAt)
@@ -599,6 +602,27 @@ const objectMaterial = {
 const documentTarget = { workspaceId: 'research-workspace', sessionId: 'research-session' }
 const visionSelection = { provider: 'chatgpt', model: 'gpt-test', reasoningEffort: 'medium' }
 const textSelection = { provider: 'deepseek-account', model: 'deepseek-flash' }
+
+test('user images reach the explicitly selected image model and are refused on a text-only route', async () => {
+  await harness(async ({ client, calls }) => {
+    // Discovery readiness precedes selecting or dispatching any test request.
+    await client.request('workspaces')
+    const images = [{ ...crops[0], name: 'synthetic-user-image.png' }]
+    const request = { ...documentTarget, requestId: 'user-image-input', text: 'Describe the image.', images }
+    await assert.rejects(client.request('prompt', { ...request, selection: textSelection }), /没有声明支持图片/)
+    assert.equal(calls.some(([name]) => name === 'prompt'), false)
+    await client.request('researchSelectModel', { ...documentTarget, selection: visionSelection })
+    const admitted = await client.request('prompt', { ...request, selection: visionSelection })
+    assert.equal(admitted.accepted, true)
+    assert.deepEqual(admitted.selection, visionSelection)
+    const sent = calls.filter(([name]) => name === 'prompt')
+    assert.equal(sent.length, 1)
+    assert.deepEqual(sent[0][1].content, [
+      { type: 'text', text: request.text },
+      { type: 'image', ...images[0] },
+    ])
+  })
+})
 
 test('images enter only an explicitly scoped document turn on a declared vision route', async () => {
   await harness(async ({ client, calls }) => {
@@ -672,16 +696,16 @@ test('the actual model boundary verifies each crop in source order and refuses m
     const stored = missing.content.slice(1)
     await assert.rejects(adapter({ ...missing, content: missing.content.slice(0, 2) }), /裁图数量/)
     await assert.rejects(adapter({ ...missing, content: [missing.content[0], { ...stored[0], offloaded: true }, stored[1]] }), /裁图数量/)
-    await assert.rejects(adapter({ ...missing, content: [missing.content[0], { type: 'image' }, stored[1]] }), /缺少.*裁图引用/)
+    await assert.rejects(adapter({ ...missing, content: [missing.content[0], { type: 'image' }, stored[1]] }), /裁图顺序/)
     state.imageBytes.delete(stored[0].attachment.attachmentId)
     await assert.rejects(adapter(missing), /missing from the store/)
     state.imageBytes.set(stored[0].attachment.attachmentId, storedPNGs[0])
     assert.equal(await get('vision-missing'), null)
 
     const changed = await admit('vision-changed')
-    await assert.rejects(adapter({ ...changed, content: [changed.content[0], ...stored.toReversed()] }), /裁图引用/)
+    await assert.rejects(adapter({ ...changed, content: [changed.content[0], ...stored.toReversed()] }), /裁图顺序/)
     state.imageBytes.set(stored[0].attachment.attachmentId, storedPNGs[1])
-    await assert.rejects(adapter(changed), /原页不同/)
+    await assert.rejects(adapter(changed), /裁图内容/)
     assert.equal(await get('vision-changed'), null)
 
     const wrong = await admit('vision-wrong')
@@ -692,5 +716,38 @@ test('the actual model boundary verifies each crop in source order and refuses m
     await assert.rejects(adapter({ ...wrong, content: stored }), /未找到本轮核对的文档原文/)
     assert.equal(await get('vision-wrong'), null)
     assert.equal(entries, 1, 'an invalid source must fail before the provider is called')
+  })
+})
+
+test('one research turn binds the PDF evidence and user image as distinct ordered inputs', async () => {
+  await harness(async ({client, state, calls, eventHandlers}) => {
+    assert.ok((await client.request('capabilities')).supports.includes('researchUserImages'))
+    await client.request('researchSelectModel', { ...documentTarget, selection: visionSelection })
+    const userImage = { ...crops[1], name: 'experiment-photo.png' }
+    const request = {
+      ...documentTarget, requestId: 'joint-vision', selection: visionSelection, mode: 'ask',
+      text: 'Compare the excerpt and the experiment photo.', includeContext: true, material: objectMaterial,
+      images: [crops[0]], userImages: [userImage],
+    }
+    await assert.rejects(client.request('researchPrompt', { ...request, userImages: {} }), /userImages must be an array/)
+    await assert.rejects(client.request('researchPrompt', { ...request, userImages: Array(5).fill(userImage) }), /image-count limit/)
+    assert.equal((await client.request('researchPrompt', request)).accepted, true)
+    const sent = calls.filter(([name]) => name === 'prompt')
+    assert.equal(sent.length, 1)
+    const [text, ...files] = sent[0][1].content
+    assert.match(text.text, /前 1 张图由用户附加。其后 1 张是本轮核对的论文原页裁图/)
+    const attachments = files.map(({receiptId}) => ({type:'image', attachment:state.imageReceipts.get(receiptId).image}))
+    assert.deepEqual(attachments.map(part => part.attachment.name), [userImage.name, crops[0].name])
+    const stream = eventHandlers.get('llm/stream')[0]
+    const modelRequest = content => ({ ...visionSelection, sessionId: documentTarget.sessionId,
+      messages: [{role:'user', source:{kind:'user', rpcId:request.requestId}, content}] })
+    await assert.rejects(consumeStream(stream, modelRequest([text, attachments[1]])), /附图或原页裁图数量/)
+    await assert.rejects(consumeStream(stream, modelRequest([text, ...attachments.toReversed()])), /裁图顺序/)
+    await consumeStream(stream, modelRequest([text, ...attachments]))
+    const {dispatchEvidence: proof} = await client.request('conversation', { ...documentTarget, requestId:request.requestId })
+    const sha = data => createHash('sha256').update(data).digest('hex')
+    assert.deepEqual(proof.userImages, [sha(storedPNGs[1])])
+    assert.deepEqual(proof.images, [sha(storedPNGs[0])])
+    assert.equal(proof.sha256, sha(objectMaterial.text))
   })
 })

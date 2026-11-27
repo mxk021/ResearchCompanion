@@ -100,16 +100,20 @@ async function startup() {
         const encoder = new TextEncoder();
         const key = await crypto.subtle.importKey('raw', encoder.encode(pairing.token), {name:'HMAC', hash:'SHA-256'}, false, ['sign']);
         const endpoint = new Zotero.Server.Endpoints['/dsh-companion/context']();
-        async function call(query) {
+        async function call(query, localPDF = false) {
             const message = Date.now() + '.' + crypto.randomUUID().replaceAll('-', '');
             const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(message));
             const proof = Array.from(new Uint8Array(signature), byte => byte.toString(16).padStart(2, '0')).join('');
-            return endpoint.init({headers: {host:'127.0.0.1:' + Zotero.Server.port, authorization:'Bearer ' + message + '.' + proof},
+            return endpoint.init({headers: {host:'127.0.0.1:' + Zotero.Server.port, authorization:'Bearer ' + message + '.' + proof,
+                ...(localPDF ? {'X-Research-Companion-Local-PDF':'1'} : {})},
                 searchParams: new win.URLSearchParams(query)});
         }
         const liveQuery = () => 'selection=live&requestId=' + crypto.randomUUID();
         const live = await call(liveQuery());
         const ordinary = await call('');
+        const auto = await call(liveQuery(), true);
+        const pdfFile = JSON.parse(auto[2]).liveSelection?.pdfFile;
+        const nativeFile = await IOUtils.stat(FIXTURE_PDF);
         await select(start, start + 1);
         const secondNative = view._selectionRanges.map(r => r.text).join('\\n');
         const second = await call(liveQuery());
@@ -147,6 +151,10 @@ async function startup() {
             mirrorDiffers: initialMirror !== expected,
             selectionUnits: initialNative.length,
             attachmentAndPage, opensOnPage,
+            optInLocalPDF: live[0] === 200 && !JSON.parse(live[2]).liveSelection?.pdfFile &&
+                auto[0] === 200 && pdfFile?.path === FIXTURE_PDF && pdfFile?.bytes === nativeFile.size &&
+                pdfFile?.modifiedMs === nativeFile.lastModified && pdfFile?.attachmentID === attachment.id &&
+                pdfFile?.attachmentKey === attachment.key && pdfFile?.library === location.library,
             emptyRejected: empty[0] === 422 && JSON.parse(empty[2]).error === 'NO_SELECTION',
             noCache: JSON.parse(cleared[2]).selection === null};
     }
@@ -205,7 +213,7 @@ def verify(executable, fixture, root, package, expected_text, page):
             print(json.dumps(result))
             expected = dict(version=version, focused=True, liveExact=True, previewExact=True,
                             switchingExact=True, repeatExact=True, verifiedCapture=True,
-                            emptyRejected=True, noCache=True, attachmentAndPage=True)
+                            emptyRejected=True, noCache=True, attachmentAndPage=True, optInLocalPDF=True)
             if (any(result.get(k) != v for k, v in expected.items()) or result.get('opensOnPage') is False
                     or page > 1 and result.get('opensOnPage') is not True):
                 raise SystemExit('The native reader result differed from the expected selection.')

@@ -191,8 +191,8 @@ struct LongPDFCheck {
         client.draft = ""
         precondition(client.fixedMaterial?.pdfIndex?.canRequestOCR == true && client.fixedMaterial?.pdfIndex?.pages[36].text.isEmpty == true)
         do {
-            _ = try client.fixedMaterial!.pdfIndex!.retrieve("第1、37页有什么？")
-            fatalError("Missing page in explicit multipage request accepted")
+            _ = try client.fixedMaterial!.pdfIndex!.retrieve("逐句翻译第1、37页的完整原文。")
+            fatalError("A strict translation accepted an unreadable requested page")
         } catch { precondition(error.localizedDescription.contains("第 37 页")) }
         client.recognizePDFScans()
         try await wait("on-demand OCR") { !client.loadingResearchFile }
@@ -251,11 +251,10 @@ struct LongPDFCheck {
         precondition(client.pdfRangeReview?.id == review.id)
         client.resolveRangeReview(review.id, choice: .edit(.init(start: "OPENING THISTLE", end: "PAGE_1_END")))
         try await wait("local user correction reaches wire") {
-            client.conversationMessages.count == beforeCorrection + 1 && !client.hasPendingSubmission
+            client.conversationMessages.count == beforeCorrection + 2 && !client.hasPendingSubmission
         }
         let corrected = client.conversationMessages.last?.reply
-        let expectedCorrection = correctionQuestion.replacingOccurrences(of: "ABSENT TERMINAL", with: "PAGE_1_END")
-        precondition(corrected?.question == expectedCorrection && corrected?.material?.text == verifiedRange[0].text)
+        precondition(corrected?.question == correctionQuestion && corrected?.material?.text == verifiedRange[0].text)
         precondition(corrected?.material?.scope?.contains("用户修正并核验") == true)
         let unrelatedAgain = client.beginResearchSelectionCapture()!
         client.finishResearchSelectionCapture(unrelatedAgain, result: .success(captured))
@@ -269,7 +268,7 @@ struct LongPDFCheck {
             client.draft = rangeQuery
             client.submitResearch()
             try await wait("range on " + route.provider) {
-                (client.conversationMessages.count == count + 1 && !client.hasPendingSubmission) || client.lastError != nil
+                (client.conversationMessages.count == count + 2 && !client.hasPendingSubmission) || client.lastError != nil
             }
             if let error = client.lastError { throw ResearchMaterialError.message(error) }
             let sent = client.conversationMessages.last!.reply!.material!
@@ -302,6 +301,27 @@ struct LongPDFCheck {
         precondition(mixedReply.material!.text.contains(captured.text) && mixedReply.material!.text.contains("MIDPOINT LARCH"))
         precondition(store.read(session: client.sessionID!, reply: mixedReply)?.backgroundFile?.fingerprint == before.fingerprint)
         client.removeResearchSelection()
+        // Ordinary reading and follow-up both use the indexed PDF and remain one visible exchange.
+        func expectPair(after count: Int, question: String) {
+            let pair = Array(client.conversationMessages.dropFirst(count))
+            precondition(pair.count == 2, "Expected one visible question and answer: " + question)
+            precondition(pair[0].role == "user" && pair[0].text == question && pair[0].originalPrompt == nil)
+            precondition(pair[1].role == "assistant" && pair[1].reply?.question == question)
+        }
+        for question in ["请总结这篇论文的主要贡献。", "它有哪些局限？"] {
+            let count = client.conversationMessages.count
+            client.draft = question
+            client.submitResearch()
+            try await wait("one local exchange " + question) {
+                (client.conversationMessages.count >= count + 2 && !client.hasPendingSubmission && !client.pdfRequestRunning)
+                    || client.lastError != nil
+            }
+            if let error = client.lastError { throw ResearchMaterialError.message(error) }
+            expectPair(after: count, question: question)
+            let reply = client.conversationMessages.last!.reply!
+            precondition(reply.material?.text.isEmpty == false)
+            precondition(store.read(session: client.sessionID!, reply: reply)?.file?.fingerprint == before.fingerprint)
+        }
         let all = try index.segments()
         precondition(all.count > 4 && all.allSatisfy { $0.text.utf16.count <= 7_200 })
         for page in index.pages {
@@ -326,69 +346,66 @@ struct LongPDFCheck {
             precondition(store.read(session: client.sessionID!, reply: answer.reply!)?.file?.fingerprint == before.fingerprint)
         }
         let beforeSemantic = client.conversationMessages.count
-        client.draft = "为什么两次记录各用一种代号？"
+        let semanticQuestion = "为什么第1、52页分别使用不同代号？"
+        client.draft = semanticQuestion
         client.submitResearch()
         try await wait("follow-up evidence on the same session and model") {
             (client.conversationMessages.count > beforeSemantic && !client.hasPendingSubmission) || client.lastError != nil
         }
         if let error = client.lastError { throw ResearchMaterialError.message(error) }
         let semanticReply = client.conversationMessages.last!.reply!
-        precondition(semanticReply.material!.text.contains("OPENING THISTLE") && semanticReply.material!.text.contains("FINAL QUARTZ"))
+        expectPair(after: beforeSemantic, question: semanticQuestion)
+        precondition(semanticReply.material?.text.contains("OPENING THISTLE") == true &&
+                     semanticReply.material?.text.contains("FINAL QUARTZ") == true)
         precondition(store.read(session: client.sessionID!, reply: semanticReply)?.file?.fingerprint == before.fingerprint)
-        client.draft = "这行代号怎么理解？"
+        let absentQuote = "请翻译“NONEXISTENT FIXTURE MARK”。"
+        client.draft = absentQuote
         let beforeMissing = client.conversationMessages.count
         client.submitResearch()
-        try await wait("bounded failed search") { !client.pdfRequestRunning && client.lastError != nil }
-        precondition(client.draft == "这行代号怎么理解？" && client.conversationMessages.count == beforeMissing)
+        try await wait("an absent explicit quote is not replaced with general evidence") { !client.pdfRequestRunning && client.lastError != nil }
+        precondition(client.draft == absentQuote && client.conversationMessages.count == beforeMissing)
         precondition(ResearchPDFIndex.wholeTask("不要翻译全文，只翻译第24页", mode: .ask) == nil)
         client.draft = ""
-        let countBeforePreview = client.conversationMessages.count
         precondition(client.fixedMaterial!.text.isEmpty)
-        func approve(_ allow: Bool) async throws {
-            try await wait("batch plan") { client.pdfBatchApproval != nil }
-            client.resolvePDFApproval(client.pdfBatchApproval!.id, allow: allow)
-        }
-        client.submitResearch(.translate)
-        try await approve(false)
-        try await wait("cancel before first call") { !client.pdfRequestRunning }
-        precondition(client.conversationMessages.count == countBeforePreview)
-        for (question, additional) in [("请翻译全文", 0), ("请分析整篇 PDF", 1)] {
-            let count = client.conversationMessages.count
-            client.draft = question
-            client.submitResearch()
-            try await approve(true)
-            try await wait(question) { !client.pdfRequestRunning }
-            precondition(client.pdfRequestStatus?.contains("已完成 \(all.count)/\(all.count) 段") == true,
-                         client.pdfRequestStatus ?? "missing progress")
-            let answers = client.conversationMessages.dropFirst(count)
-            precondition(answers.count == all.count + additional)
-            for (answer, chunk) in zip(answers, all) {
-                precondition(answer.reply?.material?.text == chunk.text)
-            }
-        }
-        let count = client.conversationMessages.count
-        client.draft = "请分析全文。FAIL_SEGMENT"
+        let longRange = "请把从 OPENING THISTLE 到 PAGE_52_END 的原文逐段翻译成中文。"
+        let exactParts = try index.prepare(longRange)
+        precondition(exactParts.count > 1)
+        try JSONEncoder().encode(exactParts.map(\.text)).write(to: folder.appendingPathComponent("expected-long-exact.json"))
+        let beforeLong = client.conversationMessages.count
+        client.draft = longRange
         client.submitResearch()
-        try await approve(true)
-        try await wait("reject") { !client.pdfRequestRunning }
-        precondition(client.pdfRequestStatus?.contains("已完成 1/") == true && client.conversationMessages.count == count + 1)
-        precondition(client.draft == "请分析全文。FAIL_SEGMENT")
-        let savedFirst = client.conversationMessages.last!.reply!.requestId
+        try await wait("complete exact translation without approval") { !client.pdfRequestRunning && !client.hasPendingSubmission }
+        if let error = client.lastError { throw ResearchMaterialError.message(error) }
+        expectPair(after: beforeLong, question: longRange)
+        let translation = client.conversationMessages.last!
+        let displayedTranslation = translation.text
+        precondition(displayedTranslation == (1...exactParts.count).map { "Synthetic translation part \($0)." }.joined(separator: "\n\n"))
+        precondition(store.read(session: client.sessionID!, reply: translation.reply!)?.file?.fingerprint == before.fingerprint)
+
+        let beforeRetry = client.conversationMessages.count
+        let rejectedQuestion = "请逐段分析从“OPENING THISTLE”到“PAGE_52_END”的完整原文。FAIL_SEGMENT"
+        client.draft = rejectedQuestion
         client.submitResearch()
-        try await approve(true)
-        try await wait("retry remaining chunks") { !client.pdfRequestRunning }
-        precondition(client.pdfRequestStatus?.contains("已完成 \(all.count)/\(all.count) 段") == true, client.pdfRequestStatus ?? "")
-        precondition(client.conversationMessages.count == count + all.count + 1)
-        precondition(client.conversationMessages.filter { $0.reply?.requestId == savedFirst }.count == 1)
+        try await wait("reject one background chunk") { !client.pdfRequestRunning }
+        precondition(client.pdfRequestStatus?.contains("已处理 1/") == true && client.conversationMessages.count == beforeRetry)
+        precondition(client.draft == rejectedQuestion)
+        client.submitResearch()
+        try await wait("retry incomplete background parts without resubmitting the first") { !client.pdfRequestRunning }
+        if let error = client.lastError { throw ResearchMaterialError.message(error) }
+        expectPair(after: beforeRetry, question: rejectedQuestion)
         let cancelledRange = "CANCEL_SEGMENT 请把从 OPENING THISTLE 到 ABSENT BATCH TERMINAL 的原文逐段翻译成中文。"
         client.draft = cancelledRange
         client.submitResearch()
         try await wait("batch correction") { client.pdfRangeReview?.anchors?.end == "ABSENT BATCH TERMINAL" }
         client.resolveRangeReview(client.pdfRangeReview!.id, choice: .edit(.init(start: "OPENING THISTLE", end: "PAGE_52_END")))
-        try await approve(true)
+        // The explicit part receipt is independent of the visible window's status polling.
+        client.setResearchWindowForeground(true)
+        client.beginResearchPolling()
         try await wait("cancel one admitted part") { client.conversationRunning }
         client.stopPDFWork()
         try await wait("cancel") { !client.pdfRequestRunning }
+        client.stopResearchPolling()
+        client.setResearchWindowForeground(false)
         precondition(client.pdfRequestStatus?.contains("已停止") == true && client.draft == cancelledRange)
         precondition(before.matches(file))
         let blank = folder.appendingPathComponent("blank.pdf")
@@ -408,6 +425,32 @@ struct LongPDFCheck {
         client.stopPDFWork()
         try await Task.sleep(for: .milliseconds(250))
         precondition(!client.loadingResearchFile && client.fixedMaterial == nil)
+        client.loadFixedMaterial(blank)
+        try await wait("partially readable attachment") { !client.loadingResearchFile && client.fixedMaterial?.pdfIndex != nil }
+        let partialQuestion = "请根据文件第 1–2 页已有的有效证据，总结实验结论，标出未能核验的页。只作简短总结。"
+        client.draft = partialQuestion
+        client.submitResearch()
+        try await wait("verified excerpts reach the wire with omissions") {
+            (!client.hasPendingSubmission && client.conversationMessages.last?.reply?.question.hasPrefix(partialQuestion) == true)
+                || client.lastError != nil
+        }
+        if let error = client.lastError { throw ResearchMaterialError.message(error) }
+        let partial = client.conversationMessages.last!.reply!
+        precondition(partial.question == partialQuestion)
+        precondition(partial.material?.scope?.contains("部分证据") == true && partial.material?.text.contains("PAGE_1_START") == true)
+        precondition(partial.material?.text.contains("PAGE_2_START") == false)
+        let storedPartial = store.read(session: client.sessionID!, reply: partial)
+        precondition(storedPartial?.pdfPages == "1" && storedPartial?.evidenceChecks?.contains {
+            $0.target.contains("第 2 页") && $0.status == .missing
+        } == true)
+        let beforeStrict = client.conversationMessages.count
+        let strictPartial = "逐句翻译第1到2页的完整原文。"
+        client.draft = strictPartial
+        client.submitResearch()
+        try await wait("no admission for partially verified translation") { !client.pdfRequestRunning && client.lastError != nil }
+        precondition(client.lastError?.contains("第 2 页") == true && client.conversationMessages.count == beforeStrict)
+        precondition(client.draft == strictPartial)
+        print("PASS partial PDF wire evidence and durable gap, while exact translation retains its unsubmitted draft.")
         let scanned = folder.appendingPathComponent("scanned.pdf")
         try makeFixture(scanned, pages: 1, scanOnly: true)
         client.loadFixedMaterial(scanned)
@@ -465,7 +508,7 @@ struct LongPDFCheck {
         client.submitResearch()
         client.submitResearch()
         try await wait("same text after replacing the inode") {
-            client.conversationMessages.count == countBeforeIdentical + 1 && !client.hasPendingSubmission
+            client.conversationMessages.count == countBeforeIdentical + 2 && !client.hasPendingSubmission
         }
         precondition(client.conversationMessages.last?.reply?.material?.text == "SESSION A ONLY")
         let changedText = Data("SESSION A ELSE".utf8)
@@ -493,7 +536,7 @@ struct LongPDFCheck {
         try changedText.write(to: text)
         client.submitResearch()
         try await wait("restored file sends exactly once") {
-            client.conversationMessages.count == countBeforeMissing + 1 && !client.hasPendingSubmission
+            client.conversationMessages.count == countBeforeMissing + 2 && !client.hasPendingSubmission
         }
         precondition(client.materialError == nil && client.conversationMessages.last?.reply?.material?.text == "SESSION A ELSE")
         client.removeResearchFile()
@@ -543,7 +586,7 @@ struct LongPDFCheck {
         client.resolveLayoutReview(current.id, accept: true)
         client.resolveLayoutReview(current.id, accept: true)
         try await wait("confirmed grid appears once") {
-            !client.pdfRequestRunning && client.conversationMessages.count == initialCount + 1
+            !client.pdfRequestRunning && client.conversationMessages.count == initialCount + 2
         }
         let gridReply = client.conversationMessages.last!.reply!
         precondition(gridReply.material?.text == reviewed.text && gridReply.material?.scope == reviewed.scope)
@@ -552,16 +595,17 @@ struct LongPDFCheck {
                                                                source: "TextEdit", title: "Grid selection")
         let gridSelection = client.beginResearchSelectionCapture()!
         client.finishResearchSelectionCapture(gridSelection, result: .success(selectedGridText))
-        let cancelQuestion = "结合论文解释这段观测的含义"
-        let cancelledPlan = try await awaitReview(cancelQuestion, count: initialCount + 1)
+        let gridExcerpt = "结合选区解释论文第1页的观测"
+        let cancelQuestion = gridExcerpt + "含义，必须完整核对该页原文。"
+        let cancelledPlan = try await awaitReview(cancelQuestion, count: initialCount + 2)
         client.resolveLayoutReview(cancelledPlan.id, accept: false)
-        try await wait("cancel does not query the planner again") { !client.pdfRequestRunning }
-        precondition(client.draft == cancelQuestion && client.conversationMessages.count == initialCount + 1)
-        let combinedGrid = try await awaitReview("结合论文解释这段观测的依据", count: initialCount + 1)
+        try await wait("a declined local review returns the draft") { !client.pdfRequestRunning }
+        precondition(client.draft == cancelQuestion && client.conversationMessages.count == initialCount + 2)
+        let combinedGrid = try await awaitReview(gridExcerpt + "依据，必须完整核对该页原文。", count: initialCount + 2)
         let candidate = combinedGrid.evidence.materials[0]
         client.resolveLayoutReview(combinedGrid.id, accept: true)
         try await wait("approved combined evidence") {
-            !client.pdfRequestRunning && client.conversationMessages.count == initialCount + 2
+            !client.pdfRequestRunning && client.conversationMessages.count == initialCount + 4
         }
         let combinedReply = client.conversationMessages.last!.reply!
         precondition(combinedReply.material?.text.contains(selectedGridText.text) == true &&
@@ -570,8 +614,8 @@ struct LongPDFCheck {
         precondition(combinedSource?.backgroundFile?.fingerprint == combinedGrid.reference.fingerprint &&
                      combinedSource?.backgroundPages == "1" && combinedSource?.backgroundPositions?.isEmpty == false)
         print("PASS cancelled, invalidated and stale layout reviews cannot transmit; exact accepted candidate reaches the socket and durable source once.")
-        print("PASS empty/failed/short/unrelated selection, inferred ranges, two evidence reads on one model, strict selection, preserved draft and resumed chunks.")
+        print("PASS empty/failed/short/unrelated selection, inferred ranges, strict selection, preserved draft and resumed chunks.")
         print("PASS chooser auto-link, draft migration, new-session isolation, stale chooser, return/relaunch, same-bytes metadata and inode changes, changed/missing/recovered files, cancellation and detachment.")
-        print("PASS 52-page native import, local Vision OCR on 37, front/middle/end and keyword question wire evidence, all ordered translation/analysis parts and final synthesis, reply provenance, reject/cancel/unreadable page and changed file.")
+        print("PASS 52-page import, OCR on page 37, local summary and follow-up, exact range in one visible pair, background retry without resending the first chunk, and durable provenance.")
     }
 }

@@ -1,9 +1,147 @@
+import CoreGraphics
+import CoreText
 import Darwin
 import Foundation
+import ImageIO
 import XCTest
 @testable import DSHPet
 
 final class CommandSocketHandshakeTests: XCTestCase {
+    func testManualImagesAndPDFRegionsShareOneTransportBudget() throws {
+        let limits = DSHPetImageLimits(maxImageBytes: 10, maxImagesPerMessage: 3, maxMessageImageBytes: 16,
+                                      mediaTypes: ["image/jpeg", "image/png"], maxImagePixels: nil, maxImageDimension: nil)
+        let image = DSHPetDraftImage(id: "image", path: "", mediaType: "image/png", name: "image.png", bytes: 8, error: nil)
+        let crop = Data(repeating: 7, count: 4)
+        XCTAssertNoThrow(try DSHPetCommandClient.validateTurnImageBudget(userImages: [image],
+                                                                         documentImages: [crop, crop], limits: limits))
+        XCTAssertThrowsError(try DSHPetCommandClient.validateTurnImageBudget(userImages: [image, image],
+                                                                             documentImages: [crop], limits: limits))
+        XCTAssertThrowsError(try DSHPetCommandClient.validateTurnImageBudget(userImages: [image],
+                                                                             documentImages: [crop, crop, crop], limits: limits))
+    }
+
+    @MainActor
+    func testResearchTurnSendsVerifiedFigureSelectionAndManualImageTogether() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("rc-mixed-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let path = "/tmp/rc-mixed-\(UUID().uuidString.prefix(8)).sock"
+        let instance = makeInstance(id: "selected", status: "/tmp/selected-status.sock", command: path)
+        let server = try CommandSocketServer(path: path, instance: instance, researchImages: true)
+        defer { server.stop() }
+        let suite = "ResearchMixedImagesTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let client = DSHPetCommandClient(defaults: defaults, socketPath: path,
+            provenanceStore: ResearchProvenanceStore(root: root.appendingPathComponent("sources")),
+            draftImageStorage: root.appendingPathComponent("drafts"))
+        XCTAssertTrue(client.configure(instance: instance))
+        client.start()
+        defer { client.stop() }
+        await server.waitForAction("workspaces")
+        for _ in 0..<100 where client.selectedWorkspaceID == nil {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        client.refreshModelCatalog()
+        for _ in 0..<100 where client.selectedResearchModel == nil {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(client.selectedResearchModel?.reasoningEffort, "high")
+        let pdf = root.appendingPathComponent("source.pdf")
+        let image = root.appendingPathComponent("manual.png")
+        try writeMixedEvidenceFixtures(pdf: pdf, image: image)
+        XCTAssertTrue(client.beginResearchFileChoice())
+        client.finishResearchFileChoice(pdf)
+        for _ in 0..<100 where client.loadingResearchFile {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(client.canUseAssociatedFile, client.materialError ?? "")
+        let selection = try ResearchMaterial.selection("This is the independently selected observation.",
+                                                       source: "TextEdit", title: "Synthetic selection")
+        let capture = try XCTUnwrap(client.beginResearchSelectionCapture())
+        client.finishResearchSelectionCapture(capture, result: .success(selection))
+        XCTAssertTrue(client.beginResearchFileChoice())
+        client.finishDraftImageChoice([image])
+        for _ in 0..<100 where client.importingDraftImages {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let imported = try XCTUnwrap(client.draftImages.first)
+        let expectedImage = try Data(contentsOf: imported.fileURL)
+        let question = "结合论文解释这段选区、Fig. 3 和附加图片。"
+        client.draft = question
+        client.submitResearch()
+        await server.waitForActionCount("researchPrompt", atLeast: 1)
+        let prompt = try XCTUnwrap(server.mixedPrompt())
+        XCTAssertEqual(prompt["text"] as? String, question)
+        XCTAssertEqual(prompt["selection"] as? [String: String], CommandSocketServer.visionSelection)
+        let material = try XCTUnwrap(prompt["material"] as? [String: Any])
+        let body = try XCTUnwrap(material["text"] as? String)
+        XCTAssertTrue(body.contains(selection.text))
+        XCTAssertTrue(body.contains("The last observation is the audited modulation signal."))
+        let crops = try XCTUnwrap(prompt["images"] as? [[String: String]])
+        XCTAssertEqual(crops.count, 2)
+        XCTAssertTrue(crops.allSatisfy { $0["mediaType"] == "image/jpeg" && ($0["name"] ?? "").hasPrefix("PDF-region-") })
+        let attachments = try XCTUnwrap(prompt["userImages"] as? [[String: String]])
+        XCTAssertEqual(attachments.count, 1)
+        XCTAssertEqual(attachments.first?["data"], expectedImage.base64EncodedString())
+        XCTAssertEqual(server.actionCount("createSession"), 1)
+        XCTAssertEqual(server.actionCount("researchPrompt"), 1)
+        XCTAssertEqual(server.actionCount("researchDocumentPlan"), 0)
+        XCTAssertEqual(server.actionCount("prompt"), 0)
+        for _ in 0..<100 where client.submissionStatus == .submitting {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(client.draft.isEmpty)
+        XCTAssertTrue(client.draftImages.isEmpty)
+        XCTAssertEqual(client.availableResearchSelection?.text, selection.text)
+        XCTAssertTrue(client.hasAssociatedFile)
+    }
+
+    private func writeMixedEvidenceFixtures(pdf: URL, image: URL) throws {
+        var page = CGRect(x: 0, y: 0, width: 612, height: 792)
+        let consumer = try XCTUnwrap(CGDataConsumer(url: pdf as CFURL))
+        let canvas = try XCTUnwrap(CGContext(consumer: consumer, mediaBox: &page, nil))
+        let small = CTFontCreateWithName("Helvetica" as CFString, 8, nil)
+        let normal = CTFontCreateWithName("Helvetica" as CFString, 11, nil)
+        let equation = CTFontCreateWithName("Helvetica" as CFString, 15, nil)
+        func line(_ text: String, _ x: CGFloat, _ y: CGFloat, _ font: CTFont) {
+            canvas.textPosition = CGPoint(x: x, y: y)
+            CTLineDraw(CTLineCreateWithAttributedString(NSAttributedString(string: text,
+                attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font])), canvas)
+        }
+        canvas.beginPDFPage(nil)
+        let paragraphs = ["This paragraph motivates the calibration.", "The fixture prints both lanes in parallel.",
+            "Figure 3a illustrates the control array.", "The output is sampled every five minutes.",
+            "These measurements establish a reference."]
+        for (i, text) in paragraphs.enumerated() {
+            line(text, 48, 741 - CGFloat(14 * i), normal)
+            line("Independent right column. " + text.prefix(17), 323, 741 - CGFloat(14 * i), normal)
+        }
+        canvas.setStrokeColor(gray: 0, alpha: 1)
+        canvas.setLineWidth(1)
+        canvas.stroke(CGRect(x: 46, y: 471, width: 253, height: 178))
+        canvas.setFillColor(red: 0.2, green: 0.4, blue: 0.8, alpha: 1)
+        canvas.fill(CGRect(x: 55, y: 539, width: 105, height: 96))
+        canvas.fill(CGRect(x: 176, y: 545, width: 113, height: 87))
+        canvas.setFillColor(gray: 0, alpha: 1)
+        line("(a) Control", 56, 642, small)
+        line("(b) Measured", 177, 641, small)
+        line("Fig. 3. A diagram with two panels and a formula.", 51, 527, small)
+        line("The shaded bars show the complete reference and test grids.", 51, 516, small)
+        line("The notation ∥u∥ = c.", 51, 500, equation)
+        line("The last observation is the audited modulation signal.", 51, 480, small)
+        line("The independent following paragraph is absent from the caption.", 48, 442, normal)
+        canvas.endPDFPage()
+        canvas.closePDF()
+        let raster = try XCTUnwrap(CGContext(data: nil, width: 16, height: 16, bitsPerComponent: 8,
+            bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        raster.setFillColor(red: 0.8, green: 0.1, blue: 0.3, alpha: 1)
+        raster.fill(CGRect(x: 0, y: 0, width: 16, height: 16))
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(image as CFURL, "public.png" as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, try XCTUnwrap(raster.makeImage()), nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+    }
+
     @MainActor
     func testTwoPromptsReuseTheSameNonblankSessionWithoutCreatingAgain() async throws {
         let path = "/tmp/research-session-\(UUID().uuidString.prefix(8)).sock"
@@ -311,6 +449,7 @@ final class CommandSocketHandshakeTests: XCTestCase {
 }
 
 private final class CommandSocketServer: @unchecked Sendable {
+    static let visionSelection = ["provider": "chatgpt", "model": "fixture-vision", "reasoningEffort": "high"]
     private let listener: Int32
     private let path: String
     private let instance: HarnessInstance
@@ -319,13 +458,15 @@ private final class CommandSocketServer: @unchecked Sendable {
     private let previewSupport: Bool
     private let disconnectOnPrompt: Bool
     private let rejectPrompt: Bool
+    private let researchImages: Bool
     private let createSessionRelease = DispatchSemaphore(value: 0)
     private let lock = NSLock()
     private var clients: [Int32] = []
     private var sessionIDs: [String] = []
+    private var mixedResearchPrompt: [String: Any]?
     private(set) var actions: [String] = []
 
-    init(path: String, instance: HarnessInstance, delayCreateSession: Bool = false, candidateSupport: Bool = false, previewSupport: Bool = false, disconnectOnPrompt: Bool = false, rejectPrompt: Bool = false) throws {
+    init(path: String, instance: HarnessInstance, delayCreateSession: Bool = false, candidateSupport: Bool = false, previewSupport: Bool = false, disconnectOnPrompt: Bool = false, rejectPrompt: Bool = false, researchImages: Bool = false) throws {
         self.path = path
         self.instance = instance
         self.delayCreateSession = delayCreateSession
@@ -333,6 +474,7 @@ private final class CommandSocketServer: @unchecked Sendable {
         self.previewSupport = previewSupport
         self.disconnectOnPrompt = disconnectOnPrompt
         self.rejectPrompt = rejectPrompt
+        self.researchImages = researchImages
         listener = try Self.makeListener(path: path)
         DispatchQueue.global().async { [weak self] in self?.acceptLoop() }
     }
@@ -351,6 +493,8 @@ private final class CommandSocketServer: @unchecked Sendable {
     func actionCount(_ action: String) -> Int {
         lock.withLock { actions.filter { $0 == action }.count }
     }
+
+    func mixedPrompt() -> [String: Any]? { lock.withLock { mixedResearchPrompt } }
 
     func waitForActionCount(_ action: String, atLeast count: Int) async {
         // The client waits two seconds before reconnecting. Leave room for
@@ -409,7 +553,10 @@ private final class CommandSocketServer: @unchecked Sendable {
                 guard let request = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                       let id = request["id"] as? String,
                       let action = request["action"] as? String else { continue }
-                lock.withLock { actions.append(action) }
+                lock.withLock {
+                    actions.append(action)
+                    if action == "researchPrompt" { mixedResearchPrompt = request }
+                }
                 if action == "prompt", disconnectOnPrompt {
                     Darwin.shutdown(client, SHUT_RDWR)
                     return
@@ -419,7 +566,12 @@ private final class CommandSocketServer: @unchecked Sendable {
                     response = [
                         "id": id, "ok": true, "protocolVersion": 1,
                         "commandSocket": true, "supports": ["workspaces"]
-                            + (candidateSupport ? ["fileCandidates"] : []) + (previewSupport ? ["taskPreview"] : []),
+                            + (candidateSupport ? ["fileCandidates"] : []) + (previewSupport ? ["taskPreview"] : [])
+                            + (researchImages ? ["conversation", "researchContext", "researchPrompt", "researchMaterial",
+                                "researchDocumentPlan", "researchDocumentImages", "researchUserImages", "imageAttachments",
+                                "modelCatalog", "researchSelectModel"] : []),
+                        "attachmentLimits": ["maxImageBytes": 5_000_000, "maxImagesPerMessage": 4,
+                            "maxMessageImageBytes": 10_000_000, "mediaTypes": ["image/png", "image/jpeg"]],
                         "instance": [
                             "protocolVersion": instance.protocolVersion,
                             "instanceId": instance.instanceId,
@@ -448,8 +600,20 @@ private final class CommandSocketServer: @unchecked Sendable {
                             "id": id, "ok": false,
                             "error": ["code": "test/rejected", "message": "rejected by test"],
                         ]
-                    } else if action == "prompt" {
+                    } else if action == "prompt" || action == "researchPrompt" {
                         response = ["id": id, "ok": true, "accepted": true, "sessionId": request["sessionId"] ?? ""]
+                    } else if action == "modelCatalog" {
+                        response = ["id": id, "ok": true, "catalog": [
+                            "defaultSelection": Self.visionSelection, "groups": [[
+                                "id": "chatgpt", "name": "Test", "models": [["id": "fixture-vision", "name": "Fixture vision",
+                                    "inputModalities": ["text", "image"], "reasoning": [
+                                        "defaultEffort": "high", "efforts": [["id": "high", "name": "High"]]]]],
+                            ]],
+                        ]]
+                    } else if action == "conversation" {
+                        response = ["id": id, "ok": true, "messages": [], "selection": Self.visionSelection]
+                    } else if action == "researchSelectModel" {
+                        response = ["id": id, "ok": true, "selected": Self.visionSelection]
                     } else if action == "createSession" {
                         if let session = request["sessionId"] as? String {
                             lock.withLock { if !sessionIDs.contains(session) { sessionIDs.append(session) } }

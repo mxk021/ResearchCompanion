@@ -2,6 +2,20 @@ import AppKit
 
 /// The hint belongs to the editor so its baseline follows AppKit's text layout.
 final class ComposerTextView: NSTextView {
+    var imagePasteboardTypes: [NSPasteboard.PasteboardType] = []
+    var imagePasteboardHandler: ((NSPasteboard) -> Bool)?
+    var imageDragOperation: ((NSPasteboard) -> NSDragOperation?)?
+
+    override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
+        let text = super.readablePasteboardTypes
+        return text + imagePasteboardTypes.filter { !text.contains($0) }
+    }
+
+    override var acceptableDragTypes: [NSPasteboard.PasteboardType] {
+        let text = super.acceptableDragTypes
+        return text + imagePasteboardTypes.filter { !text.contains($0) }
+    }
+
     var placeholder = "" {
         didSet {
             guard oldValue != placeholder else { return }
@@ -28,6 +42,40 @@ final class ComposerTextView: NSTextView {
             || command == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:))
     }
 
+    override func paste(_ sender: Any?) {
+        if !hasMarkedText(), imagePasteboardHandler?(NSPasteboard.general) == true { return }
+        super.paste(sender)
+    }
+
+    override func readSelection(from pboard: NSPasteboard) -> Bool {
+        if !hasMarkedText(), imagePasteboardHandler?(pboard) == true { return true }
+        return super.readSelection(from: pboard)
+    }
+
+    override func dragOperation(for dragInfo: any NSDraggingInfo, type: NSPasteboard.PasteboardType) -> NSDragOperation {
+        if let operation = imageDragOperation?(dragInfo.draggingPasteboard) {
+            return !hasMarkedText() && dragInfo.draggingSourceOperationMask.contains(.copy) ? operation : []
+        }
+        return super.dragOperation(for: dragInfo, type: type)
+    }
+
+    override func prepareForDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        if let operation = imageDragOperation?(sender.draggingPasteboard) {
+            return !hasMarkedText() && operation.contains(.copy) && sender.draggingSourceOperationMask.contains(.copy)
+        }
+        return super.prepareForDragOperation(sender)
+    }
+
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        if let operation = imageDragOperation?(sender.draggingPasteboard) {
+            defer { cleanUpAfterDragOperation() }
+            return !hasMarkedText() && operation.contains(.copy) &&
+                sender.draggingSourceOperationMask.contains(.copy) &&
+                imagePasteboardHandler?(sender.draggingPasteboard) == true
+        }
+        return super.performDragOperation(sender)
+    }
+
     // The Edit menu sends these selectors through the responder chain. Keep
     // the editor's undo state local, rather than using the window's manager.
     @objc func undo(_ sender: Any?) {
@@ -42,6 +90,9 @@ final class ComposerTextView: NSTextView {
         switch item.action {
         case #selector(undo(_:)): return draftUndoManager.canUndo && !hasMarkedText()
         case #selector(redo(_:)): return draftUndoManager.canRedo && !hasMarkedText()
+        case #selector(NSTextView.paste(_:)):
+            if !hasMarkedText(), imageDragOperation?(NSPasteboard.general)?.contains(.copy) == true { return true }
+            return super.validateUserInterfaceItem(item)
         default: return super.validateUserInterfaceItem(item)
         }
     }

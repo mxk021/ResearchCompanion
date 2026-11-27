@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import CoreText
 
 /// Run against the isolated socket from check-long-pdf.py. No desktop source, general pasteboard,
 /// live library, existing session, or provider is involved.
@@ -338,6 +339,74 @@ import ApplicationServices
         let withPage = try ResearchZoteroSelection.decode(location, status: 200, requestID: id)
         precondition(withPage.zoteroLocation?.url?.absoluteString == "zotero://open-pdf/groups/42/items/ABCD1234?page=4")
         precondition(withPage.fields["url"] == nil && withPage.page == "iv")
+        // The opt-in path is local only and belongs to the exact same reader attachment.
+        func samplePDF(_ filename: String, text: String) -> URL {
+            let url = folder.appendingPathComponent(filename)
+            var box = CGRect(x: 0, y: 0, width: 612, height: 792)
+            let pdf = CGContext(url as CFURL, mediaBox: &box, nil)!
+            let font = CTFontCreateWithName("Helvetica" as CFString, 14, nil)
+            pdf.beginPDFPage(nil)
+            let line = CTLineCreateWithAttributedString(NSAttributedString(string: text,
+                attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font]))
+            pdf.textPosition = CGPoint(x: 62, y: 711)
+            CTLineDraw(line, pdf)
+            pdf.endPDFPage()
+            pdf.closePDF()
+            return url
+        }
+        func packet(_ request: DSHPetCommandClient.SelectionRequest, _ file: URL, _ key: String,
+                    _ text: String, fault: String? = nil) throws -> ResearchMaterial {
+            let stamp = try ResearchFileReference.fileStamp(file)
+            let bytes = stamp.size + (fault == "version" ? 1 : 0)
+            let time = Int64(stamp.modifiedSeconds) * 1000 + Int64(stamp.modifiedNanos / 1_000_000)
+            let local: [String: Any] = ["attachmentID": 42, "attachmentKey": fault == "identity" ? "UNLINKED" : key,
+                "library": "library", "path": file.path, "bytes": bytes, "modifiedMs": time]
+            let live: [String: Any] = ["requestId": request.id.uuidString, "title": "Zotero fixture", "text": text,
+                "capture": ["method": "pdf-canvas", "tabID": "fixture-zotero", "attachmentID": 42, "attachmentKey": key],
+                "location": ["library": "library", "attachmentKey": key, "pageIndex": 0], "pdfFile": local]
+            return try ResearchZoteroSelection.decode(JSONSerialization.data(withJSONObject: ["ok": true, "liveSelection": live]),
+                                                       status: 200, requestID: request.id)
+        }
+        let firstText = "ZOTERO fixture alpha: The optical threshold is 8291 units."
+        let secondText = "ZOTERO fixture beta: The detector gain is 9326 units."
+        let fileA = samplePDF("zotero-first.pdf", text: firstText)
+        let fileB = samplePDF("zotero-second.pdf", text: secondText)
+        let stale = client.beginResearchSelectionCapture()!
+        let freshPDF = client.beginResearchSelectionCapture()!
+        let materialA = try packet(freshPDF, fileA, "ZOTO0001", firstText)
+        client.finishResearchSelectionCapture(stale, result: .success(try packet(stale, fileB, "ZOTO0002", secondText)))
+        precondition(client.fixedMaterial == nil)
+        precondition(materialA.zoteroPDF?.localURL == fileA && !materialA.fields.values.contains(fileA.path))
+        client.finishResearchSelectionCapture(freshPDF, result: .success(materialA))
+        try await wait { !client.loadingResearchFile && client.fixedMaterial?.pdfIndex != nil }
+        let existingIndex = client.fixedMaterial!.pdfIndex
+        let repeatPDF = client.beginResearchSelectionCapture()!
+        client.finishResearchSelectionCapture(repeatPDF, result: .success(try packet(repeatPDF, fileA, "ZOTO0001", firstText)))
+        precondition(!client.loadingResearchFile && client.fixedMaterial?.pdfIndex === existingIndex)
+        client.draft = "结合会话文件解释选区，核对文件第 1 页。"
+        precondition(client.researchMaterialSummary(.ask).contains("完整选区和当前 PDF"))
+        let combinedPDF = try client.availableResearchSelection!.addingBackground(
+            client.fixedMaterial!, question: "核对 PDF 文件第 1 页。")
+        precondition(combinedPDF.backgroundFile == client.fixedMaterial?.fileReference
+            && combinedPDF.text.contains(firstText) && !combinedPDF.text.contains(secondText))
+        client.draft = ""
+        let nextPDF = client.beginResearchSelectionCapture()!
+        let materialB = try packet(nextPDF, fileB, "ZOTO0002", secondText)
+        client.finishResearchSelectionCapture(nextPDF, result: .success(materialB))
+        try await wait { !client.loadingResearchFile && client.fixedMaterial?.title == fileB.lastPathComponent }
+        precondition(client.availableResearchSelection?.text == secondText)
+        let mismatched = client.beginResearchSelectionCapture()!
+        let incorrect = try packet(mismatched, fileA, "ZOTO0001", firstText, fault: "identity")
+        precondition(incorrect.zoteroPDF == nil && incorrect.zoteroLocation?.attachmentKey == "ZOTO0001")
+        client.finishResearchSelectionCapture(mismatched, result: .success(incorrect))
+        precondition(!client.hasAssociatedFile && client.availableResearchSelection?.text == firstText)
+        let obsolete = client.beginResearchSelectionCapture()!
+        client.finishResearchSelectionCapture(obsolete, result: .success(try packet(obsolete, fileB, "ZOTO0002", secondText, fault: "version")))
+        try await wait { !client.loadingResearchFile }
+        precondition(!client.hasAssociatedFile && client.availableResearchSelection?.text == secondText)
+        precondition(client.selectionError?.contains("文件版本已变化") == true)
+        client.removeResearchSelection()
+        print("Zotero auto attachment passed stale IDs, local-only path, index reuse, PDF switch, identity and file-version rejection.")
         let exactPDF = URL(string: "https://example.org/paper.pdf?edition=2#page=7")!
         precondition(ResearchBrowserNavigation.isExactPage(exactPDF.absoluteString, exactPDF))
         precondition(!ResearchBrowserNavigation.isExactPage("https://example.org/paper.pdf?edition=2#page=8", exactPDF))

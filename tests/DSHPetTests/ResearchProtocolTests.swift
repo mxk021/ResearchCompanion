@@ -58,6 +58,11 @@ final class ResearchProtocolTests: XCTestCase {
         XCTAssertThrowsError(try ResearchProtocol.decodeMessages([["role": "assistant", "text": 42]]))
     }
 
+    func testMissingSubscriptionSnapshotIsSafeToDecode() {
+        XCTAssertNil(ResearchProtocol.decode(MoodBridgeSnapshot.self, from: NSNull()))
+        XCTAssertNil(ResearchProtocol.decode(MoodBridgeSnapshot.self, from: "unavailable"))
+    }
+
     func testHistoryKeepsOriginalPromptWhileDisplayingOnlyTheQuestion() throws {
         let prompts = [
             ("Persona\n【原文】Exact quotation\n【用户问题】Explain the result", "Explain the result"),

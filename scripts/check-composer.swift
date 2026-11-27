@@ -87,7 +87,28 @@ private struct ComposerCheck {
         precondition(submitTracking.count == 0 && editor.string == "第一行\n", "Shift+Return sent or failed to insert a newline")
         editor.keyDown(with: returnEvent(in: window, modifiers: []))
         precondition(submitTracking.count == 1 && editor.string == "第一行\n", "Return failed to submit or inserted a newline")
-        print("PASS native editor layout in light and dark, marked-text commit, Return and Shift+Return, scoped undo")
+
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        var attached = 0
+        editor.imagePasteboardHandler = { board in
+            guard board.types?.contains(.png) == true else { return false }
+            attached += 1
+            return true
+        }
+        editor.replaceDraft(with: "问题")
+        editor.setSelectedRange(NSRange(location: editor.string.utf16.count, length: 0))
+        board.clearContents()
+        precondition(board.setData(Data([137, 80, 78, 71, 13, 10]), forType: .png))
+        let revision = board.changeCount
+        precondition(editor.readSelection(from: board), "Image was not forwarded as a local attachment")
+        precondition(attached == 1 && editor.string == "问题" && board.changeCount == revision,
+                     "Image ingestion changed the message text or clipboard")
+        board.clearContents()
+        precondition(board.setString("补充", forType: .string))
+        precondition(editor.readSelection(from: board) && editor.string == "问题补充", "Native text paste regressed")
+        precondition(attached == 1 && submitTracking.count == 1, "Pasting triggered submission")
+        print("PASS native editor light/dark, IME, Return, scoped undo, local image intake and ordinary text paste")
     }
 
     @MainActor private class SubmitTracking: NSObject, NSTextViewDelegate {

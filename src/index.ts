@@ -20,7 +20,7 @@ import { basename, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { mkdir, readFile } from 'node:fs/promises'
 import { ResearchRetirement } from './ResearchRetirement.js'
-import { decodeResearchHistory, researchPromptMetadata } from './ResearchHistory.js'
+import { projectResearchHistory, researchPromptMetadata, type ResearchPDFBatch } from './ResearchHistory.js'
 import { projectedSessionTitle, researchSessionIndexPage, type ResearchIndexSummary, type ResearchSessionQuery } from './ResearchSessionIndex.js'
 import {
   accountProviderAllowed, decodeResearchSelection, researchModelCatalog, sameResearchSelection, verifyResearchSelection,
@@ -153,7 +153,7 @@ export function apply(ctx: Context): void {
   const sessionStates = new Map<string, SessionMoodState>()
   const unconfirmedSessions = new Set<string>()
   const sessionOperations = new Map<string, Promise<void>>()
-  type VerifiedCrop = { attachmentId: string; source: string; normalized: string }
+  type VerifiedImage = { kind: 'user' | 'crop'; attachmentId: string; source: string; normalized: string }
   type ImageRef = { attachmentId: string }
   type DocumentAttachmentStore = {
     readImage(ref: unknown, signal: AbortSignal): Promise<{ data: Uint8Array }>
@@ -166,12 +166,12 @@ export function apply(ctx: Context): void {
   type BridgeTiming = {
     prepareMs: number; normalizeMs: number; scheduleMs: number; providerFirstTextMs?: number; providerFinishMs?: number
   }
-  const pendingModelRuns = new Map<string, { requestId: string; selection: ResearchSelection; turn?: number; crops?: VerifiedCrop[]; verifiedText?: string;
-    requestedAt?: number; timing?: { prepareMs: number; normalizeMs: number; queueAt: number } }>()
+  const pendingModelRuns = new Map<string, { requestId: string; selection: ResearchSelection; turn?: number; images?: VerifiedImage[]; verifiedText?: string;
+    requestedAt?: number; hiddenPDFPart?: boolean; timing?: { prepareMs: number; normalizeMs: number; queueAt: number } }>()
   // One non-durable fingerprint per recent session, observable only by exact
   // request ID. This is the DSH adapter-entry request, not a server receipt.
   const dispatchEvidence = new Map<string, {requestId: string; selection: ResearchSelection; sha256: string; utf16Length: number;
-    images?: string[]; sourceImages?: string[]; requestedAt?: number; dispatchedAt?: number; firstTextAt?: number; finishedAt?: number;
+    images?: string[]; sourceImages?: string[]; userImages?: string[]; requestedAt?: number; dispatchedAt?: number; firstTextAt?: number; finishedAt?: number;
     timing?: BridgeTiming; dispatchTick?: number}>()
   const recentModelReceipts = new Map<string, { requestId: string; selection: ResearchSelection }>()
   const streams = new Map<string, { stream: ResearchStream; revision: number; publishTimer?: ReturnType<typeof setTimeout> }>()
@@ -506,28 +506,31 @@ export function apply(ctx: Context): void {
           if (evidence) {
             matched = true
             const sha256 = createHash('sha256').update(evidence.text).digest('hex')
-            let images: string[] | undefined
             if (pin.verifiedText && sha256 !== pin.verifiedText) throw new Error('模型入口的原文与本轮快照不一致。')
-            if (pin.crops?.length) {
+            const expectedImages = pin.images ?? []
+            if (expectedImages.length) {
               const attached = message.content.filter(part => part.type === 'image' && !('offloaded' in part && part.offloaded))
-              if (attached.length !== pin.crops.length || typeof attachmentStore.readImage !== 'function') {
-                throw new Error('科研材料或实际裁图数量与本轮快照不一致。')
+              if (attached.length !== expectedImages.length || typeof attachmentStore.readImage !== 'function') {
+                throw new Error('模型入口的附图或原页裁图数量与本轮快照不一致。')
               }
-              images = await Promise.all(attached.map(async (part, index) => {
-                if (!('attachment' in part) || (part.attachment as ImageRef).attachmentId !== pin.crops?.[index]?.attachmentId) {
-                  throw new Error('模型入口缺少本轮归一化后的裁图引用。')
+              const digests = await Promise.all(attached.map(async (part, index) => {
+                if (!('attachment' in part) || (part.attachment as ImageRef).attachmentId !== expectedImages[index]?.attachmentId) {
+                  throw new Error('模型入口的附图或原页裁图顺序与本轮快照不一致。')
                 }
                 const item = await attachmentStore.readImage(part.attachment, request.signal ?? AbortSignal.timeout(8_000))
                 return createHash('sha256').update(item.data).digest('hex')
               }))
-              if (images.some((digest, index) => digest !== pin.crops?.[index]?.normalized)) {
-                throw new Error('模型入口的裁图与本轮核对的原页不同。')
+              if (digests.some((digest, index) => digest !== expectedImages[index]?.normalized)) {
+                throw new Error('模型入口的附图或原页裁图内容与本轮快照不一致。')
               }
             }
             if (dispatchEvidence.get(sessionId)?.requestId !== pin.requestId) {
               const dispatchTick = performance.now()
+              const crops = expectedImages.filter(image => image.kind === 'crop')
+              const userImages = expectedImages.filter(image => image.kind === 'user')
               dispatchEvidence.set(sessionId, {requestId:pin.requestId, selection, sha256, utf16Length:evidence.text.length,
-                ...(images ? {images, sourceImages: pin.crops?.map(crop => crop.source)} : {}),
+                ...(crops.length ? {images: crops.map(image => image.normalized), sourceImages: crops.map(image => image.source)} : {}),
+                ...(userImages.length ? {userImages: userImages.map(image => image.normalized)} : {}),
                 ...(pin.timing ? {dispatchTick, timing: {prepareMs: pin.timing.prepareMs,
                   normalizeMs: pin.timing.normalizeMs, scheduleMs: dispatchTick - pin.timing.queueAt}} : {}),
                 ...(pin.requestedAt ? {requestedAt: pin.requestedAt, dispatchedAt: Date.now()} : {})})
@@ -576,6 +579,7 @@ export function apply(ctx: Context): void {
         }
       }
     }
+    if (pendingModelRuns.get(sessionId)?.hiddenPDFPart) return
     let active = streams.get(sessionId)
     if (frame.type === 'start') {
       if (active?.publishTimer) clearTimeout(active.publishTimer)
@@ -721,8 +725,8 @@ export function apply(ctx: Context): void {
   }
 
   const admitResearchPrompt = async (request: {
-    sessionId: string; requestId: string; expectedSelection?: ResearchSelection
-  }, content: PromptContentPart[], document?: {text: string; crops: readonly PromptImage[]}, receivedAt = performance.now()) => {
+    sessionId: string; requestId: string; expectedSelection?: ResearchSelection; pdfBatch?: ResearchPDFBatch
+  }, content: PromptContentPart[], document?: {text: string; crops: readonly PromptImage[]; userImages: readonly PromptImage[]}, receivedAt = performance.now()) => {
     const prior = recentModelReceipts.get(request.sessionId)
     if (prior?.requestId === request.requestId) {
       return { accepted: true as const, sessionId: request.sessionId, selection: prior.selection }
@@ -737,40 +741,43 @@ export function apply(ctx: Context): void {
     }
     const requestedAt = Date.now()
     const selection = await verifyResearchSelection(llm(), original)
-    if (document?.crops.length) {
+    const uploads = document ? [
+      ...document.userImages.map(image => ({image, kind: 'user' as const})),
+      ...document.crops.map(image => ({image, kind: 'crop' as const})),
+    ] : []
+    if (uploads.length || content.some(part => part.type === 'image')) {
       const info = await llm()?.resolveModelInfo(selection.provider, selection.model)
       if (info?.inputModalities?.includes('image') !== true) {
-        throw new Error('当前会话模型没有声明支持图片。科研助手没有换模型或发送裁图。')
+        throw new Error('当前会话模型没有声明支持图片。本次未发送或切换模型。')
       }
     }
     await requireIdle(request.sessionId)
     if (!sameResearchSelection(original, decodeResearchSelection(agent.model?.current?.()))) {
       throw new Error('会话模型已变化，请刷新后重新发送。')
     }
-    // The native, session-scoped upload receipt names the crop after DSH's
-    // normalization. The prompt consumes that receipt without re-encoding it.
-    const crops: VerifiedCrop[] = []
+    // The native upload receipt binds the normalized image and its order to this session.
+    const images: VerifiedImage[] = []
     const normalizeStart = performance.now()
     let normalizeMs = 0
-    if (document?.crops.length) {
+    if (uploads.length) {
       const uploader = imageUploads()
-      if (!uploader) throw new Error('当前 DSH 未提供可校验的原页裁图上传。')
+      if (!uploader) throw new Error('当前 DSH 未提供可校验的图片上传。')
       const signal = AbortSignal.timeout(12_000)
-      for (const image of document.crops) {
+      for (const {image, kind} of uploads) {
         const bytes = Buffer.from(image.data,'base64')
         const {receiptId, image: ref} = await uploader.uploadImageStream({
           sessionId: request.sessionId, mediaType: image.mediaType, name: image.name, signal,
           data: (async function* () { yield bytes })(),
         })
         const normalized = await attachmentStore.readImage(ref, signal)
-        crops.push({attachmentId: ref.attachmentId, source:createHash('sha256').update(bytes).digest('hex'),
+        images.push({kind, attachmentId: ref.attachmentId, source:createHash('sha256').update(bytes).digest('hex'),
           normalized:createHash('sha256').update(normalized.data).digest('hex')})
         content.push({type:'file', receiptId})
       }
       normalizeMs = performance.now() - normalizeStart
       await requireIdle(request.sessionId)
       if (!sameResearchSelection(original, decodeResearchSelection(agent.model?.current?.()))) {
-        throw new Error('核对原页裁图期间模型已变化，请重新发送。')
+        throw new Error('核对图片期间模型已变化，请重新发送。')
       }
     }
     if (!sameResearchSelection(original, selection)) installSessionSelection(agent, selection)
@@ -778,7 +785,8 @@ export function apply(ctx: Context): void {
     const queueAt = performance.now()
     const pin = { requestId: request.requestId, selection, requestedAt,
       timing: {prepareMs: Math.max(0, queueAt - receivedAt - normalizeMs), normalizeMs, queueAt},
-      ...(document ? {verifiedText, crops} : {}) }
+      ...(request.pdfBatch && request.pdfBatch.stage !== 'result' ? {hiddenPDFPart: true} : {}),
+      ...(document ? {verifiedText, images} : {}) }
     pendingModelRuns.set(request.sessionId, pin)
     try {
       await ctx.sessionController.prompt({ requestId: request.requestId as never, sessionId: request.sessionId as never,
@@ -811,8 +819,8 @@ export function apply(ctx: Context): void {
       ...(resolveAvailable && typeof files?.list === 'function' ? ['fileCandidates'] : []),
       ...(resolveAvailable && typeof skills?.list === 'function' && typeof commands?.list === 'function' ? ['skillCandidates'] : []),
       ...(typeof (ctx.sessionController as unknown as { projections?: unknown }).projections === 'function' ? ['taskPreview'] : []),
-      'researchContext', 'researchPrompt', 'conversation', 'researchStream', 'researchMaterial',
-      ...(imageUploads() ? ['researchDocumentImages'] : []),
+      'researchContext', 'researchPrompt', 'conversation', 'researchStream', 'researchMaterial', 'researchPromptGuidance', 'researchPdfBatch',
+      ...(imageUploads() ? ['researchDocumentImages', 'researchUserImages'] : []),
       ...(researchSessionQuery() !== undefined && archiveSessionIDs() !== undefined ? ['researchHistory'] : []),
       ...(retirement.available(optionalService) ? ['researchSafeDelete','research.retirement.offline.v1'] : []),
       ...(retirement.onlineAvailable(optionalService) ? ['research.retirement.online.v1'] : []),
@@ -944,7 +952,7 @@ export function apply(ctx: Context): void {
         coldQueries.state({ sessionId }, AbortSignal.timeout(15_000)),
         ctx.sessionController.projections({ sessionId: sessionId as never }, AbortSignal.timeout(15_000)),
       ]) as unknown as [any, any, any]
-      const messages = decodeResearchHistory(result.records ?? [])
+      const { messages, completedPart } = projectResearchHistory(result.records ?? [], verifyRequestId)
       const historyRevision = createHash('sha256').update(JSON.stringify(messages)).digest('base64url')
       const lastUsed = decodeResearchSelection(projection.values?.modelSelection?.lastUsed)
       const selection = decodeResearchSelection(projection.values?.modelSelection?.next) ?? lastUsed ?? platformDefault()
@@ -953,7 +961,7 @@ export function apply(ctx: Context): void {
       const proof = verifyRequestId ? dispatchEvidence.get(sessionId) : undefined
       const publicProof = proof?.requestId === verifyRequestId && proof ? { ...proof, dispatchTick: undefined } : null
       return { ...(knownHistory === historyRevision ? { historyUnchanged: true } : { messages }),
-        ...(verifyRequestId ? {dispatchEvidence: publicProof} : {}),
+        ...(verifyRequestId ? {dispatchEvidence: publicProof, completedPart} : {}),
         historyRevision, hasMore: result.hasMore === true, cursor: result.cursor,
         running: state.running === true || (typeof state.running === 'object' && state.running?.active === true)
           || (state.queue?.length ?? 0) > 0,
@@ -970,10 +978,13 @@ export function apply(ctx: Context): void {
         if (request.contextKey && context?.key !== request.contextKey) throw new Error('当前 Zotero 原文或选区已变化，请核对预览再发。')
         // The memory seam is disabled; no invisible retention or autonomous actions.
         await noMemory.recall(request.text)
-        const text = researchPrompt(request.text, request.mode, context, await persona())
         const crops = request.documentImages
+        const userImages = request.userImages
+        const text = researchPrompt(request.text, request.mode, context, await persona(),
+          { user: userImages.length, crops: crops.length }, request.guidance, request.pdfBatch)
         return admitResearchPrompt(request, [{ type: 'text', text }],
-          context && (crops.length || context.scope?.startsWith('文档对象')) ? {text: context.text, crops} : undefined,
+          context && (request.material || crops.length || userImages.length)
+            ? {text: context.text, crops, userImages} : undefined,
           receivedAt)
       })
     },

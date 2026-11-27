@@ -40,12 +40,12 @@ final class ResearchPDFIndex: Equatable, @unchecked Sendable {
     let unavailable: Set<Int>
     static func == (left: ResearchPDFIndex, right: ResearchPDFIndex) -> Bool { left === right }
 
-    static func summaryGroups(_ notes: [String]) throws -> [String] {
+    static func summaryGroups(_ notes: [String], limit: Int = 18_000) throws -> [String] {
         var groups: [String] = []
         var group = ""
         for note in notes {
-            for part in try split(note, limit: 8_000) {
-                if group.utf16.count + part.utf16.count + 2 > 18_000 {
+            for part in try split(note, limit: min(limit, 8_000)) {
+                if !group.isEmpty && group.utf16.count + part.utf16.count + 2 > limit {
                     groups.append(group)
                     group = ""
                 }
@@ -454,7 +454,7 @@ final class ResearchPDFIndex: Equatable, @unchecked Sendable {
         // An explicit page-only or negative instruction must not initiate a paid multi-turn job.
         let limited = #"不要|不用|无需|不必|只(?:看|要|用|翻译|解释|分析|处理)|仅(?:需|看|翻译|解释|分析|处理)|\b(?:do not|don.t|skip|only)\b"#
         if value.range(of: limited, options: .regularExpression) != nil { return nil }
-        let full = value.range(of: #"全文|全篇|整篇|整本|整份|通篇|逐页|逐段|所有页|每一页|\b(?:entire|whole|full|all pages)\b"#, options: .regularExpression) != nil
+        let full = value.range(of: #"全文|全篇|整篇|整本|整份|通篇|通读|从头到尾|逐页|逐段|所有页|每一页|\b(?:entire|whole|full|all pages)\b"#, options: .regularExpression) != nil
         guard full else { return nil }
         if mode == .translate || value.contains("翻译") || value.contains("translat") { return .translation }
         let analysis = #"分析|解读|总结|归纳|梳理|概括|解释|评析|综述|复述|analy[sz]|summari[sz]|explain|review"#

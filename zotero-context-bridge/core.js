@@ -129,7 +129,7 @@
     return { selection: { text, truncated, pageIndex, pageLabel: typeof pageLabel === "string" ? pageLabel : undefined }, method };
   }
 
-  function liveSelection(zotero, activeWindow, requestId) {
+  function liveSelection(zotero, activeWindow, requestId, localPDF) {
     const fail = (code, error) => jsonResponse(code, { ok: false, error });
     const win = zotero.getMainWindow();
     if (!win || activeWindow !== win || !win.document.hasFocus()) return fail(409, "SOURCE_CHANGED");
@@ -159,7 +159,19 @@
         if (typeof selection.pageLabel === "string" && selection.pageLabel.length <= 128) location.pageLabel = selection.pageLabel;
       }
     }
-    return jsonResponse(200, { ok: true, liveSelection: { text: selection.text, title, requestId, capture, location } });
+    let pdfFile;
+    if (localPDF && location && method !== "document-dom" && attachment.isPDFAttachment?.() &&
+        reader._item === attachment) {
+      try {
+        const file = localPDF(attachment);
+        if (file) pdfFile = { ...file, attachmentID: capture.attachmentID, attachmentKey: capture.attachmentKey, library };
+      } catch (_) { /* Keep the verified selection if the local attachment is inaccessible. */ }
+    }
+    if (tabs.selectedType !== "reader" || tabs.selectedID !== tabID ||
+        zotero.Reader.getByTabID(tabID) !== reader || reader._internalReader?._lastView !== view ||
+        reader.itemID !== capture.attachmentID || zotero.Items.get(reader.itemID) !== attachment ||
+        !win.document.hasFocus()) return fail(409, "SOURCE_CHANGED");
+    return jsonResponse(200, { ok: true, liveSelection: { text: selection.text, title, requestId, capture, location, pdfFile } });
   }
 
   function zoteroLibraryRoute(Zotero, libraryID) {

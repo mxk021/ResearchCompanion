@@ -266,6 +266,7 @@ struct ResearchFileReference: Codable, Equatable, Sendable {
 struct ResearchFileAttachment: Codable {
     let file: ResearchFileReference
     let recognizeScans: Bool
+    var zotero: ResearchZoteroPDF.Identity? = nil
 
     static func key(host: String, workspace: String, session: String?) -> String {
         // A distinct null slot represents an as-yet-unsent composition.

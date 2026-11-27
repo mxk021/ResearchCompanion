@@ -1,7 +1,7 @@
 /* Zotero 10 privileged bootstrap; no outbound network, database writes, or model access. */
 if (typeof Zotero === "undefined") { var Zotero; }
 const MAX_FULLTEXT_BYTES = 512000;
-const BRIDGE_VERSION = "0.1.6";
+const BRIDGE_VERSION = "0.1.7";
 let bridgeCore;
 let installedEndpoint;
 let pairingToken;
@@ -65,6 +65,32 @@ async function fulltextFor(attachment) {
   };
 }
 
+// This opt-in lookup is scoped to the authenticated live reader. Resolve only
+// modern file-locator formats. Zotero's getFilePath* can migrate legacy aliases.
+function localPDF(attachment) {
+  if (!attachment.isPDFAttachment?.() || !attachment.isFileAttachment?.()) return undefined;
+  const raw = attachment.attachmentPath;
+  if (typeof raw !== "string" || !raw || /[\u0000-\u001f\u007f]/.test(raw)) return undefined;
+  let path;
+  if (attachment.isStoredFileAttachment?.()) {
+    if (!/^storage:(?!\.)[^\\/]+[.]pdf$/i.test(raw)) return undefined;
+    const directory = Zotero.Attachments.getStorageDirectory(attachment);
+    path = PathUtils.join(directory.path, raw.slice("storage:".length));
+  } else if (attachment.attachmentLinkMode === Zotero.Attachments?.LINK_MODE_LINKED_FILE) {
+    path = raw.startsWith(Zotero.Attachments.BASE_PATH_PLACEHOLDER)
+      ? Zotero.Attachments.resolveRelativePath(raw)
+      : raw;
+  }
+  if (typeof path !== "string" || !path.startsWith("/") || !/[.]pdf$/i.test(path) ||
+      path.length > 4096 || /[\u0000-\u001f\u007f]/.test(path)) return undefined;
+  const file = checkedExistingPath(path, "regular");
+  if (!file) return undefined;
+  const bytes = file.fileSize;
+  const modifiedMs = file.lastModifiedTime;
+  if (!Number.isSafeInteger(bytes) || bytes <= 0 || !Number.isSafeInteger(modifiedMs)) return undefined;
+  return { path, bytes, modifiedMs };
+}
+
 async function contextRequest(request) {
   let port = 23119;
   try { port = Zotero.Server.port; } catch (_) { /* Fail against the default host. */ }
@@ -74,7 +100,11 @@ async function contextRequest(request) {
   let query;
   try { query = bridgeCore.parseQuery(request.searchParams); }
   catch (_) { return bridgeCore.jsonResponse(400, { ok: false, error: "INVALID_QUERY" }); }
-  if (query.live) return bridgeCore.liveSelection(Zotero, Services.focus.activeWindow, query.requestId);
+  if (query.live) {
+    const wantsPDF = Object.entries(request.headers || {}).some(([key, value]) =>
+      key.toLowerCase() === "x-research-companion-local-pdf" && value === "1");
+    return bridgeCore.liveSelection(Zotero, Services.focus.activeWindow, query.requestId, wantsPDF ? localPDF : undefined);
+  }
   const current = await bridgeCore.currentPaper(Zotero);
   if (!current) return bridgeCore.jsonResponse(404, { ok: false, error: "NO_ACTIVE_PAPER" });
   let fulltext = null;
